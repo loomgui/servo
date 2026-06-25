@@ -410,6 +410,7 @@ impl DisplayListBuilder<'_> {
         let effects = style.get_effects();
         let transform_style = style.used_transform_style(fragment.base.flags);
         if effects.filter.0.is_empty() &&
+            effects.backdrop_filter.0.is_empty() &&
             effects.opacity == 1.0 &&
             effects.mix_blend_mode == ComputedMixBlendMode::Normal &&
             !style.has_effective_transform_or_perspective(FragmentFlags::empty()) &&
@@ -451,6 +452,12 @@ impl DisplayListBuilder<'_> {
             clip_id => Some(self.clip_chain_id(clip_id)),
         };
 
+        let sc_flags = if effects.backdrop_filter.0.is_empty() {
+            wr::StackingContextFlags::empty()
+        } else {
+            wr::StackingContextFlags::WRAPS_BACKDROP_FILTER
+        };
+
         self.wr().push_stacking_context(
             spatial_id,
             style.get_webrender_primitive_flags(),
@@ -460,7 +467,7 @@ impl DisplayListBuilder<'_> {
             &filters,
             &[], // filter_datas
             wr::RasterSpace::Screen,
-            wr::StackingContextFlags::empty(),
+            sc_flags,
             None, // snapshot
         );
 
@@ -482,6 +489,34 @@ impl DisplayListBuilder<'_> {
             clip_chain_id: self.clip_chain_id(state.clip_id),
             flags: style.get_webrender_primitive_flags(),
         }
+    }
+
+    fn push_backdrop_filter_if_necessary(
+        &mut self,
+        state: &TraversalState,
+        fragment: &BoxFragmentWithStyle<'_>,
+    ) {
+        let style = fragment.style();
+        let effects = style.get_effects();
+        if effects.backdrop_filter.0.is_empty() {
+            return;
+        }
+
+        let current_color = style.clone_color();
+        let filters: Vec<wr::FilterOp> = effects
+            .backdrop_filter
+            .0
+            .iter()
+            .map(|filter| FilterToWebRender::to_webrender(filter, &current_color))
+            .collect();
+
+        let rect = fragment
+            .border_rect()
+            .translate(state.origin.to_vector())
+            .to_webrender();
+        let common = self.common_properties(state, rect, style);
+
+        self.wr().push_backdrop_filter(&common, &filters, &[]);
     }
 
     /// Draw highlights around the node that is currently hovered in the devtools.
@@ -692,6 +727,8 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
         if fragment.style().get_inherited_box().visibility != Visibility::Visible {
             return;
         };
+
+        self.push_backdrop_filter_if_necessary(state, fragment);
 
         BuilderForBoxFragment::new(fragment, state.origin).build(self, state)
     }
