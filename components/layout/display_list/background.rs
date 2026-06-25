@@ -75,6 +75,7 @@ impl<'a> BackgroundPainter<'a> {
             Clip::ContentBox => *fragment_builder.content_rect(),
             Clip::PaddingBox => *fragment_builder.padding_rect(),
             Clip::BorderBox => fragment_builder.border_rect,
+            Clip::Text => fragment_builder.border_rect,
         }
     }
 
@@ -107,6 +108,7 @@ impl<'a> BackgroundPainter<'a> {
             Clip::BorderBox => {
                 fragment_builder.border_edge_clip(builder, state, force_clip_creation)
             },
+            Clip::Text => None,
         }
     }
 

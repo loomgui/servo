@@ -7,6 +7,7 @@ use layout_api::AxesOverflow;
 use malloc_size_of_derive::MallocSizeOf;
 use style::Zero;
 use style::color::AbsoluteColor;
+use style::computed_values::background_clip::single_value::T as BackgroundClip;
 use style::computed_values::direction::T as Direction;
 use style::computed_values::isolation::T as ComputedIsolation;
 use style::computed_values::mix_blend_mode::T as ComputedMixBlendMode;
@@ -691,6 +692,7 @@ impl ComputedValuesExt for ComputedValues {
             effects.opacity < 1.0 ||
             !effects.filter.0.is_empty() ||
             !effects.backdrop_filter.0.is_empty() ||
+            self.get_background().background_clip.0.iter().any(|c| matches!(c, BackgroundClip::Text)) ||
             !effects.clip.is_auto() ||
             self.get_svg().clip_path != ClipPath::None ||
             self.get_box().isolation == ComputedIsolation::Isolate ||
@@ -806,7 +808,10 @@ impl ComputedValuesExt for ComputedValues {
         // From <https://www.w3.org/TR/filter-effects-1/#FilterProperty>
         // > A computed value of other than `none` results in the creation of a stacking context
         // Note `will-change: filter` is handled above by `STACKING_CONTEXT_UNCONDITIONAL`.
-        if !effects.filter.0.is_empty() || !effects.backdrop_filter.0.is_empty() {
+        if !effects.filter.0.is_empty() ||
+            !effects.backdrop_filter.0.is_empty() ||
+            self.get_background().background_clip.0.iter().any(|c| matches!(c, BackgroundClip::Text))
+        {
             return true;
         }
 
@@ -916,6 +921,7 @@ impl ComputedValuesExt for ComputedValues {
         if !fragment_flags.contains(FragmentFlags::IS_ROOT_ELEMENT) &&
             (!self.get_effects().filter.0.is_empty() ||
                 !self.get_effects().backdrop_filter.0.is_empty() ||
+                self.get_background().background_clip.0.iter().any(|c| matches!(c, BackgroundClip::Text)) ||
                 will_change_bits.intersects(WillChangeBits::FIXPOS_CB_NON_SVG))
         {
             return true;

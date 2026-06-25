@@ -13,9 +13,11 @@ use fonts::ShapedTextSlice;
 use gradient::WebRenderGradient;
 use layout_api::ReflowStatistics;
 use net_traits::image_cache::Image as CachedImage;
+use paint_api::CrossProcessPaintApi;
 use paint_api::display_list::{PaintDisplayListInfo, SpatialTreeNodeInfo};
+use rustc_hash::FxHashMap;
 use servo_arc::Arc as ServoArc;
-use servo_base::id::{PipelineId, ScrollTreeNodeId};
+use servo_base::id::{PipelineId, ScrollTreeNodeId, WebViewId};
 use servo_config::opts::{DiagnosticsLogging, DiagnosticsLoggingOption};
 use servo_config::{pref, prefs};
 use servo_url::ServoUrl;
@@ -127,6 +129,29 @@ pub(crate) struct DisplayListBuilder<'a> {
 
     /// Statistics collected about the reflow, in order to write tests for incremental layout.
     reflow_statistics: &'a mut ReflowStatistics,
+
+    /// `None` makes `background-clip: text` a no-op (unclipped background).
+    paint_api: Option<(CrossProcessPaintApi, WebViewId)>,
+
+    /// Snapshot image keys reused across reflows, so the blocking key allocation
+    /// happens once per clip:text element. Pruned per build (see `build`).
+    snapshot_image_key_cache: &'a mut FxHashMap<OpaqueNode, wr::SnapshotImageKey>,
+
+    /// Paint glyphs as opaque white (alpha coverage for the glyph mask). Set only
+    /// inside a detached snapshot stacking context.
+    force_opaque_glyphs: bool,
+
+    /// One frame per live stacking context, so the lazily-opened clip:text
+    /// snapshot SC stays balanced under nesting.
+    text_snapshot_stack: Vec<TextSnapshotFrame>,
+}
+
+struct TextSnapshotFrame {
+    /// Set when this SC's box has clip:text; taken when the snapshot SC opens.
+    pending: Option<(wr::SnapshotImageKey, units::LayoutRect)>,
+    opened: bool,
+    /// `force_opaque_glyphs` to restore when this frame's SC is popped.
+    prev_force_opaque: bool,
 }
 
 struct InspectorHighlight {
@@ -178,6 +203,8 @@ impl DisplayListBuilder<'_> {
         debug: &DiagnosticsLogging,
         paint_timing_handler: &mut PaintTimingHandler,
         reflow_statistics: &mut ReflowStatistics,
+        paint_api: Option<(CrossProcessPaintApi, WebViewId)>,
+        snapshot_image_key_cache: &mut FxHashMap<OpaqueNode, wr::SnapshotImageKey>,
     ) -> BuiltDisplayList {
         // Build the rest of the display list which inclues all of the WebRender primitives.
         let paint_info = &mut stacking_context_tree.paint_info;
@@ -207,6 +234,10 @@ impl DisplayListBuilder<'_> {
             device_pixel_ratio,
             paint_timing_handler,
             reflow_statistics,
+            paint_api,
+            snapshot_image_key_cache,
+            force_opaque_glyphs: false,
+            text_snapshot_stack: Vec::new(),
         };
 
         // Clear any caret color from previous display list constructions.
@@ -232,6 +263,13 @@ impl DisplayListBuilder<'_> {
         );
 
         PaintTraversal::traverse(&stacking_context_tree.root_stacking_context, &mut builder);
+
+        // Drop cache entries unused this build; the paint thread frees their keys.
+        let used_keys = builder.paint_info.snapshot_image_keys.clone();
+        builder
+            .snapshot_image_key_cache
+            .retain(|_, key| used_keys.contains(key));
+
         builder.paint_dom_inspector_highlight();
 
         webrender_display_list_builder.end().1
@@ -239,6 +277,60 @@ impl DisplayListBuilder<'_> {
 
     fn wr(&mut self) -> &mut wr::DisplayListBuilder {
         self.webrender_display_list_builder
+    }
+
+    fn has_text_clipped_background(style: &ComputedValues) -> bool {
+        use style::computed_values::background_clip::single_value::T as BackgroundClip;
+        style
+            .get_background()
+            .background_clip
+            .0
+            .iter()
+            .any(|c| matches!(c, BackgroundClip::Text))
+    }
+
+    /// Build the `ImageMask` clip chain over `border_rect` for `background-clip:
+    /// text`, returning `None` (unclipped) if no key is available. The mask's
+    /// snapshot stacking context is emitted later, at the first text fragment;
+    /// WebRender resolves snapshots in a pre-pass, so the background painted
+    /// under this clip still samples it.
+    fn define_text_clip_snapshot(
+        &mut self,
+        state: &TraversalState,
+        border_rect: units::LayoutRect,
+        node: Option<OpaqueNode>,
+    ) -> Option<(wr::SnapshotImageKey, ClipChainId)> {
+        // Cached per element; only the first build pays the blocking allocation.
+        let snapshot_key = match node.and_then(|n| self.snapshot_image_key_cache.get(&n).copied()) {
+            Some(key) => key,
+            None => {
+                let image_key = {
+                    let (paint_api, webview_id) = self.paint_api.as_ref()?;
+                    paint_api.generate_image_key_blocking(*webview_id)?
+                };
+                let key = wr::SnapshotImageKey(image_key);
+                if let Some(n) = node {
+                    self.snapshot_image_key_cache.insert(n, key);
+                }
+                key
+            },
+        };
+
+        let spatial_id = self.spatial_id(state.spatial_id);
+        let mask = wr::ImageMask {
+            image: snapshot_key.as_image(),
+            rect: border_rect,
+        };
+        let clip_id = self
+            .wr()
+            .define_clip_image_mask(spatial_id, mask, &[], wr::FillRule::Nonzero);
+        let parent = match self.clip_chain_id(state.clip_id) {
+            ClipChainId::INVALID => None,
+            parent => Some(parent),
+        };
+        let clip_chain = self.wr().define_clip_chain(parent, [clip_id]);
+        self.paint_info.snapshot_image_keys.push(snapshot_key);
+        Some((snapshot_key, clip_chain))
     }
 
     fn pipeline_id(&mut self) -> wr::PipelineId {
@@ -696,6 +788,12 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
                     )
                 })
         });
+        self.text_snapshot_stack.push(TextSnapshotFrame {
+            pending: None,
+            opened: false,
+            prev_force_opaque: self.force_opaque_glyphs,
+        });
+
         (pushed_stacking_context, old_reference_frame)
     }
 
@@ -711,6 +809,14 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
 
         if let Some(old_reference_frame) = old_reference_frame {
             self.current_reference_frame_scroll_node_id = old_reference_frame;
+        }
+
+        // Close the clip:text snapshot SC if this one opened it.
+        if let Some(frame) = self.text_snapshot_stack.pop() {
+            if frame.opened {
+                self.wr().pop_stacking_context();
+                self.force_opaque_glyphs = frame.prev_force_opaque;
+            }
         }
     }
 
@@ -730,7 +836,46 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
 
         self.push_backdrop_filter_if_necessary(state, fragment);
 
-        BuilderForBoxFragment::new(fragment, state.origin).build(self, state)
+        // clip:text: wrap this box's background in an isolated stacking context
+        // clipped by the glyph image-mask. The SC is a picture, so the mask takes
+        // WebRender's legacy (masked) path; applying it to the background rect
+        // directly would hit the quad path, which rejects image masks. The mask
+        // snapshot is filled later by the element's text (see `visit_text`).
+        let mut text_clip_sc = false;
+        if Self::has_text_clipped_background(fragment.style()) {
+            let border_rect = fragment
+                .border_rect()
+                .translate(state.origin.to_vector())
+                .to_webrender();
+            let node = fragment.base.tag.map(|tag| tag.node);
+            if let Some((key, clip_chain)) =
+                self.define_text_clip_snapshot(state, border_rect, node)
+            {
+                let spatial_id = self.spatial_id(state.spatial_id);
+                self.wr().push_stacking_context(
+                    spatial_id,
+                    wr::PrimitiveFlags::empty(),
+                    Some(clip_chain),
+                    wr::TransformStyle::Flat,
+                    wr::MixBlendMode::Normal,
+                    &[],
+                    &[],
+                    wr::RasterSpace::Screen,
+                    wr::StackingContextFlags::FORCED_ISOLATION,
+                    None,
+                );
+                text_clip_sc = true;
+                if let Some(frame) = self.text_snapshot_stack.last_mut() {
+                    frame.pending = Some((key, border_rect));
+                }
+            }
+        }
+
+        BuilderForBoxFragment::new(fragment, state.origin).build(self, state);
+
+        if text_clip_sc {
+            self.wr().pop_stacking_context();
+        }
     }
 
     fn visit_iframe(&mut self, state: &TraversalState, fragment: &Arc<IFrameFragment>) {
@@ -834,6 +979,39 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
         if style.get_inherited_box().visibility != Visibility::Visible {
             return;
         }
+
+        // Open the snapshot SC at the first text fragment, once per element.
+        let to_open = self
+            .text_snapshot_stack
+            .last()
+            .and_then(|f| (!f.opened).then_some(f.pending))
+            .flatten();
+        if let Some((key, area)) = to_open {
+            let spatial_id = self.spatial_id(state.spatial_id);
+            let prev_force_opaque = self.force_opaque_glyphs;
+            self.wr().push_stacking_context(
+                spatial_id,
+                wr::PrimitiveFlags::empty(),
+                None,
+                wr::TransformStyle::Flat,
+                wr::MixBlendMode::Normal,
+                &[],
+                &[],
+                wr::RasterSpace::Screen,
+                wr::StackingContextFlags::empty(),
+                Some(wr::SnapshotInfo {
+                    key,
+                    area,
+                    detached: true,
+                }),
+            );
+            self.force_opaque_glyphs = true;
+            if let Some(frame) = self.text_snapshot_stack.last_mut() {
+                frame.opened = true;
+                frame.prev_force_opaque = prev_force_opaque;
+            }
+        }
+
         Fragment::build_display_list_for_text_fragment(fragment, self, state, &containing_block);
     }
 
@@ -1094,12 +1272,19 @@ impl Fragment {
             fragment.justification_adjustment,
         );
 
+        // White glyphs become the clip:text alpha mask; the snapshot SC is
+        // detached, so these pixels never reach the screen.
+        let glyph_color = if builder.force_opaque_glyphs {
+            wr::ColorF::WHITE
+        } else {
+            rgba(color)
+        };
         builder.wr().push_text(
             &common,
             glyph_bounds,
             &glyphs,
             fragment.font_key,
-            rgba(color),
+            glyph_color,
             None,
         );
 

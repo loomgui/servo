@@ -81,6 +81,7 @@ use style_traits::{CSSPixel, SpeculativePainter};
 use stylo_atoms::Atom;
 use url::Url;
 use webrender_api::ExternalScrollId;
+use webrender_api::SnapshotImageKey;
 use webrender_api::units::{DevicePixel, LayoutVector2D};
 
 use crate::accessibility_tree::AccessibilityTree;
@@ -210,6 +211,10 @@ pub struct LayoutThread {
 
     /// Cross-process access to the `Paint` API.
     paint_api: CrossProcessPaintApi,
+
+    /// Per-element `background-clip: text` snapshot image keys, reused across
+    /// reflows so each clip:text element allocates its (blocking) key only once.
+    snapshot_image_key_cache: RefCell<FxHashMap<OpaqueNode, SnapshotImageKey>>,
 
     /// Debug options, copied from configuration to this `LayoutThread` in order
     /// to avoid having to constantly access the thread-safe global options.
@@ -822,6 +827,7 @@ impl LayoutThread {
             fragment_tree: Default::default(),
             stacking_context_tree: Default::default(),
             paint_api: config.paint_api,
+            snapshot_image_key_cache: RefCell::new(FxHashMap::default()),
             stylist: Stylist::new(device, QuirksMode::NoQuirks),
             resolved_images_cache: Default::default(),
             debug: opts::get().debug.clone(),
@@ -1463,6 +1469,8 @@ impl LayoutThread {
             &self.debug,
             paint_timing_handler,
             reflow_statistics,
+            Some((self.paint_api.clone(), self.webview_id)),
+            &mut self.snapshot_image_key_cache.borrow_mut(),
         );
         self.paint_api.send_display_list(
             self.webview_id,

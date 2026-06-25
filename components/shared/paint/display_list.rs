@@ -21,7 +21,7 @@ use style::values::specified::Overflow;
 use webrender_api::units::{LayoutPixel, LayoutPoint, LayoutRect, LayoutSize, LayoutVector2D};
 use webrender_api::{
     ColorF, ExternalScrollId, PipelineId, PropertyBindingKey, ReferenceFrameKind, ScrollLocation,
-    SpatialId, StickyOffsetBounds, TransformStyle,
+    SnapshotImageKey, SpatialId, StickyOffsetBounds, TransformStyle,
 };
 
 /// A scroll type, describing whether what kind of action originated this scroll request.
@@ -858,6 +858,11 @@ pub struct PaintDisplayListInfo {
     /// If this display list contains a blinking caret, this value will be filled with its animation
     /// key and original color value so that the painter can animate the caret.
     pub caret_property_binding: Option<(PropertyBindingKey<ColorF>, ColorF)>,
+
+    /// clip:text glyph-mask snapshot keys referenced by this display list, for
+    /// the paint thread to register.
+    #[ignore_malloc_size_of = "Small WebRender resource keys"]
+    pub snapshot_image_keys: Vec<SnapshotImageKey>,
 }
 
 impl PaintDisplayListInfo {
@@ -909,6 +914,7 @@ impl PaintDisplayListInfo {
             is_contentful: false,
             first_reflow,
             caret_property_binding: Default::default(),
+            snapshot_image_keys: Vec::new(),
         }
     }
 

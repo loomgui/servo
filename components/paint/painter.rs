@@ -50,7 +50,8 @@ use webrender_api::{
     DocumentId, DynamicProperties, Epoch as WebRenderEpoch, ExternalScrollId, FontInstanceFlags,
     FontInstanceKey, FontInstanceOptions, FontKey, FontVariation, ImageData, ImageKey,
     NativeFontHandle, PipelineId as WebRenderPipelineId, PropertyBinding, ReferenceFrameKind,
-    RenderReasons, SampledScrollOffset, SpaceAndClipInfo, SpatialId, TransformStyle,
+    RenderReasons, SampledScrollOffset, SnapshotImageKey, SpaceAndClipInfo, SpatialId,
+    TransformStyle,
 };
 use wr_malloc_size_of::MallocSizeOfOps;
 
@@ -97,6 +98,11 @@ pub(crate) struct Painter {
 
     /// The WebRender [`RenderApi`] interface used to communicate with WebRender.
     pub(crate) webrender_api: RenderApi,
+
+    /// clip:text glyph-mask snapshot keys per pipeline, to free on the next
+    /// display list or pipeline exit. Keyed per pipeline since a WebView's
+    /// iframes each send their own.
+    prev_snapshot_image_keys: FxHashMap<(WebViewId, PipelineId), Vec<SnapshotImageKey>>,
 
     /// The active webrender document.
     pub(crate) webrender_document: DocumentId,
@@ -274,6 +280,7 @@ impl Painter {
             animation_refresh_driver_observer,
             webrender_renderer: Some(webrender_renderer),
             webrender_api,
+            prev_snapshot_image_keys: FxHashMap::default(),
             webrender_document,
             webrender_gl,
             last_mouse_move_position: None,
@@ -839,6 +846,20 @@ impl Painter {
         }
         self.lcp_calculator
             .remove_lcp_candidates_for_pipeline(&pipeline_id.into());
+
+        // Free this pipeline's `background-clip: text` snapshot images.
+        if let Some(keys) = self
+            .prev_snapshot_image_keys
+            .remove(&(webview_id, pipeline_id))
+        {
+            if !keys.is_empty() {
+                let mut txn = Transaction::new();
+                for key in keys {
+                    txn.delete_snapshot_image(key);
+                }
+                self.send_transaction(txn);
+            }
+        }
     }
 
     pub(crate) fn send_initial_pipeline_transaction(
@@ -1001,6 +1022,24 @@ impl Painter {
         }
 
         transaction.set_display_list(epoch, (pipeline_id, built_display_list));
+
+        // Register clip:text snapshot keys. Diff against the previous set rather
+        // than re-adding all, since layout reuses keys across reflows.
+        let new_keys = display_list_info.snapshot_image_keys.clone();
+        let old_keys = self
+            .prev_snapshot_image_keys
+            .insert((webview_id, pipeline_id.into()), new_keys.clone())
+            .unwrap_or_default();
+        for key in &old_keys {
+            if !new_keys.contains(key) {
+                transaction.delete_snapshot_image(*key);
+            }
+        }
+        for key in &new_keys {
+            if !old_keys.contains(key) {
+                transaction.add_snapshot_image(*key);
+            }
+        }
 
         self.update_transaction_with_all_scroll_offsets(&mut transaction);
         self.send_transaction(transaction);
@@ -1220,6 +1259,8 @@ impl Painter {
             warn!("Tried removing unknown WebView: {webview_id:?}");
             return;
         };
+        self.prev_snapshot_image_keys
+            .retain(|(other_webview, _), _| *other_webview != webview_id);
 
         self.send_root_pipeline_display_list();
         self.lcp_calculator.enable_for_webview(&webview_id);

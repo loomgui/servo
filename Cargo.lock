@@ -6238,8 +6238,7 @@ checksum = "c5a797f0e07bdf071d15742978fc3128ec6c22891c31a3a931513263904c982a"
 [[package]]
 name = "peek-poke"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef60922033e31835f6cf98b9b81b58368037b71d2a81928985cd9d0b3b3171fb"
+source = "git+https://github.com/loomgui/webrender?rev=738c81246f17a3f95bbf9a002e353bccac0d7659#738c81246f17a3f95bbf9a002e353bccac0d7659"
 dependencies = [
  "euclid",
  "peek-poke-derive",
@@ -6248,8 +6247,7 @@ dependencies = [
 [[package]]
 name = "peek-poke-derive"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "271f78bae1e699b58c180a384a2e8d78ccbb60b853e15db92339725f3a2764d5"
+source = "git+https://github.com/loomgui/webrender?rev=738c81246f17a3f95bbf9a002e353bccac0d7659#738c81246f17a3f95bbf9a002e353bccac0d7659"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7451,7 +7449,7 @@ dependencies = [
 [[package]]
 name = "selectors"
 version = "0.38.0"
-source = "git+https://github.com/loomgui/stylo?rev=5ee955082ffd917178baa7da4b0d61fd5b454244#5ee955082ffd917178baa7da4b0d61fd5b454244"
+source = "git+https://github.com/loomgui/stylo?rev=5f2038b4cfe9dd6f73bb6291e41ca3f708accb35#5f2038b4cfe9dd6f73bb6291e41ca3f708accb35"
 dependencies = [
  "bitflags 2.13.0",
  "cssparser",
@@ -8294,7 +8292,7 @@ dependencies = [
  "uuid",
  "webrender",
  "webrender_api",
- "wr_malloc_size_of",
+ "wr_malloc_size_of 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -8682,7 +8680,7 @@ dependencies = [
  "tracing",
  "webrender",
  "webrender_api",
- "wr_malloc_size_of",
+ "wr_malloc_size_of 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -9202,7 +9200,7 @@ dependencies = [
 [[package]]
 name = "servo_arc"
 version = "0.4.3"
-source = "git+https://github.com/loomgui/stylo?rev=5ee955082ffd917178baa7da4b0d61fd5b454244#5ee955082ffd917178baa7da4b0d61fd5b454244"
+source = "git+https://github.com/loomgui/stylo?rev=5f2038b4cfe9dd6f73bb6291e41ca3f708accb35#5f2038b4cfe9dd6f73bb6291e41ca3f708accb35"
 dependencies = [
  "serde",
  "stable_deref_trait",
@@ -9673,7 +9671,7 @@ dependencies = [
 [[package]]
 name = "stylo"
 version = "0.18.0"
-source = "git+https://github.com/loomgui/stylo?rev=5ee955082ffd917178baa7da4b0d61fd5b454244#5ee955082ffd917178baa7da4b0d61fd5b454244"
+source = "git+https://github.com/loomgui/stylo?rev=5f2038b4cfe9dd6f73bb6291e41ca3f708accb35#5f2038b4cfe9dd6f73bb6291e41ca3f708accb35"
 dependencies = [
  "app_units",
  "arrayvec",
@@ -9729,7 +9727,7 @@ dependencies = [
 [[package]]
 name = "stylo_atoms"
 version = "0.18.0"
-source = "git+https://github.com/loomgui/stylo?rev=5ee955082ffd917178baa7da4b0d61fd5b454244#5ee955082ffd917178baa7da4b0d61fd5b454244"
+source = "git+https://github.com/loomgui/stylo?rev=5f2038b4cfe9dd6f73bb6291e41ca3f708accb35#5f2038b4cfe9dd6f73bb6291e41ca3f708accb35"
 dependencies = [
  "string_cache",
  "string_cache_codegen",
@@ -9738,7 +9736,7 @@ dependencies = [
 [[package]]
 name = "stylo_derive"
 version = "0.18.0"
-source = "git+https://github.com/loomgui/stylo?rev=5ee955082ffd917178baa7da4b0d61fd5b454244#5ee955082ffd917178baa7da4b0d61fd5b454244"
+source = "git+https://github.com/loomgui/stylo?rev=5f2038b4cfe9dd6f73bb6291e41ca3f708accb35#5f2038b4cfe9dd6f73bb6291e41ca3f708accb35"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -9750,7 +9748,7 @@ dependencies = [
 [[package]]
 name = "stylo_dom"
 version = "0.18.0"
-source = "git+https://github.com/loomgui/stylo?rev=5ee955082ffd917178baa7da4b0d61fd5b454244#5ee955082ffd917178baa7da4b0d61fd5b454244"
+source = "git+https://github.com/loomgui/stylo?rev=5f2038b4cfe9dd6f73bb6291e41ca3f708accb35#5f2038b4cfe9dd6f73bb6291e41ca3f708accb35"
 dependencies = [
  "bitflags 2.13.0",
  "stylo_malloc_size_of",
@@ -9759,7 +9757,7 @@ dependencies = [
 [[package]]
 name = "stylo_malloc_size_of"
 version = "0.18.0"
-source = "git+https://github.com/loomgui/stylo?rev=5ee955082ffd917178baa7da4b0d61fd5b454244#5ee955082ffd917178baa7da4b0d61fd5b454244"
+source = "git+https://github.com/loomgui/stylo?rev=5f2038b4cfe9dd6f73bb6291e41ca3f708accb35#5f2038b4cfe9dd6f73bb6291e41ca3f708accb35"
 dependencies = [
  "app_units",
  "cssparser",
@@ -9776,7 +9774,7 @@ dependencies = [
 [[package]]
 name = "stylo_static_prefs"
 version = "0.18.0"
-source = "git+https://github.com/loomgui/stylo?rev=5ee955082ffd917178baa7da4b0d61fd5b454244#5ee955082ffd917178baa7da4b0d61fd5b454244"
+source = "git+https://github.com/loomgui/stylo?rev=5f2038b4cfe9dd6f73bb6291e41ca3f708accb35#5f2038b4cfe9dd6f73bb6291e41ca3f708accb35"
 dependencies = [
  "toml",
 ]
@@ -9784,7 +9782,7 @@ dependencies = [
 [[package]]
 name = "stylo_traits"
 version = "0.18.0"
-source = "git+https://github.com/loomgui/stylo?rev=5ee955082ffd917178baa7da4b0d61fd5b454244#5ee955082ffd917178baa7da4b0d61fd5b454244"
+source = "git+https://github.com/loomgui/stylo?rev=5f2038b4cfe9dd6f73bb6291e41ca3f708accb35#5f2038b4cfe9dd6f73bb6291e41ca3f708accb35"
 dependencies = [
  "app_units",
  "bitflags 2.13.0",
@@ -10204,7 +10202,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 [[package]]
 name = "to_shmem"
 version = "0.4.0"
-source = "git+https://github.com/loomgui/stylo?rev=5ee955082ffd917178baa7da4b0d61fd5b454244#5ee955082ffd917178baa7da4b0d61fd5b454244"
+source = "git+https://github.com/loomgui/stylo?rev=5f2038b4cfe9dd6f73bb6291e41ca3f708accb35#5f2038b4cfe9dd6f73bb6291e41ca3f708accb35"
 dependencies = [
  "cssparser",
  "servo_arc",
@@ -10217,7 +10215,7 @@ dependencies = [
 [[package]]
 name = "to_shmem_derive"
 version = "0.1.0"
-source = "git+https://github.com/loomgui/stylo?rev=5ee955082ffd917178baa7da4b0d61fd5b454244#5ee955082ffd917178baa7da4b0d61fd5b454244"
+source = "git+https://github.com/loomgui/stylo?rev=5f2038b4cfe9dd6f73bb6291e41ca3f708accb35#5f2038b4cfe9dd6f73bb6291e41ca3f708accb35"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -11240,8 +11238,7 @@ dependencies = [
 [[package]]
 name = "webrender"
 version = "0.69.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "384e260b5f94dd5459e58e37a4a336141ce1b91da3c3c403d579688922515731"
+source = "git+https://github.com/loomgui/webrender?rev=738c81246f17a3f95bbf9a002e353bccac0d7659#738c81246f17a3f95bbf9a002e353bccac0d7659"
 dependencies = [
  "allocator-api2",
  "bincode",
@@ -11270,15 +11267,14 @@ dependencies = [
  "webrender_api",
  "webrender_build",
  "wr_glyph_rasterizer",
- "wr_malloc_size_of",
+ "wr_malloc_size_of 0.2.2 (git+https://github.com/loomgui/webrender?rev=738c81246f17a3f95bbf9a002e353bccac0d7659)",
  "zeitstempel",
 ]
 
 [[package]]
 name = "webrender_api"
 version = "0.69.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c9f6c3b8ea958f6c34c3eb82f46ac42dacd94e3c18c710bcd27879ade71492"
+source = "git+https://github.com/loomgui/webrender?rev=738c81246f17a3f95bbf9a002e353bccac0d7659#738c81246f17a3f95bbf9a002e353bccac0d7659"
 dependencies = [
  "app_units",
  "bitflags 2.13.0",
@@ -11290,15 +11286,14 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_derive",
- "wr_malloc_size_of",
+ "wr_malloc_size_of 0.2.2 (git+https://github.com/loomgui/webrender?rev=738c81246f17a3f95bbf9a002e353bccac0d7659)",
  "zeitstempel",
 ]
 
 [[package]]
 name = "webrender_build"
 version = "0.69.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5476f637aa37fc5753921fb324cc9114cc158bfd7602382afefcd6afda4bad04"
+source = "git+https://github.com/loomgui/webrender?rev=738c81246f17a3f95bbf9a002e353bccac0d7659#738c81246f17a3f95bbf9a002e353bccac0d7659"
 dependencies = [
  "bitflags 2.13.0",
  "lazy_static",
@@ -11964,8 +11959,7 @@ dependencies = [
 [[package]]
 name = "wr_glyph_rasterizer"
 version = "0.69.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f35fd5520f25d3a02acc20464e53e48bb68e22ac78960f10a6fd76820e3bde2"
+source = "git+https://github.com/loomgui/webrender?rev=738c81246f17a3f95bbf9a002e353bccac0d7659#738c81246f17a3f95bbf9a002e353bccac0d7659"
 dependencies = [
  "core-foundation 0.9.4",
  "core-graphics",
@@ -11984,7 +11978,7 @@ dependencies = [
  "smallvec",
  "tracy-rs",
  "webrender_api",
- "wr_malloc_size_of",
+ "wr_malloc_size_of 0.2.2 (git+https://github.com/loomgui/webrender?rev=738c81246f17a3f95bbf9a002e353bccac0d7659)",
 ]
 
 [[package]]
@@ -11992,6 +11986,15 @@ name = "wr_malloc_size_of"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "482308b684f11723b200a32808094bb460b5ac4840903ccbcb78ad92a6354a1f"
+dependencies = [
+ "app_units",
+ "euclid",
+]
+
+[[package]]
+name = "wr_malloc_size_of"
+version = "0.2.2"
+source = "git+https://github.com/loomgui/webrender?rev=738c81246f17a3f95bbf9a002e353bccac0d7659#738c81246f17a3f95bbf9a002e353bccac0d7659"
 dependencies = [
  "app_units",
  "euclid",
