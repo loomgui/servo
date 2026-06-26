@@ -1004,6 +1004,15 @@ impl Element {
             .map(|data| data.element_data.borrow().styles.primary().clone())
     }
 
+    /// Like [`Self::style`] but reads cached style without a reflow, for callers
+    /// already inside one where [`Self::style`] would re-enter layout.
+    pub(crate) fn style_without_reflow(&self) -> Option<ServoArc<ComputedValues>> {
+        self.style_data
+            .borrow()
+            .as_ref()
+            .map(|data| data.element_data.borrow().styles.primary().clone())
+    }
+
     pub(crate) fn is_styled(&self) -> bool {
         self.style_data.borrow().is_some()
     }

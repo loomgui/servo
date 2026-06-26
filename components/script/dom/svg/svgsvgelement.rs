@@ -89,12 +89,71 @@ impl SVGSVGElement {
         };
 
         let xml_source: String = xml_source.into();
+        let xml_source = self.resolve_inherited_paint(xml_source);
         let base64_encoded_source = base64::engine::general_purpose::STANDARD.encode(xml_source);
         let data_url = format!("data:image/svg+xml;base64,{}", base64_encoded_source);
         match ServoUrl::parse(&data_url) {
             Ok(url) => *self.cached_serialized_data_url.borrow_mut() = Some(Ok(url)),
             Err(error) => error!("Unable to parse serialized SVG data url: {error}"),
         };
+    }
+
+    /// Bake `currentColor` and `var(--name)` paint into the serialized SVG so the
+    /// usvg can render them, it has no parent context and no custom-property support 
+    /// so both would go black. Resolves against the host `<svg>`'s computed style.
+    /// Descendant-local `color`/`--var` overrides aren't honored; both inherit, so
+    /// the ancestor/`:root` case is exact.
+    fn resolve_inherited_paint(&self, xml_source: String) -> String {
+        use style::custom_properties::Name;
+        use style::properties::{LonghandId, PropertyDeclarationId};
+
+        let needs_current = xml_source.contains("currentColor");
+        let needs_var = xml_source.contains("var(");
+        if !needs_current && !needs_var {
+            return xml_source;
+        }
+        let Some(style) = self.upcast::<Element>().style_without_reflow() else {
+            return xml_source;
+        };
+
+        let with_color = if needs_current {
+            let color = style
+                .computed_value_to_string(PropertyDeclarationId::Longhand(LonghandId::Color));
+            xml_source.replace("currentColor", &color)
+        } else {
+            xml_source
+        };
+
+        if !needs_var {
+            return with_color;
+        }
+
+        let mut out = String::with_capacity(with_color.len());
+        let mut rest = with_color.as_str();
+        while let Some(idx) = rest.find("var(") {
+            out.push_str(&rest[..idx]);
+            let after = &rest[idx + "var(".len()..];
+            let Some(close) = after.find(')') else {
+                out.push_str(&rest[idx..]);
+                return out;
+            };
+            let (name_part, fallback) = match after[..close].split_once(',') {
+                Some((name, fallback)) => (name.trim(), Some(fallback.trim())),
+                None => (after[..close].trim(), None),
+            };
+            let resolved = name_part.strip_prefix("--").and_then(|name| {
+                let value = style
+                    .computed_value_to_string(PropertyDeclarationId::Custom(&Name::from(name)));
+                (!value.is_empty()).then_some(value)
+            });
+            match resolved {
+                Some(value) => out.push_str(&value),
+                None => out.push_str(fallback.unwrap_or("")),
+            }
+            rest = &after[close + 1..];
+        }
+        out.push_str(rest);
+        out
     }
 
     fn process_use_elements(&self, cx: &mut JSContext) -> Vec<DomRoot<Node>> {
