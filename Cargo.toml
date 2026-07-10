@@ -282,7 +282,7 @@ windows-sys = "0.61"
 winit = "0.30.13"
 winresource = "0.1"
 wio = "0.2"
-wr_malloc_size_of = "0.2.2"
+wr_malloc_size_of = { git = "https://github.com/loomgui/webrender", rev = "738c81246f17a3f95bbf9a002e353bccac0d7659" }
 x25519-dalek = { version = "=3.0.0-rc.1", features = ["getrandom", "static_secrets", "zeroize"] }
 xcomponent-sys = "0.3.6"
 xml = "1.1"
