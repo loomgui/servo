@@ -110,6 +110,11 @@ pub(crate) struct Painter {
     /// The webrender renderer.
     pub(crate) webrender_renderer: Option<webrender::Renderer>,
 
+    /// Embedder tag whose WebRender updates have been consumed but whose
+    /// framebuffer render has not run yet. A single rendering context can
+    /// safely hold one prepared scene at a time.
+    prepared_frame_tag: Option<u64>,
+
     /// The GL bindings for webrender
     webrender_gl: Rc<dyn gleam::gl::Gl>,
 
@@ -279,6 +284,7 @@ impl Painter {
             refresh_driver,
             animation_refresh_driver_observer,
             webrender_renderer: Some(webrender_renderer),
+            prepared_frame_tag: None,
             webrender_api,
             prev_snapshot_image_keys: FxHashMap::default(),
             webrender_document,
@@ -401,13 +407,26 @@ impl Painter {
         }
     }
 
+    /// Consume pending WebRender transactions without drawing into the
+    /// embedder's framebuffer. This lets embedders overlap scene preparation
+    /// with their own CPU/GPU work, then gate the final surface write.
     #[servo_tracing::instrument(skip_all)]
-    pub(crate) fn render(&mut self, time_profiler_channel: &ProfilerChan) {
+    pub(crate) fn prepare_for_render(
+        &mut self,
+        frame_tag: u64,
+        time_profiler_channel: &ProfilerChan,
+    ) -> bool {
+        if let Some(prepared) = self.prepared_frame_tag {
+            error!("Cannot prepare frame tag {frame_tag}: frame tag {prepared} is still prepared");
+            return false;
+        }
+
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
 
         if let Err(error) = self.rendering_context.make_current() {
             error!("Failed to make the rendering context current: {error:?}");
+            return false;
         }
         self.assert_no_gl_error();
 
@@ -421,7 +440,41 @@ impl Painter {
                 if let Some(renderer) = self.webrender_renderer.as_mut() {
                     renderer.update();
                 }
+            }
+        );
 
+        self.prepared_frame_tag = Some(frame_tag);
+        true
+    }
+
+    /// Draw a scene previously prepared with the exact same embedder tag.
+    /// Returns false rather than painting a stale or differently-tagged scene.
+    #[servo_tracing::instrument(skip_all)]
+    pub(crate) fn render_prepared(
+        &mut self,
+        frame_tag: u64,
+        time_profiler_channel: &ProfilerChan,
+    ) -> bool {
+        if self.prepared_frame_tag != Some(frame_tag) {
+            error!(
+                "Cannot render frame tag {frame_tag}: prepared tag is {:?}",
+                self.prepared_frame_tag
+            );
+            return false;
+        }
+
+        if let Err(error) = self.rendering_context.make_current() {
+            error!("Failed to make the rendering context current: {error:?}");
+            return false;
+        }
+        self.assert_no_gl_error();
+        self.rendering_context.prepare_for_rendering();
+
+        time_profile!(
+            ProfilerCategory::Painting,
+            None,
+            time_profiler_channel.clone(),
+            || {
                 // Paint the scene.
                 // TODO(gw): Take notice of any errors the renderer returns!
                 self.clear_background();
@@ -438,6 +491,25 @@ impl Painter {
 
         self.screenshot_taker.maybe_take_screenshots(self);
         self.send_pending_paint_metrics_messages_after_composite();
+        self.prepared_frame_tag = None;
+        true
+    }
+
+    /// Discard a prepared scene that the embedder chose not to present.
+    pub(crate) fn discard_prepared_render(&mut self, frame_tag: u64) -> bool {
+        if self.prepared_frame_tag != Some(frame_tag) {
+            return false;
+        }
+        self.prepared_frame_tag = None;
+        true
+    }
+
+    #[servo_tracing::instrument(skip_all)]
+    pub(crate) fn render(&mut self, time_profiler_channel: &ProfilerChan) {
+        const LEGACY_FRAME_TAG: u64 = u64::MAX;
+        if self.prepare_for_render(LEGACY_FRAME_TAG, time_profiler_channel) {
+            self.render_prepared(LEGACY_FRAME_TAG, time_profiler_channel);
+        }
     }
 
     fn clear_background(&self) {

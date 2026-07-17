@@ -697,6 +697,25 @@ impl Paint {
             .render(&self.time_profiler_chan);
     }
 
+    /// Consume pending WebRender updates for an embedder-tagged frame without
+    /// drawing into the rendering context.
+    pub fn prepare_for_render(&self, webview_id: WebViewId, frame_tag: u64) -> bool {
+        self.painter_mut(webview_id.into())
+            .prepare_for_render(frame_tag, &self.time_profiler_chan)
+    }
+
+    /// Draw only the scene prepared for `frame_tag`.
+    pub fn render_prepared(&self, webview_id: WebViewId, frame_tag: u64) -> bool {
+        self.painter_mut(webview_id.into())
+            .render_prepared(frame_tag, &self.time_profiler_chan)
+    }
+
+    /// Cancel one prepared frame that the embedder will not present.
+    pub fn discard_prepared_render(&self, webview_id: WebViewId, frame_tag: u64) -> bool {
+        self.painter_mut(webview_id.into())
+            .discard_prepared_render(frame_tag)
+    }
+
     /// Get the message receiver for this [`Paint`].
     pub fn receiver(&self) -> &RoutedReceiver<PaintMessage> {
         &self.paint_receiver

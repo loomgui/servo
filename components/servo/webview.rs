@@ -745,6 +745,31 @@ impl WebView {
         self.inner().servo.paint().render(self.id());
     }
 
+    /// Consume pending WebRender scene updates for an embedder frame without
+    /// writing the rendering context's framebuffer.
+    pub fn prepare_for_paint(&self, frame_tag: u64) -> bool {
+        self.inner()
+            .servo
+            .paint()
+            .prepare_for_render(self.id(), frame_tag)
+    }
+
+    /// Paint only the scene previously prepared for the exact same tag.
+    pub fn paint_prepared(&self, frame_tag: u64) -> bool {
+        self.inner()
+            .servo
+            .paint()
+            .render_prepared(self.id(), frame_tag)
+    }
+
+    /// Discard a prepared frame that the embedder chose not to present.
+    pub fn discard_prepared_paint(&self, frame_tag: u64) -> bool {
+        self.inner()
+            .servo
+            .paint()
+            .discard_prepared_render(self.id(), frame_tag)
+    }
+
     /// Get the [`UserContentManager`] associated with this [`WebView`].
     pub fn user_content_manager(&self) -> Option<Rc<UserContentManager>> {
         self.inner().user_content_manager.clone()
