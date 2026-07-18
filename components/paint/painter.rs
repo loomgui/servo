@@ -2,7 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::{Cell, LazyCell};
+use std::cell::{Cell, LazyCell, RefCell};
+use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -10,8 +11,8 @@ use std::sync::Arc;
 use crossbeam_channel::Sender;
 use dpi::PhysicalSize;
 use embedder_traits::{
-    InputEvent, InputEventAndId, InputEventId, InputEventResult, PaintHitTestResult,
-    ScreenshotCaptureError, Scroll, ViewportDetails, WebViewPoint, WebViewRect,
+    EventLoopWaker, InputEvent, InputEventAndId, InputEventId, InputEventResult,
+    PaintHitTestResult, ScreenshotCaptureError, Scroll, ViewportDetails, WebViewPoint, WebViewRect,
 };
 use euclid::{Point2D, Rect, Scale, Size2D};
 use gleam::gl::RENDERER;
@@ -23,8 +24,9 @@ use paint_api::largest_contentful_paint_candidate::LCPCandidate;
 use paint_api::rendering_context::RenderingContext;
 use paint_api::viewport_description::ViewportDescription;
 use paint_api::{
-    ImageUpdate, PipelineExitSource, SendableFrameTree, SerializableDisplayListPayload,
-    SerializableImageData, WebRenderExternalImageHandlers, WebRenderImageHandlerType, WebViewTrait,
+    ImageUpdate, PaintMessage, PipelineExitSource, SendableFrameTree,
+    SerializableDisplayListPayload, SerializableImageData, WebRenderExternalImageHandlers,
+    WebRenderImageHandlerType, WebViewTrait,
 };
 use profile_traits::time::{ProfilerCategory, ProfilerChan};
 use profile_traits::time_profile;
@@ -46,12 +48,12 @@ use webrender_api::units::{
     WorldPoint,
 };
 use webrender_api::{
-    self, BuiltDisplayList, BuiltDisplayListDescriptor, ColorF, DirtyRect, DisplayListPayload,
-    DocumentId, DynamicProperties, Epoch as WebRenderEpoch, ExternalScrollId, FontInstanceFlags,
-    FontInstanceKey, FontInstanceOptions, FontKey, FontVariation, ImageData, ImageKey,
-    NativeFontHandle, PipelineId as WebRenderPipelineId, PropertyBinding, ReferenceFrameKind,
-    RenderReasons, SampledScrollOffset, SnapshotImageKey, SpaceAndClipInfo, SpatialId,
-    TransformStyle,
+    self, BuiltDisplayList, BuiltDisplayListDescriptor, Checkpoint, ColorF, DirtyRect,
+    DisplayListPayload, DocumentId, DynamicProperties, Epoch as WebRenderEpoch, ExternalScrollId,
+    FontInstanceFlags, FontInstanceKey, FontInstanceOptions, FontKey, FontVariation, ImageData,
+    ImageKey, NativeFontHandle, NotificationHandler, NotificationRequest,
+    PipelineId as WebRenderPipelineId, PropertyBinding, ReferenceFrameKind, RenderReasons,
+    SampledScrollOffset, SnapshotImageKey, SpaceAndClipInfo, SpatialId, TransformStyle,
 };
 use wr_malloc_size_of::MallocSizeOfOps;
 
@@ -64,6 +66,27 @@ use crate::screenshot::ScreenshotTaker;
 use crate::web_content_animation::WebContentAnimator;
 use crate::webrender_external_images::WebGLExternalImages;
 use crate::webview_renderer::{PinchZoomResult, ScrollResult, UnknownWebView, WebViewRenderer};
+
+struct EmbedderSceneFrameNotifier {
+    sender: Sender<Result<PaintMessage, ipc_channel::IpcError>>,
+    event_loop_waker: Box<dyn EventLoopWaker>,
+    painter_id: PainterId,
+    frame_tag: u64,
+}
+
+impl NotificationHandler for EmbedderSceneFrameNotifier {
+    fn notify(&self, when: Checkpoint) {
+        let message = PaintMessage::EmbedderSceneFrameReady(
+            self.painter_id,
+            self.frame_tag,
+            when == Checkpoint::FrameBuilt,
+        );
+        if let Err(error) = self.sender.send(Ok(message)) {
+            warn!("Failed to send embedder scene frame notification: {error:?}");
+        }
+        self.event_loop_waker.wake();
+    }
+}
 
 /// A [`Painter`] is responsible for all of the painting to a particular [`RenderingContext`].
 /// This holds all of the WebRender specific data structures and state necessary for painting
@@ -114,6 +137,18 @@ pub(crate) struct Painter {
     /// framebuffer render has not run yet. A single rendering context can
     /// safely hold one prepared scene at a time.
     prepared_frame_tag: Option<u64>,
+
+    /// Non-zero embedder tag applied to the next scene-generated WebRender
+    /// frame. An exact transaction notification proves that readiness belongs
+    /// to the scene the embedder armed.
+    next_scene_frame_tag: Cell<Option<u64>>,
+
+    /// Completed non-zero scene tags not yet consumed by the embedder.
+    ready_scene_frame_tags: RefCell<VecDeque<u64>>,
+
+    /// Routes exact scene-transaction notifications back to this painter.
+    scene_frame_notification_sender: Sender<Result<PaintMessage, ipc_channel::IpcError>>,
+    scene_frame_notification_waker: Box<dyn EventLoopWaker>,
 
     /// The GL bindings for webrender
     webrender_gl: Rc<dyn gleam::gl::Gl>,
@@ -285,6 +320,10 @@ impl Painter {
             animation_refresh_driver_observer,
             webrender_renderer: Some(webrender_renderer),
             prepared_frame_tag: None,
+            next_scene_frame_tag: Cell::new(None),
+            ready_scene_frame_tags: RefCell::new(VecDeque::new()),
+            scene_frame_notification_sender: paint.paint_proxy.sender.clone(),
+            scene_frame_notification_waker: paint.paint_proxy.event_loop_waker.clone(),
             webrender_api,
             prev_snapshot_image_keys: FxHashMap::default(),
             webrender_document,
@@ -405,6 +444,30 @@ impl Painter {
         if let Err(error) = self.embedder_to_constellation_sender.send(message) {
             warn!("Could not send message to constellation ({error:?})");
         }
+    }
+
+    /// Apply `frame_tag` to the next scene frame generated by this painter.
+    /// Promise continuations run before the next rendering update, so an
+    /// embedder can await this arm, mutate the DOM, and then wait for the exact
+    /// tag to return from WebRender.
+    pub(crate) fn arm_next_scene_frame(&self, frame_tag: u64) -> bool {
+        if frame_tag == 0 || self.next_scene_frame_tag.get().is_some() {
+            return false;
+        }
+        self.next_scene_frame_tag.set(Some(frame_tag));
+        true
+    }
+
+    pub(crate) fn mark_scene_frame_ready(&self, frame_tag: u64) {
+        if frame_tag != 0 {
+            self.ready_scene_frame_tags
+                .borrow_mut()
+                .push_back(frame_tag);
+        }
+    }
+
+    pub(crate) fn take_ready_scene_frame(&self) -> Option<u64> {
+        self.ready_scene_frame_tags.borrow_mut().pop_front()
     }
 
     /// Consume pending WebRender transactions without drawing into the
@@ -631,7 +694,27 @@ impl Painter {
 
     /// Queue a new frame in the transaction and increase the pending frames count.
     pub(crate) fn generate_frame(&self, transaction: &mut Transaction, reason: RenderReasons) {
-        transaction.generate_frame(0, true /* present */, false /* tracked */, reason);
+        let frame_tag = if reason.contains(RenderReasons::SCENE) {
+            self.next_scene_frame_tag.take().unwrap_or(0)
+        } else {
+            0
+        };
+        if frame_tag != 0 {
+            transaction.notify(NotificationRequest::new(
+                Checkpoint::FrameBuilt,
+                Box::new(EmbedderSceneFrameNotifier {
+                    sender: self.scene_frame_notification_sender.clone(),
+                    event_loop_waker: self.scene_frame_notification_waker.clone(),
+                    painter_id: self.painter_id,
+                    frame_tag,
+                }),
+            ));
+        }
+        transaction.generate_frame(
+            frame_tag, true,  /* present */
+            false, /* tracked */
+            reason,
+        );
         self.pending_frames.set(self.pending_frames.get() + 1);
     }
 

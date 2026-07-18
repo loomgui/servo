@@ -402,6 +402,9 @@ impl Paint {
             PaintMessage::NewWebRenderFrameReady(..) => {
                 unreachable!("New WebRender frames should be handled in the caller.");
             },
+            PaintMessage::EmbedderSceneFrameReady(..) => {
+                unreachable!("Embedder scene frames should be handled in the caller.");
+            },
             PaintMessage::SendInitialTransaction(webview_id, pipeline_id) => {
                 if let Some(mut painter) = self.maybe_painter_mut(webview_id.into()) {
                     painter.send_initial_pipeline_transaction(webview_id, pipeline_id);
@@ -716,6 +719,17 @@ impl Paint {
             .discard_prepared_render(frame_tag)
     }
 
+    /// Tag the next scene generated for this WebView and return that same tag
+    /// only after WebRender reports the frame ready.
+    pub fn arm_next_scene_frame(&self, webview_id: WebViewId, frame_tag: u64) -> bool {
+        self.painter(webview_id.into())
+            .arm_next_scene_frame(frame_tag)
+    }
+
+    pub fn take_ready_scene_frame(&self, webview_id: WebViewId) -> Option<u64> {
+        self.painter(webview_id.into()).take_ready_scene_frame()
+    }
+
     /// Get the message receiver for this [`Paint`].
     pub fn receiver(&self) -> &RoutedReceiver<PaintMessage> {
         &self.paint_receiver
@@ -737,6 +751,16 @@ impl Paint {
                         .or_insert(*need_repaint) |= *need_repaint;
                 }
 
+                false
+            },
+            PaintMessage::EmbedderSceneFrameReady(painter_id, frame_tag, completed) => {
+                if *completed {
+                    if let Some(painter) = self.maybe_painter(*painter_id) {
+                        painter.mark_scene_frame_ready(*frame_tag);
+                    }
+                } else {
+                    warn!("WebRender dropped embedder scene frame {frame_tag}");
+                }
                 false
             },
             _ => true,

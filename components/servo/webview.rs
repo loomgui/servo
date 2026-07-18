@@ -770,6 +770,32 @@ impl WebView {
             .discard_prepared_render(self.id(), frame_tag)
     }
 
+    /// Tag the next WebRender scene generated after this call. A non-zero tag
+    /// is returned by [`Self::take_ready_scene_frame`] only when that exact
+    /// generated frame has completed.
+    pub fn arm_next_scene_frame(&self, frame_tag: u64) -> bool {
+        self.inner()
+            .servo
+            .paint()
+            .arm_next_scene_frame(self.id(), frame_tag)
+    }
+
+    /// Ask the script event loop to run an update-the-rendering opportunity for
+    /// this `WebView` as soon as possible.
+    ///
+    /// Embedders with an external frame clock can use this after applying the
+    /// state associated with one of their frames instead of waiting for Servo's
+    /// timer-based fallback rendering opportunity.
+    pub fn request_rendering_update(&self) {
+        self.inner().servo.constellation_proxy().send(
+            EmbedderToConstellationMessage::TickAnimation(vec![self.id()]),
+        );
+    }
+
+    pub fn take_ready_scene_frame(&self) -> Option<u64> {
+        self.inner().servo.paint().take_ready_scene_frame(self.id())
+    }
+
     /// Get the [`UserContentManager`] associated with this [`WebView`].
     pub fn user_content_manager(&self) -> Option<Rc<UserContentManager>> {
         self.inner().user_content_manager.clone()
