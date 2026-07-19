@@ -81,7 +81,7 @@ use script_traits::{
 };
 use servo_arc::Arc as ServoArc;
 use servo_base::cross_process_instant::CrossProcessInstant;
-use servo_base::generic_channel::GenericSender;
+use servo_base::generic_channel::{GenericCallback, GenericSender};
 use servo_base::id::{
     BrowsingContextId, HistoryStateId, PipelineId, PipelineNamespace, ScriptEventLoopId, WebViewId,
 };
@@ -403,6 +403,11 @@ pub struct ScriptThread {
     /// also do this when animating. Renderer-based calls always take precedence.
     #[no_trace]
     scheduled_update_the_rendering: RefCell<Option<TimerId>>,
+
+    /// Embedder callbacks waiting for the rendering opportunity requested by
+    /// an external frame clock to finish.
+    #[no_trace]
+    pending_rendering_update_callbacks: RefCell<Vec<GenericCallback<bool>>>,
 
     /// Whether an animation tick or ScriptThread-triggered rendering update is pending. This might
     /// either be because the Servo renderer is managing animations and the [`ScriptThread`] has
@@ -1037,6 +1042,7 @@ impl ScriptThread {
                     gpu_id_hub,
                     layout_factory,
                     scheduled_update_the_rendering: Default::default(),
+                    pending_rendering_update_callbacks: Default::default(),
                     needs_rendering_update: Arc::new(AtomicBool::new(false)),
                     debugger_global: debugger_global.as_traced(),
                     debugger_paused: Cell::new(false),
@@ -1554,6 +1560,14 @@ impl ScriptThread {
         let built_any_display_lists =
             self.needs_rendering_update.load(Ordering::Relaxed) && self.update_the_rendering(cx);
 
+        for callback in self
+            .pending_rendering_update_callbacks
+            .borrow_mut()
+            .drain(..)
+        {
+            let _ = callback.send(built_any_display_lists);
+        }
+
         self.maybe_fulfill_font_ready_promises(cx);
         self.maybe_resolve_pending_screenshot_readiness_requests(cx);
 
@@ -1925,7 +1939,12 @@ impl ScriptThread {
             ScriptThreadMessage::SetWebGPUPort(port) => {
                 *self.receivers.webgpu_receiver.borrow_mut() = port.route_preserving_errors();
             },
-            ScriptThreadMessage::TickAllAnimations(_webviews) => {
+            ScriptThreadMessage::TickAllAnimations(_webviews, callback) => {
+                if let Some(callback) = callback {
+                    self.pending_rendering_update_callbacks
+                        .borrow_mut()
+                        .push(callback);
+                }
                 self.set_needs_rendering_update();
             },
             ScriptThreadMessage::NoLongerWaitingOnAsychronousImageUpdates(pipeline_id) => {

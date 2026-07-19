@@ -136,9 +136,10 @@ impl AnimationRefreshDriverObserver {
 
         if let Err(error) =
             self.constellation_sender
-                .send(EmbedderToConstellationMessage::TickAnimation(vec![
-                    webview_renderer.id,
-                ]))
+                .send(EmbedderToConstellationMessage::TickAnimation(
+                    vec![webview_renderer.id],
+                    None,
+                ))
         {
             warn!("Sending tick to constellation failed ({error:?}).");
         }
@@ -169,6 +170,7 @@ impl RefreshDriverObserver for AnimationRefreshDriverObserver {
             self.constellation_sender
                 .send(EmbedderToConstellationMessage::TickAnimation(
                     animating_webviews,
+                    None,
                 ))
         {
             warn!("Sending tick to constellation failed ({error:?}).");

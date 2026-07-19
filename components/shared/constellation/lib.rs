@@ -57,7 +57,7 @@ pub enum EmbedderToConstellationMessage {
     ThemeChange(WebViewId, Theme),
     /// Requests that the constellation instruct script/layout to try to layout again and tick
     /// animations.
-    TickAnimation(Vec<WebViewId>),
+    TickAnimation(Vec<WebViewId>, Option<GenericCallback<bool>>),
     /// Notify the `ScriptThread` that the Servo renderer is no longer waiting on
     /// asynchronous image uploads for the given `Pipeline`. These are mainly used
     /// by canvas to perform uploads while the display list is being built.

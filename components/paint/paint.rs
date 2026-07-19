@@ -405,6 +405,9 @@ impl Paint {
             PaintMessage::EmbedderSceneFrameReady(..) => {
                 unreachable!("Embedder scene frames should be handled in the caller.");
             },
+            PaintMessage::EmbedderRenderingUpdateReady(..) => {
+                unreachable!("Embedder rendering updates should be handled in the caller.");
+            },
             PaintMessage::SendInitialTransaction(webview_id, pipeline_id) => {
                 if let Some(mut painter) = self.maybe_painter_mut(webview_id.into()) {
                     painter.send_initial_pipeline_transaction(webview_id, pipeline_id);
@@ -730,6 +733,20 @@ impl Paint {
         self.painter(webview_id.into()).take_ready_scene_frame()
     }
 
+    pub fn rendering_update_callback(
+        &self,
+        webview_id: WebViewId,
+        frame_tag: u64,
+    ) -> Option<servo_base::generic_channel::GenericCallback<bool>> {
+        self.painter(webview_id.into())
+            .rendering_update_callback(frame_tag)
+    }
+
+    pub fn take_unchanged_rendering_update(&self, webview_id: WebViewId) -> Option<u64> {
+        self.painter(webview_id.into())
+            .take_unchanged_rendering_update()
+    }
+
     /// Get the message receiver for this [`Paint`].
     pub fn receiver(&self) -> &RoutedReceiver<PaintMessage> {
         &self.paint_receiver
@@ -760,6 +777,12 @@ impl Paint {
                     }
                 } else {
                     warn!("WebRender dropped embedder scene frame {frame_tag}");
+                }
+                false
+            },
+            PaintMessage::EmbedderRenderingUpdateReady(painter_id, frame_tag, changed) => {
+                if let Some(painter) = self.maybe_painter(*painter_id) {
+                    painter.mark_rendering_update_complete(*frame_tag, *changed);
                 }
                 false
             },

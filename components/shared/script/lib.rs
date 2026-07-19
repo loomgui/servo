@@ -246,7 +246,7 @@ pub enum ScriptThreadMessage {
     /// Passes a webdriver command to the script thread for execution
     WebDriverScriptCommand(PipelineId, WebDriverScriptCommand),
     /// Notifies script thread that all animations are done
-    TickAllAnimations(Vec<WebViewId>),
+    TickAllAnimations(Vec<WebViewId>, Option<GenericCallback<bool>>),
     /// Notifies the script thread that a new Web font has been loaded, and thus the page should be
     /// reflowed.
     WebFontLoaded(PipelineId),

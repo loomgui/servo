@@ -33,7 +33,7 @@ use profile_traits::time_profile;
 use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::Epoch;
 use servo_base::cross_process_instant::CrossProcessInstant;
-use servo_base::generic_channel::{GenericReceiver, GenericSharedMemory};
+use servo_base::generic_channel::{GenericCallback, GenericReceiver, GenericSharedMemory};
 use servo_base::id::{PainterId, PipelineId, WebViewId};
 use servo_config::{opts, pref};
 use servo_constellation_traits::{EmbedderToConstellationMessage, PaintMetricEvent};
@@ -145,6 +145,14 @@ pub(crate) struct Painter {
 
     /// Completed non-zero scene tags not yet consumed by the embedder.
     ready_scene_frame_tags: RefCell<VecDeque<u64>>,
+
+    /// External rendering opportunities that completed without producing or
+    /// waiting on any visual update.
+    ready_unchanged_frame_tags: RefCell<VecDeque<u64>>,
+
+    /// An unchanged external rendering opportunity waiting for an older
+    /// WebRender frame to finish before it can safely be classified.
+    pending_unchanged_frame_tag: Cell<Option<u64>>,
 
     /// Routes exact scene-transaction notifications back to this painter.
     scene_frame_notification_sender: Sender<Result<PaintMessage, ipc_channel::IpcError>>,
@@ -322,6 +330,8 @@ impl Painter {
             prepared_frame_tag: None,
             next_scene_frame_tag: Cell::new(None),
             ready_scene_frame_tags: RefCell::new(VecDeque::new()),
+            ready_unchanged_frame_tags: RefCell::new(VecDeque::new()),
+            pending_unchanged_frame_tag: Cell::new(None),
             scene_frame_notification_sender: paint.paint_proxy.sender.clone(),
             scene_frame_notification_waker: paint.paint_proxy.event_loop_waker.clone(),
             webrender_api,
@@ -460,6 +470,9 @@ impl Painter {
 
     pub(crate) fn mark_scene_frame_ready(&self, frame_tag: u64) {
         if frame_tag != 0 {
+            if self.pending_unchanged_frame_tag.get() == Some(frame_tag) {
+                self.pending_unchanged_frame_tag.set(None);
+            }
             self.ready_scene_frame_tags
                 .borrow_mut()
                 .push_back(frame_tag);
@@ -468,6 +481,66 @@ impl Painter {
 
     pub(crate) fn take_ready_scene_frame(&self) -> Option<u64> {
         self.ready_scene_frame_tags.borrow_mut().pop_front()
+    }
+
+    pub(crate) fn rendering_update_callback(
+        &self,
+        frame_tag: u64,
+    ) -> Option<GenericCallback<bool>> {
+        if frame_tag == 0 {
+            return None;
+        }
+        let sender = self.scene_frame_notification_sender.clone();
+        let waker = self.scene_frame_notification_waker.clone();
+        let painter_id = self.painter_id;
+        GenericCallback::new(move |result| {
+            let Ok(changed) = result else {
+                warn!("Embedder rendering update callback was disconnected");
+                return;
+            };
+            if let Err(error) = sender.send(Ok(PaintMessage::EmbedderRenderingUpdateReady(
+                painter_id, frame_tag, changed,
+            ))) {
+                warn!("Failed to send embedder rendering update result: {error:?}");
+            }
+            waker.wake();
+        })
+        .ok()
+    }
+
+    pub(crate) fn mark_rendering_update_complete(&self, frame_tag: u64, changed: bool) {
+        if changed || self.next_scene_frame_tag.get() != Some(frame_tag) {
+            return;
+        }
+
+        if self.needs_repaint() {
+            self.next_scene_frame_tag.take();
+            self.mark_scene_frame_ready(frame_tag);
+        } else if self.has_pending_frames() {
+            self.pending_unchanged_frame_tag.set(Some(frame_tag));
+        } else {
+            self.ready_unchanged_frame_tags
+                .borrow_mut()
+                .push_back(frame_tag);
+        }
+    }
+
+    pub(crate) fn take_unchanged_rendering_update(&self) -> Option<u64> {
+        let frame_tag = self.ready_unchanged_frame_tags.borrow_mut().pop_front()?;
+        if self.next_scene_frame_tag.get() != Some(frame_tag) {
+            return None;
+        }
+        if self.needs_repaint() {
+            self.next_scene_frame_tag.take();
+            self.mark_scene_frame_ready(frame_tag);
+            return None;
+        }
+        if self.has_pending_frames() {
+            self.pending_unchanged_frame_tag.set(Some(frame_tag));
+            return None;
+        }
+        self.next_scene_frame_tag.take();
+        Some(frame_tag)
     }
 
     /// Consume pending WebRender transactions without drawing into the
@@ -1647,6 +1720,25 @@ impl Painter {
         if !repaint_needed {
             self.screenshot_taker
                 .maybe_trigger_paint_for_screenshot(self);
+        }
+
+        let Some(frame_tag) = self.pending_unchanged_frame_tag.get() else {
+            return;
+        };
+        if self.has_pending_frames() {
+            return;
+        }
+        self.pending_unchanged_frame_tag.set(None);
+        if self.next_scene_frame_tag.get() != Some(frame_tag) {
+            return;
+        }
+        self.next_scene_frame_tag.take();
+        if self.needs_repaint() {
+            self.mark_scene_frame_ready(frame_tag);
+        } else {
+            self.ready_unchanged_frame_tags
+                .borrow_mut()
+                .push_back(frame_tag);
         }
     }
 

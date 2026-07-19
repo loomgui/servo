@@ -100,6 +100,9 @@ pub enum PaintMessage {
     /// A WebRender scene transaction carrying an embedder-provided tag reached
     /// `FrameBuilt`. The bool is false if WebRender dropped the transaction instead.
     EmbedderSceneFrameReady(PainterId, u64, bool),
+    /// The script rendering opportunity requested for an embedder frame
+    /// completed. The bool says whether it generated a new display list.
+    EmbedderRenderingUpdateReady(PainterId, u64, bool),
     /// Script or the Constellation is notifying the renderer that a Pipeline has finished
     /// shutting down. The renderer will not discard the Pipeline until both report that
     /// they have fully shut it down, to avoid recreating it due to any subsequent

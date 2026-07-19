@@ -1450,8 +1450,8 @@ where
             EmbedderToConstellationMessage::ThemeChange(webview_id, theme) => {
                 self.handle_theme_change(webview_id, theme);
             },
-            EmbedderToConstellationMessage::TickAnimation(webview_ids) => {
-                self.handle_tick_animation(webview_ids)
+            EmbedderToConstellationMessage::TickAnimation(webview_ids, callback) => {
+                self.handle_tick_animation(webview_ids, callback)
             },
             EmbedderToConstellationMessage::NoLongerWaitingOnAsynchronousImageUpdates(
                 pipeline_ids,
@@ -3735,7 +3735,11 @@ where
     }
 
     #[servo_tracing::instrument(skip_all)]
-    fn handle_tick_animation(&mut self, webview_ids: Vec<WebViewId>) {
+    fn handle_tick_animation(
+        &mut self,
+        webview_ids: Vec<WebViewId>,
+        callback: Option<GenericCallback<bool>>,
+    ) {
         let mut animating_event_loops = HashSet::new();
 
         for webview_id in webview_ids.iter() {
@@ -3750,8 +3754,10 @@ where
                     // with a particular pipeline. In addition, the danger of not progressing animations is pretty
                     // low, so it's probably safe to ignore this error and handle the crashed ScriptThread on
                     // some other message.
-                    let _ = event_loop
-                        .send(ScriptThreadMessage::TickAllAnimations(webview_ids.clone()));
+                    let _ = event_loop.send(ScriptThreadMessage::TickAllAnimations(
+                        webview_ids.clone(),
+                        callback.clone(),
+                    ));
                     animating_event_loops.insert(event_loop.id());
                 }
             }

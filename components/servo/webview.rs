@@ -788,12 +788,38 @@ impl WebView {
     /// timer-based fallback rendering opportunity.
     pub fn request_rendering_update(&self) {
         self.inner().servo.constellation_proxy().send(
-            EmbedderToConstellationMessage::TickAnimation(vec![self.id()]),
+            EmbedderToConstellationMessage::TickAnimation(vec![self.id()], None),
         );
+    }
+
+    /// Request a rendering opportunity and report whether it produced a new
+    /// scene for the supplied external-frame tag.
+    pub fn request_rendering_update_for_frame(&self, frame_tag: u64) -> bool {
+        let Some(callback) = self
+            .inner()
+            .servo
+            .paint()
+            .rendering_update_callback(self.id(), frame_tag)
+        else {
+            return false;
+        };
+        self.inner().servo.constellation_proxy().send(
+            EmbedderToConstellationMessage::TickAnimation(vec![self.id()], Some(callback)),
+        );
+        true
     }
 
     pub fn take_ready_scene_frame(&self) -> Option<u64> {
         self.inner().servo.paint().take_ready_scene_frame(self.id())
+    }
+
+    /// Return an externally-clocked rendering opportunity that completed
+    /// without changing the visual output.
+    pub fn take_unchanged_rendering_update(&self) -> Option<u64> {
+        self.inner()
+            .servo
+            .paint()
+            .take_unchanged_rendering_update(self.id())
     }
 
     /// Get the [`UserContentManager`] associated with this [`WebView`].
