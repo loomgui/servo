@@ -48,6 +48,10 @@ pub use paint::WebRenderDebugOption;
 pub use paint_api::rendering_context::{
     OffscreenRenderingContext, RenderingContext, SoftwareRenderingContext, WindowRenderingContext,
 };
+pub use paint_api::{
+    EmbedderExternalImageResolution, EmbedderExternalImageResolver, ExternalImageSource,
+    WebRenderExternalImageApi,
+};
 // Expose our profile traits for servoshell, so we can instrument code there, but don't
 // add it as an official API.
 #[doc(hidden)]

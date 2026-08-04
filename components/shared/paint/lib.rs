@@ -579,8 +579,39 @@ impl PainterSurfmanDetailsMap {
 /// This trait is used to notify lock/unlock messages and get the
 /// required info that WR needs.
 pub trait WebRenderExternalImageApi {
+    /// Whether this handler owns an id that is not registered with Servo's
+    /// built-in external-image id manager. Embedder handlers override this;
+    /// built-in handlers continue to use the manager routing above.
+    fn owns_unregistered_id(&self, _id: u64) -> bool {
+        false
+    }
+
     fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, UntypedSize2D<i32>);
     fn unlock(&mut self, id: u64);
+}
+
+/// Result of asking an embedder whether a URL names a GPU-native image.
+///
+/// `NotHandled` leaves the URL on Servo's normal fetch/decode path. This is
+/// important for embedders which use one custom protocol for both ordinary
+/// encoded images and GPU-native images.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmbedderExternalImageResolution {
+    NotHandled,
+    Unavailable,
+    Ready {
+        id: ExternalImageId,
+        width: u32,
+        height: u32,
+        buffer_kind: webrender_api::ImageBufferKind,
+    },
+}
+
+/// Thread-safe URL resolver for embedder-owned WebRender external images.
+/// The corresponding native texture is supplied by a
+/// [`WebRenderExternalImageApi`] installed on [`crate::WebRenderExternalImageHandlers`].
+pub trait EmbedderExternalImageResolver: Send + Sync {
+    fn resolve(&self, url: &str) -> EmbedderExternalImageResolution;
 }
 
 /// Type of WebRender External Image Handler.
@@ -589,6 +620,7 @@ pub enum WebRenderImageHandlerType {
     WebGl,
     Media,
     WebGpu,
+    Embedder,
 }
 
 /// List of WebRender external images to be shared among all external image
@@ -631,6 +663,8 @@ pub struct WebRenderExternalImageHandlers {
     media_handler: Option<Box<dyn WebRenderExternalImageApi>>,
     /// WebGPU handler.
     webgpu_handler: Option<Box<dyn WebRenderExternalImageApi>>,
+    /// Optional handler installed by an embedder for GPU-native image URLs.
+    embedder_handler: Option<Box<dyn WebRenderExternalImageApi>>,
     /// A [`WebRenderExternalImageIdManager`] responsible for creating new [`ExternalImageId`]s.
     /// This is shared with the WebGL, WebGPU, and hardware-accelerated media threads and
     /// all other instances of [`WebRenderExternalImageHandlers`] -- one per WebRender instance.
@@ -643,6 +677,7 @@ impl WebRenderExternalImageHandlers {
             webgl_handler: Default::default(),
             media_handler: Default::default(),
             webgpu_handler: Default::default(),
+            embedder_handler: Default::default(),
             id_manager,
         }
     }
@@ -660,6 +695,7 @@ impl WebRenderExternalImageHandlers {
             WebRenderImageHandlerType::WebGl => self.webgl_handler = Some(handler),
             WebRenderImageHandlerType::Media => self.media_handler = Some(handler),
             WebRenderImageHandlerType::WebGpu => self.webgpu_handler = Some(handler),
+            WebRenderImageHandlerType::Embedder => self.embedder_handler = Some(handler),
         }
     }
 }
@@ -675,10 +711,17 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
         _channel_index: u8,
         _is_composited: bool,
     ) -> ExternalImage<'_> {
-        let handler_type = self
-            .id_manager()
-            .get(&key)
-            .expect("Tried to get unknown external image");
+        let handler_type = self.id_manager().get(&key).unwrap_or_else(|| {
+            if self
+                .embedder_handler
+                .as_ref()
+                .is_some_and(|handler| handler.owns_unregistered_id(key.0))
+            {
+                WebRenderImageHandlerType::Embedder
+            } else {
+                panic!("Tried to get unknown external image")
+            }
+        });
         match handler_type {
             WebRenderImageHandlerType::WebGl => {
                 let (source, size) = self.webgl_handler.as_mut().unwrap().lock(key.0);
@@ -709,21 +752,38 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
                     source,
                 }
             },
+            WebRenderImageHandlerType::Embedder => {
+                let (source, size) = self.embedder_handler.as_mut().unwrap().lock(key.0);
+                ExternalImage {
+                    uv: TexelRect::new(0.0, size.height as f32, size.width as f32, 0.0),
+                    source,
+                }
+            },
         }
     }
 
     /// Unlock the external image. The WR should not read the image
     /// content after this call.
     fn unlock(&mut self, key: ExternalImageId, _channel_index: u8) {
-        let handler_type = self
-            .id_manager()
-            .get(&key)
-            .expect("Tried to get unknown external image");
+        let handler_type = self.id_manager().get(&key).unwrap_or_else(|| {
+            if self
+                .embedder_handler
+                .as_ref()
+                .is_some_and(|handler| handler.owns_unregistered_id(key.0))
+            {
+                WebRenderImageHandlerType::Embedder
+            } else {
+                panic!("Tried to get unknown external image")
+            }
+        });
         match handler_type {
             WebRenderImageHandlerType::WebGl => self.webgl_handler.as_mut().unwrap().unlock(key.0),
             WebRenderImageHandlerType::Media => self.media_handler.as_mut().unwrap().unlock(key.0),
             WebRenderImageHandlerType::WebGpu => {
                 self.webgpu_handler.as_mut().unwrap().unlock(key.0)
+            },
+            WebRenderImageHandlerType::Embedder => {
+                self.embedder_handler.as_mut().unwrap().unlock(key.0)
             },
         };
     }

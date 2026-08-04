@@ -9,6 +9,7 @@ use std::rc::Rc;
 
 use crossbeam_channel::Sender;
 use embedder_traits::{EventLoopWaker, ShutdownState};
+use paint_api::WebRenderExternalImageApi;
 use paint_api::{PaintMessage, PaintProxy};
 use profile_traits::{mem, time};
 use servo_base::generic_channel::RoutedReceiver;
@@ -52,6 +53,8 @@ pub struct InitialPaintState {
     /// An [`EventLoopWaker`] used in order to wake up the embedder when it is
     /// time to paint.
     pub event_loop_waker: Box<dyn EventLoopWaker>,
+    /// Optional GPU-native image handler supplied by the embedder.
+    pub embedder_external_image_handler: Option<Box<dyn WebRenderExternalImageApi>>,
     /// If WebXR is enabled, a [`WebXrRegistry`] to register WebXR threads.
     #[cfg(feature = "webxr")]
     pub webxr_registry: Box<dyn WebXrRegistry>,

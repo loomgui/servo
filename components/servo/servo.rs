@@ -35,7 +35,10 @@ use net::resource_thread::new_resource_threads;
 use net_traits::{ResourceThreads, exit_fetch_thread, start_fetch_thread};
 use paint::{InitialPaintState, Paint};
 pub use paint_api::rendering_context::RenderingContext;
-use paint_api::{CrossProcessPaintApi, PaintMessage, PaintProxy};
+use paint_api::{
+    CrossProcessPaintApi, EmbedderExternalImageResolver, PaintMessage, PaintProxy,
+    WebRenderExternalImageApi,
+};
 use profile::{mem as profile_mem, system_reporter, time as profile_time};
 use profile_traits::mem::{MemoryReportResult, ProfilerMsg, Reporter};
 use profile_traits::{mem, time};
@@ -956,6 +959,7 @@ impl Servo {
             mem_profiler_chan: mem_profiler_chan.clone(),
             shutdown_state: shutdown_state.clone(),
             event_loop_waker: event_loop_waker.clone(),
+            embedder_external_image_handler: builder.embedder_external_image_handler,
             #[cfg(feature = "webxr")]
             webxr_registry: builder.webxr_registry,
         });
@@ -992,6 +996,7 @@ impl Servo {
             public_resource_threads.clone(),
             private_resource_threads.clone(),
             async_runtime,
+            builder.embedder_external_image_resolver,
             public_storage_threads.clone(),
             private_storage_threads.clone(),
         );
@@ -1193,6 +1198,7 @@ fn create_constellation(
     public_resource_threads: ResourceThreads,
     private_resource_threads: ResourceThreads,
     async_runtime: Box<dyn net_traits::AsyncRuntime>,
+    embedder_external_image_resolver: Option<Arc<dyn EmbedderExternalImageResolver>>,
     public_storage_threads: StorageThreads,
     private_storage_threads: StorageThreads,
 ) {
@@ -1236,6 +1242,7 @@ fn create_constellation(
         #[cfg(feature = "webgpu")]
         wgpu_image_map: paint.webgpu_image_map(),
         async_runtime,
+        embedder_external_image_resolver,
         privileged_urls,
         wake_lock_provider: Box::new(DefaultWakeLockDelegate),
     };
@@ -1338,6 +1345,7 @@ pub fn run_content_process(token: String) {
                 layout_factory,
                 Arc::new(ImageCacheFactoryImpl::new(
                     new_event_loop_info.broken_image_icon_data,
+                    None,
                 )),
                 background_hang_monitor_register,
             );
@@ -1414,6 +1422,8 @@ pub struct ServoBuilder {
     preferences: Option<Box<Preferences>>,
     event_loop_waker: Box<dyn EventLoopWaker>,
     protocol_registry: ProtocolRegistry,
+    embedder_external_image_resolver: Option<Arc<dyn EmbedderExternalImageResolver>>,
+    embedder_external_image_handler: Option<Box<dyn WebRenderExternalImageApi>>,
     #[cfg(feature = "webxr")]
     webxr_registry: Box<dyn webxr::WebXrRegistry>,
 }
@@ -1425,6 +1435,8 @@ impl Default for ServoBuilder {
             preferences: Default::default(),
             event_loop_waker: Box::new(DefaultEventLoopWaker),
             protocol_registry: Default::default(),
+            embedder_external_image_resolver: None,
+            embedder_external_image_handler: None,
             #[cfg(feature = "webxr")]
             webxr_registry: Box::new(DefaultWebXrRegistry),
         }
@@ -1453,6 +1465,18 @@ impl ServoBuilder {
 
     pub fn protocol_registry(mut self, protocol_registry: ProtocolRegistry) -> Self {
         self.protocol_registry = protocol_registry;
+        self
+    }
+
+    /// Install a URL resolver and native-texture handler for GPU images owned
+    /// by the embedder.
+    pub fn external_image_bridge(
+        mut self,
+        resolver: Arc<dyn EmbedderExternalImageResolver>,
+        handler: Box<dyn WebRenderExternalImageApi>,
+    ) -> Self {
+        self.embedder_external_image_resolver = Some(resolver);
+        self.embedder_external_image_handler = Some(handler);
         self
     }
 

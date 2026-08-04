@@ -127,8 +127,8 @@ use net::image_cache::ImageCacheFactoryImpl;
 use net_traits::pub_domains::registered_domain_name;
 use net_traits::{self, AsyncRuntime, ResourceThreads, exit_fetch_thread, start_fetch_thread};
 use paint_api::{
-    PaintMessage, PaintProxy, PinchZoomInfos, PipelineExitSource, SendableFrameTree,
-    WebRenderExternalImageIdManager,
+    EmbedderExternalImageResolver, PaintMessage, PaintProxy, PinchZoomInfos, PipelineExitSource,
+    SendableFrameTree, WebRenderExternalImageIdManager,
 };
 use profile_traits::mem::ProfilerMsg;
 use profile_traits::{mem, time};
@@ -583,6 +583,9 @@ pub struct InitialConstellationState {
     /// The async runtime.
     pub async_runtime: Box<dyn AsyncRuntime>,
 
+    /// Optional resolver for embedder-owned GPU-native image URLs.
+    pub embedder_external_image_resolver: Option<Arc<dyn EmbedderExternalImageResolver>>,
+
     /// The wake lock provider for acquiring and releasing OS-level screen wake locks.
     pub wake_lock_provider: Box<dyn WakeLockDelegate>,
 }
@@ -737,6 +740,7 @@ where
                     privileged_urls: state.privileged_urls,
                     image_cache_factory: Arc::new(ImageCacheFactoryImpl::new(
                         broken_image_icon_data,
+                        state.embedder_external_image_resolver,
                     )),
                     pending_viewport_changes: Default::default(),
                     screenshot_readiness_requests: Vec::new(),

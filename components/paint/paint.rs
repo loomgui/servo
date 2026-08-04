@@ -20,6 +20,7 @@ use euclid::{Scale, Size2D};
 use image::RgbaImage;
 use ipc_channel::ipc::{self};
 use log::{debug, warn};
+use paint_api::WebRenderExternalImageApi;
 use paint_api::rendering_context::RenderingContext;
 use paint_api::{
     PaintMessage, PaintProxy, PainterSurfmanDetails, PainterSurfmanDetailsMap,
@@ -84,6 +85,11 @@ pub struct Paint {
     /// All of the [`Painters`] for this [`Paint`]. Each [`Painter`] handles painting to
     /// a single [`RenderingContext`].
     painters: Vec<Rc<RefCell<Painter>>>,
+
+    /// The embedder image handler is consumed by the first painter. Servo's
+    /// embedder API creates one painter per rendering context; Loom uses one.
+    pub(crate) embedder_external_image_handler:
+        RefCell<Option<Box<dyn WebRenderExternalImageApi>>>,
 
     /// A [`PaintProxy`] which can be used to allow other parts of Servo to communicate
     /// with this [`Paint`].
@@ -198,6 +204,7 @@ impl Paint {
 
         Rc::new(RefCell::new(Paint {
             painters: Default::default(),
+            embedder_external_image_handler: RefCell::new(state.embedder_external_image_handler),
             paint_proxy: state.paint_proxy,
             event_loop_waker: state.event_loop_waker,
             shutdown_state: state.shutdown_state,
@@ -745,6 +752,11 @@ impl Paint {
     pub fn take_unchanged_rendering_update(&self, webview_id: WebViewId) -> Option<u64> {
         self.painter(webview_id.into())
             .take_unchanged_rendering_update()
+    }
+
+    pub fn generate_external_image_frame(&self, webview_id: WebViewId) {
+        self.painter_mut(webview_id.into())
+            .generate_external_image_frame();
     }
 
     /// Get the message receiver for this [`Paint`].

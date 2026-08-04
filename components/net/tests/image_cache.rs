@@ -32,7 +32,7 @@ fn create_test_image_cache() -> (Arc<dyn ImageCache>, Receiver<PipelineId>) {
         }
     })));
 
-    let factory = ImageCacheFactoryImpl::new(vec![]);
+    let factory = ImageCacheFactoryImpl::new(vec![], None);
     let cache = factory.create(TEST_WEBVIEW_ID, TEST_PIPELINE_ID, &paint_api);
     (cache, receiver)
 }

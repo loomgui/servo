@@ -21,7 +21,10 @@ use net_traits::image_cache::{
 };
 use net_traits::request::CorsSettings;
 use net_traits::{FetchMetadata, FetchResponseMsg, FilteredMetadata, NetworkError};
-use paint_api::{CrossProcessPaintApi, ImageUpdate, SerializableImageData};
+use paint_api::{
+    CrossProcessPaintApi, EmbedderExternalImageResolution, EmbedderExternalImageResolver,
+    ImageUpdate, SerializableImageData,
+};
 use parking_lot::Mutex;
 use pixels::{CorsStatus, ImageFrame, ImageMetadata, PixelFormat, RasterImage, load_from_memory};
 use profile_traits::mem::{Report, ReportKind};
@@ -32,8 +35,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::id::{PipelineId, WebViewId};
 use servo_base::threadpool::ThreadPool;
 use servo_url::{ImmutableOrigin, ServoUrl};
-use webrender_api::ImageKey as WebRenderImageKey;
 use webrender_api::units::DeviceIntSize;
+use webrender_api::{
+    ExternalImageData, ExternalImageType, ImageDescriptor, ImageDescriptorFlags, ImageFormat,
+    ImageKey as WebRenderImageKey,
+};
 
 // We bake in rippy.png as a fallback, in case the embedder does not provide a broken
 // image icon resource. This version is 229 bytes, so don't exchange it against
@@ -477,6 +483,11 @@ struct ImageCacheStore {
     /// Images that have finished loading (successful or not)
     completed_loads: HashMap<ImageKey, CompletedLoad>,
 
+    /// GPU-native images resolved by the embedder. They bypass byte fetch,
+    /// decode, and upload while retaining the ordinary image-cache identity.
+    #[conditional_malloc_size_of]
+    external_images: HashMap<ImageKey, Arc<RasterImage>>,
+
     /// Vector (e.g. SVG) images that have been sucessfully loaded and parsed
     /// but are yet to be rasterized. Since the same SVG data can be used for
     /// rasterizing at different sizes, we use this hasmap to share the data.
@@ -783,10 +794,14 @@ pub struct ImageCacheFactoryImpl {
     /// A shared font database to be used by system fonts accessed when rasterizing vector
     /// images.
     fontdb: Arc<fontdb::Database>,
+    external_image_resolver: Option<Arc<dyn EmbedderExternalImageResolver>>,
 }
 
 impl ImageCacheFactoryImpl {
-    pub fn new(broken_image_icon_data: Vec<u8>) -> Self {
+    pub fn new(
+        broken_image_icon_data: Vec<u8>,
+        external_image_resolver: Option<Arc<dyn EmbedderExternalImageResolver>>,
+    ) -> Self {
         debug!("Creating new ImageCacheFactoryImpl");
         let mut fontdb = fontdb::Database::new();
         fontdb.load_system_fonts();
@@ -795,6 +810,7 @@ impl ImageCacheFactoryImpl {
             broken_image_icon_data: Arc::new(broken_image_icon_data),
             thread_pool: ThreadPool::global(),
             fontdb: Arc::new(fontdb),
+            external_image_resolver,
         }
     }
 }
@@ -810,6 +826,7 @@ impl ImageCacheFactory for ImageCacheFactoryImpl {
             store: Arc::new(Mutex::new(ImageCacheStore {
                 pending_loads: AllPendingLoads::new(),
                 completed_loads: HashMap::new(),
+                external_images: HashMap::new(),
                 vector_images: FxHashMap::default(),
                 rasterized_vector_images: FxHashMap::default(),
                 broken_image_icon_image: OnceCell::new(),
@@ -823,6 +840,7 @@ impl ImageCacheFactory for ImageCacheFactoryImpl {
             broken_image_icon_data: self.broken_image_icon_data.clone(),
             thread_pool: self.thread_pool.clone(),
             fontdb: self.fontdb.clone(),
+            external_image_resolver: self.external_image_resolver.clone(),
         })
     }
 }
@@ -840,6 +858,108 @@ pub struct ImageCacheImpl {
     /// A shared font database to be used by system fonts accessed when rasterizing vector
     /// images. This is shared with other [`ImageCache`]s in the same process.
     fontdb: Arc<fontdb::Database>,
+    external_image_resolver: Option<Arc<dyn EmbedderExternalImageResolver>>,
+}
+
+impl ImageCacheImpl {
+    /// Resolve an embedder image without ever materializing pixel bytes.
+    /// `None` means the resolver did not claim the URL and normal loading
+    /// should continue; `Some(Err(()))` is a claimed but unavailable image.
+    fn resolve_external_image(
+        &self,
+        url: &ServoUrl,
+        origin: &ImmutableOrigin,
+        cors_setting: Option<CorsSettings>,
+    ) -> Option<Result<Arc<RasterImage>, ()>> {
+        let resolution = self.external_image_resolver.as_ref()?.resolve(url.as_str());
+        let descriptor = match resolution {
+            EmbedderExternalImageResolution::NotHandled => return None,
+            EmbedderExternalImageResolution::Unavailable => {
+                let cache_key = (url.clone(), origin.clone(), cors_setting);
+                let mut store = self.store.lock();
+                if let Some(image) = store.external_images.remove(&cache_key)
+                    && let Some(image_key) = image.id
+                {
+                    store.paint_api.delete_image(image_key);
+                }
+                return Some(Err(()));
+            },
+            EmbedderExternalImageResolution::Ready {
+                id,
+                width,
+                height,
+                buffer_kind,
+            } => (id, width, height, buffer_kind),
+        };
+
+        let cache_key = (url.clone(), origin.clone(), cors_setting);
+        let mut store = self.store.lock();
+        if let Some(image) = store.external_images.get(&cache_key) {
+            if image.metadata.width == descriptor.1 && image.metadata.height == descriptor.2 {
+                return Some(Ok(image.clone()));
+            }
+            if let Some(image_key) = image.id {
+                store.paint_api.delete_image(image_key);
+            }
+            store.external_images.remove(&cache_key);
+        }
+
+        let Some(image_key) = take_image_key(&mut store) else {
+            return Some(Err(()));
+        };
+        let wr_descriptor = ImageDescriptor {
+            size: DeviceIntSize::new(descriptor.1 as i32, descriptor.2 as i32),
+            stride: None,
+            format: ImageFormat::BGRA8,
+            offset: 0,
+            flags: ImageDescriptorFlags::empty(),
+        };
+        let data = SerializableImageData::External(ExternalImageData {
+            id: descriptor.0,
+            channel_index: 0,
+            image_type: ExternalImageType::TextureHandle(descriptor.3),
+            normalized_uvs: false,
+        });
+        store
+            .paint_api
+            .add_image(image_key, wr_descriptor, data, false);
+
+        // Layout needs the natural dimensions and WebRender image key. The
+        // zero-length frame is deliberate: no API on this path receives or
+        // uploads CPU pixels.
+        let image = Arc::new(RasterImage {
+            metadata: ImageMetadata {
+                width: descriptor.1,
+                height: descriptor.2,
+            },
+            format: PixelFormat::BGRA8,
+            id: Some(image_key),
+            cors_status: CorsStatus::Safe,
+            bytes: Arc::new(Vec::new()),
+            frames: vec![ImageFrame {
+                delay: None,
+                byte_range: 0..0,
+                width: descriptor.1,
+                height: descriptor.2,
+            }],
+            is_opaque: false,
+            loop_count: None,
+        });
+        store.external_images.insert(cache_key, image.clone());
+        Some(Ok(image))
+    }
+}
+
+fn take_image_key(store: &mut ImageCacheStore) -> Option<WebRenderImageKey> {
+    if let KeyCacheState::Ready(ref mut cache) = store.key_cache.cache {
+        if let Some(image_key) = cache.pop() {
+            return Some(image_key);
+        }
+        store.fetch_more_image_keys();
+    }
+    store
+        .paint_api
+        .generate_image_key_blocking(store.webview_id)
 }
 
 impl ImageCache for ImageCacheImpl {
@@ -867,17 +987,7 @@ impl ImageCache for ImageCacheImpl {
 
     fn get_image_key(&self) -> Option<WebRenderImageKey> {
         let mut store = self.store.lock();
-        if let KeyCacheState::Ready(ref mut cache) = store.key_cache.cache {
-            if let Some(image_key) = cache.pop() {
-                return Some(image_key);
-            }
-
-            store.fetch_more_image_keys();
-        }
-
-        store
-            .paint_api
-            .generate_image_key_blocking(store.webview_id)
+        take_image_key(&mut store)
     }
 
     fn get_image(
@@ -886,6 +996,9 @@ impl ImageCache for ImageCacheImpl {
         origin: ImmutableOrigin,
         cors_setting: Option<CorsSettings>,
     ) -> Option<Image> {
+        if let Some(result) = self.resolve_external_image(&url, &origin, cors_setting.clone()) {
+            return result.ok().map(Image::Raster);
+        }
         let store = self.store.lock();
         let result = store.get_completed_image_if_available(url, origin, cors_setting);
         match result {
@@ -900,6 +1013,17 @@ impl ImageCache for ImageCacheImpl {
         origin: ImmutableOrigin,
         cors_setting: Option<CorsSettings>,
     ) -> ImageCacheResult {
+        if let Some(result) = self.resolve_external_image(&url, &origin, cors_setting.clone()) {
+            return match result {
+                Ok(image) => {
+                    ImageCacheResult::Available(ImageOrMetadataAvailable::ImageAvailable {
+                        image: Image::Raster(image),
+                        url,
+                    })
+                },
+                Err(()) => ImageCacheResult::FailedToLoadOrDecode,
+            };
+        }
         let mut store = self.store.lock();
         if let Some(result) =
             store.get_completed_image_if_available(url.clone(), origin.clone(), cors_setting)
@@ -1268,6 +1392,11 @@ impl ImageCacheStore {
                 _ => None,
             })
             .chain(
+                self.external_images
+                    .values()
+                    .filter_map(|image| image.id.map(ImageUpdate::DeleteImage)),
+            )
+            .chain(
                 self.rasterized_vector_images
                     .values()
                     .filter_map(|task| task.result.as_ref()?.id.map(ImageUpdate::DeleteImage)),
@@ -1288,6 +1417,7 @@ impl ImageCacheStore {
         // explicitly on pipeline close, and again on Drop (as a safeguard,
         // since we could forget to explicitly clear).
         self.completed_loads.clear();
+        self.external_images.clear();
         self.rasterized_vector_images.clear();
         let _ = self.broken_image_icon_image.take();
     }

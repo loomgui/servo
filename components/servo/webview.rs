@@ -813,6 +813,15 @@ impl WebView {
         self.inner().servo.paint().take_ready_scene_frame(self.id())
     }
 
+    /// Produce a tagged WebRender frame for embedder-owned external image
+    /// pixels even when script/layout did not change the display list.
+    pub fn request_external_image_frame(&self) {
+        self.inner()
+            .servo
+            .paint()
+            .generate_external_image_frame(self.id());
+    }
+
     /// Return an externally-clocked rendering opportunity that completed
     /// without changing the visual output.
     pub fn take_unchanged_rendering_update(&self) -> Option<u64> {

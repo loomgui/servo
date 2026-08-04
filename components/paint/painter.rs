@@ -233,6 +233,10 @@ impl Painter {
 
         WindowGLContext::initialize_image_handler(&mut external_image_handlers);
 
+        if let Some(handler) = paint.embedder_external_image_handler.borrow_mut().take() {
+            external_image_handlers.set_handler(handler, WebRenderImageHandlerType::Embedder);
+        }
+
         let embedder_to_constellation_sender = paint.embedder_to_constellation_sender.clone();
         let timer_refresh_driver = LazyCell::default();
         let refresh_driver = Rc::new(BaseRefreshDriver::new(
@@ -1295,6 +1299,14 @@ impl Painter {
         self.frame_delayer.set_pending_frame(false);
         self.screenshot_taker
             .prepare_screenshot_requests_for_render(self)
+    }
+
+    /// Generate a tagged WebRender frame when embedder-owned external image
+    /// pixels changed without a DOM/display-list mutation.
+    pub(crate) fn generate_external_image_frame(&mut self) {
+        let mut transaction = Transaction::new();
+        self.generate_frame(&mut transaction, RenderReasons::SCENE);
+        self.send_transaction(transaction);
     }
 
     fn serializable_image_data_to_image_data_maybe_caching(
