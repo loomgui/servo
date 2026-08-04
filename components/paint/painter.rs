@@ -50,8 +50,9 @@ use webrender_api::units::{
 use webrender_api::{
     self, BuiltDisplayList, BuiltDisplayListDescriptor, Checkpoint, ColorF, DirtyRect,
     DisplayListPayload, DocumentId, DynamicProperties, Epoch as WebRenderEpoch, ExternalScrollId,
-    FontInstanceFlags, FontInstanceKey, FontInstanceOptions, FontKey, FontVariation, ImageData,
-    ImageKey, NativeFontHandle, NotificationHandler, NotificationRequest,
+    ExternalImageData, FontInstanceFlags, FontInstanceKey, FontInstanceOptions, FontKey,
+    FontVariation, ImageData, ImageDescriptor, ImageKey, NativeFontHandle, NotificationHandler,
+    NotificationRequest,
     PipelineId as WebRenderPipelineId, PropertyBinding, ReferenceFrameKind, RenderReasons,
     SampledScrollOffset, SnapshotImageKey, SpaceAndClipInfo, SpatialId, TransformStyle,
 };
@@ -182,6 +183,12 @@ pub(crate) struct Painter {
     /// A cache that stores data for all animating images uploaded to WebRender. This is used
     /// for animated images, which only need to update their offset in the data.
     animation_image_cache: FxHashMap<ImageKey, Arc<Vec<u8>>>,
+
+    /// External registrations whose backing pixels can change without a new
+    /// display list or image key. Embedder-clocked frames re-submit these with
+    /// a full dirty rect so picture-cache tiles are rebuilt from the current
+    /// native texture instead of retaining the first sampled contents.
+    external_image_cache: FxHashMap<ImageKey, (ImageDescriptor, ExternalImageData)>,
 
     /// A [`WebContentAnimator`] used to manage web content-derived animations. Currently this only
     /// manages blinking caret animations.
@@ -346,6 +353,7 @@ impl Painter {
             frame_delayer: Default::default(),
             lcp_calculator: LargestContentfulPaintCalculator::new(),
             animation_image_cache: FxHashMap::default(),
+            external_image_cache: FxHashMap::default(),
             web_content_animator: WebContentAnimator::new(
                 paint.event_loop_waker.clone_box(),
                 (*timer_refresh_driver).clone(),
@@ -1305,6 +1313,14 @@ impl Painter {
     /// pixels changed without a DOM/display-list mutation.
     pub(crate) fn generate_external_image_frame(&mut self) {
         let mut transaction = Transaction::new();
+        for (key, (descriptor, image)) in &self.external_image_cache {
+            transaction.update_image(
+                *key,
+                descriptor.clone(),
+                ImageData::External(image.clone()),
+                &DirtyRect::All,
+            );
+        }
         self.generate_frame(&mut transaction, RenderReasons::SCENE);
         self.send_transaction(transaction);
     }
@@ -1332,6 +1348,12 @@ impl Painter {
         for update in updates {
             match update {
                 ImageUpdate::AddImage(key, description, data, is_animated_image) => {
+                    if let SerializableImageData::External(image) = &data {
+                        self.external_image_cache
+                            .insert(key, (description.clone(), image.clone()));
+                    } else {
+                        self.external_image_cache.remove(&key);
+                    }
                     txn.add_image(
                         key,
                         description,
@@ -1347,8 +1369,15 @@ impl Painter {
                     txn.delete_image(key);
                     self.frame_delayer.delete_image(key);
                     self.animation_image_cache.remove(&key);
+                    self.external_image_cache.remove(&key);
                 },
                 ImageUpdate::UpdateImage(key, desc, data, epoch) => {
+                    if let SerializableImageData::External(image) = &data {
+                        self.external_image_cache
+                            .insert(key, (desc.clone(), image.clone()));
+                    } else {
+                        self.external_image_cache.remove(&key);
+                    }
                     if let Some(epoch) = epoch {
                         self.frame_delayer.update_image(key, epoch);
                     }
