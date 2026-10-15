@@ -3,13 +3,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use js::rust::HandleObject;
 use rustc_hash::FxHashMap;
 use script_bindings::match_domstring_ascii;
-use script_bindings::reflector::{
-    Reflector, reflect_dom_object_with_cx, reflect_dom_object_with_proto_and_cx,
-};
+use script_bindings::reflector::{Reflector, reflect_dom_object, reflect_dom_object_with_proto};
+use script_bindings::traits::DomExceptionTrait;
 use servo_base::id::{DomExceptionId, DomExceptionIndex};
 use servo_constellation_traits::DomException;
 
@@ -184,10 +183,10 @@ impl DOMException {
     ) -> DomRoot<DOMException> {
         let (message, name) = DOMException::get_error_data_by_code(code);
 
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(DOMException::new_inherited(message, name)),
             global,
-            cx,
         )
     }
 
@@ -199,10 +198,10 @@ impl DOMException {
     ) -> DomRoot<DOMException> {
         let (_, name) = DOMException::get_error_data_by_code(code);
 
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(DOMException::new_inherited(DOMString::from(message), name)),
             global,
-            cx,
         )
     }
 
@@ -221,11 +220,11 @@ impl DOMExceptionMethods<crate::DomTypeHolder> for DOMException {
         message: DOMString,
         name: DOMString,
     ) -> Result<DomRoot<DOMException>, Error> {
-        Ok(reflect_dom_object_with_proto_and_cx(
+        Ok(reflect_dom_object_with_proto(
+            cx,
             Box::new(DOMException::new_inherited(message, name)),
             global,
             proto,
-            cx,
         ))
     }
 
@@ -253,7 +252,7 @@ impl Serializable for DOMException {
     type Data = DomException;
 
     /// <https://webidl.spec.whatwg.org/#idl-DOMException>
-    fn serialize(&self) -> Result<(DomExceptionId, Self::Data), ()> {
+    fn serialize(&self, _no_gc: &NoGC) -> Result<(DomExceptionId, Self::Data), ()> {
         let serialized = DomException {
             message: self.message.to_string(),
             name: self.name.to_string(),
@@ -285,5 +284,14 @@ impl Serializable for DOMException {
             StructuredData::Reader(reader) => &mut reader.exceptions,
             StructuredData::Writer(writer) => &mut writer.exceptions,
         }
+    }
+}
+
+impl DomExceptionTrait for DOMException {
+    fn new_inherited(
+        message: script_bindings::str::DOMString,
+        name: script_bindings::str::DOMString,
+    ) -> Self {
+        DOMException::new_inherited(message, name)
     }
 }

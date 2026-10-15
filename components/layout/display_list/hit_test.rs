@@ -6,17 +6,20 @@ use std::sync::Arc;
 
 use app_units::Au;
 use embedder_traits::Cursor;
-use euclid::{Box2D, Vector2D};
+use euclid::{Box2D, Point2D, Vector2D};
 use kurbo::{Ellipse, Shape};
-use layout_api::ElementsFromPointResult;
+use layout_api::{HitTestFlags, HitTestResult, HitTestResultItem};
 use rustc_hash::FxHashMap;
 use servo_base::id::ScrollTreeNodeId;
+use servo_base::text::{Utf32CodeUnits, Utf32CodeUnitsOrNodeOffset};
 use servo_geometry::FastLayoutTransform;
 use style::computed_values::backface_visibility::T as BackfaceVisibility;
 use style::computed_values::pointer_events::T as PointerEvents;
 use style::computed_values::visibility::T as Visibility;
+use style::dom::OpaqueNode;
 use style::properties::ComputedValues;
 use style::values::computed::ui::CursorKind;
+use style_traits::CSSPixel;
 use webrender_api::BorderRadius;
 use webrender_api::units::{LayoutPoint, LayoutRect, LayoutSize, RectExt};
 
@@ -26,7 +29,15 @@ use crate::display_list::{StackingContext, StackingContextTree, ToWebRender, Tra
 use crate::fragment_tree::{BoxFragmentWithStyle, Fragment, FragmentFlags, TextFragment};
 use crate::geom::PhysicalRect;
 
+struct DomPositionCandidate {
+    fragment: Fragment,
+    node: OpaqueNode,
+    point_in_target: Point2D<f32, CSSPixel>,
+}
+
 pub(crate) struct HitTest<'a> {
+    /// The flags which describe how to perform this [`HitTest`]
+    flags: HitTestFlags,
     /// The point to test for this hit test, relative to the page.
     point_to_test: LayoutPoint,
     /// A cached version of [`Self::point_to_test`] projected to a spatial node, to avoid
@@ -35,22 +46,32 @@ pub(crate) struct HitTest<'a> {
     /// The stacking context tree against which to perform the hit test.
     stacking_context_tree: &'a StackingContextTree,
     /// The resulting [`HitTestResultItems`] for this hit test.
-    results: Vec<ElementsFromPointResult>,
+    items: Vec<HitTestResultItem>,
+    /// Candidate for `HitTestResult::dom_position_for_selection`
+    dom_position_candidate: Option<DomPositionCandidate>,
     /// A cache of hit test results for shared clip nodes.
     clip_hit_test_results: FxHashMap<ClipId, bool>,
+    /// Collected reference frame clips. For painting, reference frame clips are handled
+    /// by enclosing reference frames in stacking contexts, but we don't have that option
+    /// here, so we must handle them manually.
+    collected_reference_frame_clips: Vec<ClipId>,
 }
 
 impl<'a> HitTest<'a> {
     pub(crate) fn run(
+        flags: HitTestFlags,
         stacking_context_tree: &'a StackingContextTree,
         point_to_test: LayoutPoint,
-    ) -> Vec<ElementsFromPointResult> {
+    ) -> HitTestResult {
         let mut hit_test = Self {
+            flags,
             point_to_test,
             projected_point_to_test: None,
             stacking_context_tree,
-            results: Vec::new(),
+            items: Vec::new(),
+            dom_position_candidate: None,
             clip_hit_test_results: FxHashMap::default(),
+            collected_reference_frame_clips: Default::default(),
         };
 
         PaintTraversal::traverse(&stacking_context_tree.root_stacking_context, &mut hit_test);
@@ -61,14 +82,53 @@ impl<'a> HitTest<'a> {
         //
         // TODO: Eventually PaintTraversal should support walking backward through
         // fragments.
-        hit_test.results.reverse();
+        hit_test.items.reverse();
 
-        hit_test.results
+        let dom_position_for_selection = if flags.contains(HitTestFlags::IncludeDomPosition) {
+            hit_test
+                .dom_position()
+                .map(|(node, offset)| (node, Utf32CodeUnitsOrNodeOffset(offset.0)))
+        } else {
+            None
+        };
+
+        HitTestResult {
+            dom_position_for_selection,
+            items: hit_test.items,
+        }
     }
 
-    /// Perform a hit test against a the clip node for the given [`ClipId`], returning
+    fn dom_position(&self) -> Option<(OpaqueNode, Utf32CodeUnits)> {
+        let hit = self.dom_position_candidate.as_ref()?;
+        if let Fragment::Text(text_fragment) = &hit.fragment {
+            let character_offset =
+                text_fragment.character_offset(hit.point_in_target.map(Au::from_f32_px))?;
+            return Some((hit.node, character_offset));
+        }
+
+        let mut search = ClosestFragmentSearch::default();
+        if let Some(point_in_fragment) = self.stacking_context_tree.offset_in_fragment(
+            &hit.fragment,
+            self.point_to_test.map(Au::from_f32_px).cast_unit(),
+        ) {
+            search.collect_relevant_children(&hit.fragment, point_in_fragment);
+        }
+        search.into_dom_position()
+    }
+
+    /// Perform a hit test against the clip node for the given [`ClipId`], returning
     /// true if it is not clipped out or false if is clipped out.
     fn hit_test_clip_id(&mut self, clip_id: ClipId) -> bool {
+        // Using the index here is necessary to avoid a double borrow of `self`.
+        for index in 0..self.collected_reference_frame_clips.len() {
+            if !self.hit_test_individual_clip_id(self.collected_reference_frame_clips[index]) {
+                return false;
+            }
+        }
+        self.hit_test_individual_clip_id(clip_id)
+    }
+
+    fn hit_test_individual_clip_id(&mut self, clip_id: ClipId) -> bool {
         if clip_id == ClipId::INVALID {
             return true;
         }
@@ -81,7 +141,7 @@ impl<'a> HitTest<'a> {
         let result = self
             .location_in_spatial_node(clip.parent_scroll_node_id)
             .is_some_and(|(point, _)| {
-                clip.contains(point) && self.hit_test_clip_id(clip.parent_clip_id)
+                clip.contains(point) && self.hit_test_individual_clip_id(clip.parent_clip_id)
             });
         self.clip_hit_test_results.insert(clip_id, result);
         result
@@ -117,17 +177,41 @@ impl<'a> HitTest<'a> {
 }
 
 impl PaintTraversalHandler for HitTest<'_> {
-    type StackingContextState = ();
+    /// `true` if we pushed a reference frame clip and `false` otherwise.
+    type StackingContextState = bool;
 
-    fn visit_stacking_context(&mut self, _: &StackingContext) -> Self::StackingContextState {}
-    fn leave_stacking_context(&mut self, _: &TraversalState, _: Self::StackingContextState) {}
+    fn visit_stacking_context(
+        &mut self,
+        stacking_context: &StackingContext,
+    ) -> Self::StackingContextState {
+        if let Some(reference_frame_info) = stacking_context.reference_frame_info.as_ref() &&
+            reference_frame_info.captured_clip_id != ClipId::INVALID
+        {
+            self.collected_reference_frame_clips
+                .push(reference_frame_info.captured_clip_id);
+            return true;
+        }
+        false
+    }
+
+    fn leave_stacking_context(
+        &mut self,
+        _: &TraversalState,
+        pushed_reference_frame_clip: Self::StackingContextState,
+    ) {
+        if pushed_reference_frame_clip {
+            self.collected_reference_frame_clips.pop();
+        }
+    }
+
     fn visit_box(&mut self, state: &TraversalState, fragment: &BoxFragmentWithStyle<'_>) {
         Fragment::Box(fragment.box_fragment.clone()).hit_test(state, self);
     }
+
     fn visit_text(
         &mut self,
         state: &TraversalState,
-        _: PhysicalRect<Au>,
+        _line_box_rect: PhysicalRect<Au>,
         fragment: &Arc<TextFragment>,
     ) {
         Fragment::Text(fragment.clone()).hit_test(state, self);
@@ -207,11 +291,23 @@ impl Fragment {
                         fragment_rect.origin.y.to_f32_px(),
                     );
 
-                hit_test.results.push(ElementsFromPointResult {
+                hit_test.items.push(HitTestResultItem {
                     node: tag.node,
                     point_in_target,
                     cursor: cursor(style.get_inherited_ui().cursor.keyword, auto_cursor),
                 });
+
+                // Selection boundaries cannot intersect generated content, which is what
+                // the pseudo_element_chain check does here.
+                if hit_test.flags.intersects(HitTestFlags::IncludeDomPosition) &&
+                    tag.pseudo_element_chain.is_empty()
+                {
+                    hit_test.dom_position_candidate = Some(DomPositionCandidate {
+                        fragment: self.clone(),
+                        node: tag.node,
+                        point_in_target,
+                    });
+                }
 
                 // Since there is no reverse PaintTraversal, hit testing always searches
                 // the entire fragment tree (in stacking context order), which is why this
@@ -233,7 +329,7 @@ impl Fragment {
                 Cursor::Default,
             ),
             Fragment::Text(text) => hit_test_fragment_inner(
-                &text.base.style(),
+                &text.style(),
                 text.base.rect(),
                 BorderRadius::zero(),
                 FragmentFlags::empty(),
@@ -328,5 +424,87 @@ fn cursor(kind: CursorKind, auto_cursor: Cursor) -> Cursor {
         CursorKind::AllScroll => Cursor::AllScroll,
         CursorKind::ZoomIn => Cursor::ZoomIn,
         CursorKind::ZoomOut => Cursor::ZoomOut,
+    }
+}
+
+pub(crate) struct ClosestFragment {
+    fragment: Arc<TextFragment>,
+    node: OpaqueNode,
+    point_in_fragment: Point2D<Au, CSSPixel>,
+    distance: Au,
+    point_in_vertical_bounds: bool,
+}
+
+impl ClosestFragment {
+    fn should_replace(&self, new_distance: Au, point_in_vertical_bounds: bool) -> bool {
+        if point_in_vertical_bounds && !self.point_in_vertical_bounds {
+            return true;
+        }
+        if self.point_in_vertical_bounds && !point_in_vertical_bounds {
+            return false;
+        }
+        new_distance <= self.distance
+    }
+
+    pub(crate) fn dom_position(&self) -> Option<(OpaqueNode, Utf32CodeUnits)> {
+        let character_offset = self.fragment.character_offset(self.point_in_fragment)?;
+        Some((self.node, character_offset))
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ClosestFragmentSearch {
+    closest: Option<ClosestFragment>,
+}
+
+impl ClosestFragmentSearch {
+    pub(crate) fn into_dom_position(self) -> Option<(OpaqueNode, Utf32CodeUnits)> {
+        self.closest?.dom_position()
+    }
+
+    fn maybe_update(&mut self, fragment: &Fragment, point_in_fragment: Point2D<Au, CSSPixel>) {
+        let Fragment::Text(text_fragment) = fragment else {
+            return;
+        };
+
+        let (distance, point_in_vertical_bounds) = {
+            (
+                text_fragment.distance_to_point_for_glyph_offset(point_in_fragment),
+                text_fragment.point_is_within_vertical_boundaries(point_in_fragment),
+            )
+        };
+
+        if let Some(tag) = text_fragment.base.tag.as_ref() &&
+            tag.pseudo_element_chain.is_empty() &&
+            self.closest.as_ref().is_none_or(|closest_fragment| {
+                closest_fragment.should_replace(distance, point_in_vertical_bounds)
+            })
+        {
+            self.closest = Some(ClosestFragment {
+                fragment: text_fragment.clone(),
+                node: tag.node,
+                point_in_fragment,
+                distance,
+                point_in_vertical_bounds,
+            });
+        }
+    }
+
+    pub(crate) fn collect_relevant_children(
+        &mut self,
+        fragment: &Fragment,
+        point_in_fragment: Point2D<Au, CSSPixel>,
+    ) {
+        self.maybe_update(fragment, point_in_fragment);
+        if let Some(children) = fragment.children() {
+            for child in children.iter() {
+                let offset = child
+                    .base()
+                    .map(|base| base.rect().origin)
+                    .unwrap_or_default();
+                let point = point_in_fragment - offset.to_vector();
+                self.collect_relevant_children(child, point);
+            }
+        }
     }
 }

@@ -12,6 +12,7 @@ use layout_api::{
 use malloc_size_of_derive::MallocSizeOf;
 use script::layout_dom::ServoLayoutNode;
 use servo_arc::Arc as ServoArc;
+use servo_base::text::{AssumeUnder4GB, RangeAny, Utf32CodeUnits};
 use smallvec::SmallVec;
 use style::context::SharedStyleContext;
 use style::properties::ComputedValues;
@@ -34,7 +35,7 @@ use crate::style_ext::{
     ComputedValuesExt, Display, DisplayGeneratingBox, DisplayLayoutInternal, DisplayOutside,
 };
 use crate::table::{TableLevelBox, WeakTableLevelBox};
-use crate::taffy::TaffyItemBox;
+use crate::taffy::{TaffyItemBox, TaffyItemBoxInner};
 
 #[derive(MallocSizeOf)]
 pub struct PseudoLayoutData {
@@ -75,11 +76,15 @@ impl InnerDOMLayoutData {
     }
 
     fn fragments(&self) -> Vec<Fragment> {
-        self.self_box
-            .borrow()
-            .as_ref()
-            .and_then(|layout_box| layout_box.with_base(|base| base.fragments().clone()))
+        self.with_fragments(<[Fragment]>::to_vec)
             .unwrap_or_default()
+    }
+
+    /// Run `callback` on the fragments without cloning them. Returns `None` if the node has no box.
+    fn with_fragments<T>(&self, callback: impl FnOnce(&[Fragment]) -> T) -> Option<T> {
+        let self_box = self.self_box.borrow();
+        let layout_box = self_box.as_ref()?;
+        layout_box.with_base(|base| callback(&base.fragments()))
     }
 
     fn repair_style(&self, node: &ServoLayoutNode, context: &SharedStyleContext) {
@@ -278,6 +283,87 @@ impl GenericLayoutDataTrait for DOMLayoutData {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn set_text_run_selection(&self, new_range: Option<RangeAny<Utf32CodeUnits>>) -> bool {
+        let inner = self.0.borrow();
+        // When `::first-letter` is used, one DOM text node can generate multiple text runs
+        // so there isn’t a single place to set the new range
+        if inner
+            .pseudo_boxes
+            .iter()
+            .any(|pseudo_box| matches!(pseudo_box.pseudo, PseudoElement::FirstLetter))
+        {
+            return false;
+        }
+        if let Some(LayoutBox::Text(text_run)) = &*inner.self_box.borrow() {
+            *text_run.borrow().run_data.selection.borrow_mut() = new_range;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn set_element_selection(&self, selected: bool) -> bool {
+        let inner = self.0.borrow();
+        let inner_box = inner.self_box.borrow();
+        let Some(inner_box) = &*inner_box else {
+            return false;
+        };
+
+        match inner_box {
+            LayoutBox::DisplayContents(..) => false,
+            LayoutBox::BlockLevel(block_level_box) => match &*block_level_box.borrow() {
+                BlockLevelBox::Independent(independent_formatting_context) => {
+                    independent_formatting_context.set_selection(selected)
+                },
+                _ => false,
+            },
+            LayoutBox::InlineLevel(inline_item) => match inline_item {
+                InlineItem::Atomic(atomic_item, ..) => atomic_item.borrow().set_selection(selected),
+                _ => false,
+            },
+            LayoutBox::FlexLevel(flex_level_box) => match &*flex_level_box.borrow() {
+                FlexLevelBox::FlexItem(flex_item) => flex_item
+                    .independent_formatting_context
+                    .set_selection(selected),
+                _ => false,
+            },
+            LayoutBox::TableLevelBox(table_level_box) => match table_level_box {
+                TableLevelBox::Caption(caption) => caption.borrow().context.set_selection(selected),
+                TableLevelBox::Cell(cell) => cell.borrow().context.set_selection(selected),
+                _ => false,
+            },
+            LayoutBox::TaffyItemBox(taffy_item_box) => {
+                match &taffy_item_box.borrow().taffy_level_box {
+                    TaffyItemBoxInner::InFlowBox(independent_formatting_context) => {
+                        independent_formatting_context.set_selection(selected)
+                    },
+                    _ => false,
+                }
+            },
+            LayoutBox::Text(..) => false,
+        }
+    }
+
+    fn rendered_text(&self, range: RangeAny<Utf32CodeUnits>) -> Option<String> {
+        let inner = self.0.borrow();
+        let self_box = inner.self_box.borrow();
+
+        let Some(LayoutBox::Text(text_run)) = self_box.as_ref() else {
+            return None;
+        };
+
+        let text_run = text_run.borrow();
+        let range_in_text_run = text_run.run_data.map_dom_range_to_transformed_range(range);
+        let start_in_ifc = text_run.run_data.character_range_in_ifc_text.start;
+
+        let string = text_run.run_data.text_content.get()?;
+        let start =
+            (range_in_text_run.start + start_in_ifc).to_utf8_code_units_in(AssumeUnder4GB, string);
+        let end =
+            (range_in_text_run.end + start_in_ifc).to_utf8_code_units_in(AssumeUnder4GB, string);
+        Some(string[start.0 as usize..end.0 as usize].to_owned())
+    }
 }
 
 pub struct BoxSlot<'dom> {
@@ -341,12 +427,28 @@ pub(crate) trait NodeExt<'dom> {
     /// Remove boxes for the element itself, and all of its pseudo-element boxes.
     fn unset_all_boxes(&self);
 
+    /// Clear laid out `Fragment`s and dirty `Fragment` caches for all of this node's boxes,
+    /// ensuring that the next `FragmentTree` layout that happens at this node is complete.
+    fn clear_fragments_and_dirty_fragment_caches(&self);
+
+    /// Clear laid out `Fragment`s and dirty `Fragment` caches for all this node's boxes and
+    /// descendant's boxes, ensuring that the next `FragmentTree` layout that happens at and
+    /// below this node is complete.
+    fn clear_fragments_and_dirty_fragment_caches_recursively(&self);
+
+    /// Clear laid out `Fragment`s and dirty `Fragment` caches for all this node's descendant's
+    /// boxes.
+    fn clear_fragments_and_dirty_fragment_caches_of_descendants(&self);
+
     /// Returns the [`NodeRenderingType`] for this [`LayoutNode`] which describes whether
     /// the node is being rendered, delegating rendering, or not being rendered at all
     /// based on whether it has a [`LayoutBox`] and what kind.
     fn rendering_type(&self) -> NodeRenderingType;
 
     fn fragments_for_pseudo(&self, pseudo_element: Option<PseudoElement>) -> Vec<Fragment>;
+
+    /// Run `callback` on the fragments without cloning them. Returns `None` if the node has no box.
+    fn with_fragments<T>(&self, callback: impl FnOnce(&[Fragment]) -> T) -> Option<T>;
     fn with_layout_box_base(&self, callback: impl FnMut(&LayoutBoxBase));
     fn with_layout_box_base_including_pseudos(&self, callback: impl FnMut(&LayoutBoxBase));
 
@@ -416,6 +518,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
         Some((
             VideoInfo {
                 image_key: data.current_frame.map(|frame| frame.image_key),
+                poster_url: data.poster_url,
             },
             natural_size,
         ))
@@ -533,6 +636,23 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
         // for DOM descendants of elements with `display: none`.
     }
 
+    fn clear_fragments_and_dirty_fragment_caches_recursively(&self) {
+        self.clear_fragments_and_dirty_fragment_caches();
+        self.clear_fragments_and_dirty_fragment_caches_of_descendants();
+    }
+
+    fn clear_fragments_and_dirty_fragment_caches(&self) {
+        self.with_layout_box_base_including_pseudos(|base| {
+            base.clear_fragments_and_dirty_fragment_cache()
+        });
+    }
+
+    fn clear_fragments_and_dirty_fragment_caches_of_descendants(&self) {
+        for child in self.flat_tree_children() {
+            child.clear_fragments_and_dirty_fragment_caches_recursively();
+        }
+    }
+
     fn rendering_type(&self) -> NodeRenderingType {
         let Some(layout_data) = self.inner_layout_data() else {
             return NodeRenderingType::NotRendered;
@@ -567,6 +687,10 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                 .unwrap_or_default(),
             None => layout_data.fragments(),
         }
+    }
+
+    fn with_fragments<T>(&self, callback: impl FnOnce(&[Fragment]) -> T) -> Option<T> {
+        self.inner_layout_data()?.with_fragments(callback)
     }
 
     fn repair_style(&self, context: &SharedStyleContext) {
@@ -659,6 +783,11 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                 let mut block_level = block_level.borrow_mut();
                 match &mut *block_level {
                     BlockLevelBox::Independent(independent_formatting_context) => {
+                        if box_style.position.is_absolutely_positioned() ||
+                            box_style.float.is_floating()
+                        {
+                            return false;
+                        }
                         let DisplayGeneratingBox::OutsideInside {
                             outside: DisplayOutside::Block,
                             inside: display_inside,

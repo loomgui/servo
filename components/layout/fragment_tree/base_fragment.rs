@@ -5,7 +5,6 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use app_units::Au;
-use atomic_refcell::AtomicRef;
 use bitflags::bitflags;
 use layout_api::{LayoutElement, LayoutNode, PseudoElementChain, combine_id_with_fragment_type};
 use malloc_size_of::malloc_size_of_is_0;
@@ -13,13 +12,11 @@ use malloc_size_of_derive::MallocSizeOf;
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 use script::layout_dom::ServoLayoutNode;
-use servo_arc::Arc as ServoArc;
 use style::dom::OpaqueNode;
-use style::properties::ComputedValues;
 use style::selector_parser::PseudoElement;
-use web_atoms::local_name;
+use stylo_atoms::atom;
+use web_atoms::{local_name, ns};
 
-use crate::SharedStyle;
 use crate::dom_traversal::NodeAndStyleInfo;
 use crate::geom::{PhysicalPoint, PhysicalRect, PhysicalSize, SyncPhysicalRectAu};
 
@@ -52,10 +49,6 @@ pub(crate) struct BaseFragment {
     /// layout.
     pub flags: FragmentFlags,
 
-    /// The style for this [`BaseFragment`]. Depending on the fragment type this is either
-    /// a shared or non-shared style.
-    pub style: SharedStyle,
-
     /// The content rect of this fragment in the parent fragment's content rectangle. This
     /// does not include padding, border, or margin -- it only includes content. This is
     /// relative to the parent containing block.
@@ -80,15 +73,10 @@ impl std::fmt::Debug for BaseFragment {
 }
 
 impl BaseFragment {
-    pub(crate) fn new(
-        base_fragment_info: BaseFragmentInfo,
-        style: SharedStyle,
-        rect: PhysicalRect<Au>,
-    ) -> Self {
+    pub(crate) fn new(base_fragment_info: BaseFragmentInfo, rect: PhysicalRect<Au>) -> Self {
         Self {
             tag: base_fragment_info.tag,
             flags: base_fragment_info.flags,
-            style,
             rect: SyncPhysicalRectAu::new(rect),
             status: AtomicU8::new(FragmentStatus::New as u8),
         }
@@ -125,15 +113,6 @@ impl BaseFragment {
 
     pub(crate) fn set_status(&self, new_status: FragmentStatus) {
         self.status.store(new_status as u8, Ordering::Relaxed)
-    }
-
-    pub(crate) fn repair_style(&self, style: &ServoArc<ComputedValues>) {
-        *self.style.borrow_mut() = style.clone();
-        self.set_status(FragmentStatus::StyleChanged);
-    }
-
-    pub(crate) fn style<'a>(&'a self) -> AtomicRef<'a, ServoArc<ComputedValues>> {
-        self.style.borrow()
     }
 }
 
@@ -181,19 +160,32 @@ impl From<ServoLayoutNode<'_>> for BaseFragmentInfo {
         let pseudo_element_chain = node.pseudo_element_chain();
         let mut flags = FragmentFlags::empty();
 
-        // Anonymous boxes should not have a tag, because they should not take part in hit testing.
-        //
-        // TODO(mrobinson): It seems that anonymous boxes should take part in hit testing in some
-        // cases, but currently this means that the order of hit test results isn't as expected for
-        // some WPT tests. This needs more investigation.
-        if matches!(
-            pseudo_element_chain.innermost(),
-            Some(PseudoElement::ServoAnonymousBox) |
-                Some(PseudoElement::ServoAnonymousTable) |
-                Some(PseudoElement::ServoAnonymousTableCell) |
-                Some(PseudoElement::ServoAnonymousTableRow)
-        ) {
-            return Self::anonymous();
+        if let Some(innermost_pseudo) = pseudo_element_chain.innermost() {
+            match innermost_pseudo {
+                // Anonymous boxes should not have a tag, because they should not take part in hit testing.
+                //
+                // TODO(mrobinson): It seems that anonymous boxes should take part in hit testing in some
+                // cases, but currently this means that the order of hit test results isn't as expected for
+                // some WPT tests. This needs more investigation.
+                PseudoElement::ServoAnonymousBox |
+                PseudoElement::ServoAnonymousTable |
+                PseudoElement::ServoAnonymousTableCell |
+                PseudoElement::ServoAnonymousTableRow => return Self::anonymous(),
+                // A `<br>` forces a new line using a `::before` pseudo-element. Both of them need to get
+                // this flag.
+                PseudoElement::Before
+                    if node
+                        .as_html_element()
+                        .is_some_and(|element| element.local_name() == &local_name!("br")) =>
+                {
+                    flags.insert(FragmentFlags::IS_BR_ELEMENT);
+                },
+                _ => {},
+            }
+            return Self {
+                tag: Some(node.into()),
+                flags,
+            };
         }
 
         if node.as_element().is_some_and(|element| element.is_root()) {
@@ -213,6 +205,20 @@ impl From<ServoLayoutNode<'_>> for BaseFragmentInfo {
                 },
                 &local_name!("input") => {
                     flags.insert(FragmentFlags::IS_INPUT_ELEMENT);
+                    if element
+                        .attribute(&ns!(), &local_name!("type"))
+                        .is_some_and(|attr| {
+                            matches!(
+                                attr.as_atom().to_ascii_lowercase(),
+                                atom!("button") | atom!("color") | atom!("reset") | atom!("submit")
+                            )
+                        })
+                    {
+                        flags.insert(FragmentFlags::IS_BUTTON);
+                    }
+                },
+                &local_name!("button") => {
+                    flags.insert(FragmentFlags::IS_BUTTON);
                 },
                 _ => {},
             }
@@ -231,7 +237,8 @@ bitflags! {
     pub(crate) struct FragmentFlags: u16 {
         /// Whether or not the node that created this fragment is a `<body>` element on an HTML document.
         const IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT = 1 << 0;
-        /// Whether or not the node that created this Fragment is a `<br>` element.
+        /// Whether or not the node that created this Fragment is a `<br>` element, or a `::before`
+        /// pseudo-element originated by `<br>`.
         const IS_BR_ELEMENT = 1 << 1;
         /// Whether or not the node that created this Fragment is a widget. Widgets behave similarly to
         /// replaced elements, e.g. they are atomic when inline-level, and their automatic inline size
@@ -267,7 +274,8 @@ bitflags! {
         const IS_COLLAPSED = 1 << 11;
         /// Whether or not the node that created this Fragment is a `<input>` element.
         const IS_INPUT_ELEMENT = 1 << 12;
-
+        /// Whether this is a <button> element, or an <input> that uses button layout.
+        const IS_BUTTON = 1 << 13;
     }
 }
 

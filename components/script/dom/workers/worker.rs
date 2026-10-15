@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+#![cfg_attr(crown, allow(crown::jscontext_first_arg))]
+
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +14,7 @@ use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::jsapi::{Heap, JSObject};
 use js::jsval::UndefinedValue;
-use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleObject, HandleValue};
+use js::rust::{CustomAutoRooterGuard, HandleObject, HandleValue};
 use net_traits::request::Referrer;
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::reflect_dom_object_with_proto;
@@ -42,13 +44,13 @@ use crate::dom::trustedtypes::trustedscripturl::TrustedScriptURL;
 use crate::dom::window::Window;
 use crate::dom::workerglobalscope::prepare_workerscope_init;
 use crate::realms::enter_auto_realm;
-use crate::script_runtime::{CanGc, ThreadSafeJSContext};
-use crate::task::TaskOnce;
+use crate::runtime::script_runtime::ThreadSafeJSContext;
+use crate::tasks::task::TaskOnce;
 use crate::url::ensure_blob_referenced_by_url_is_kept_alive;
 
 pub(crate) type TrustedWorkerAddress = Trusted<Worker>;
 
-// https://html.spec.whatwg.org/multipage/#worker
+/// <https://html.spec.whatwg.org/multipage/#worker>
 #[dom_struct]
 pub(crate) struct Worker {
     eventtarget: EventTarget,
@@ -75,17 +77,17 @@ impl Worker {
     }
 
     fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
         sender: Sender<DedicatedWorkerScriptMsg>,
         closing: Arc<AtomicBool>,
-        can_gc: CanGc,
     ) -> DomRoot<Worker> {
         reflect_dom_object_with_proto(
+            cx,
             Box::new(Worker::new_inherited(sender, closing)),
             global,
             proto,
-            can_gc,
         )
     }
 
@@ -190,13 +192,7 @@ impl WorkerMethods<crate::DomTypeHolder> for Worker {
 
         let (sender, receiver) = unbounded();
         let closing = Arc::new(AtomicBool::new(false));
-        let worker = Worker::new(
-            global,
-            proto,
-            sender.clone(),
-            closing.clone(),
-            CanGc::from_cx(cx),
-        );
+        let worker = Worker::new(cx, global, proto, sender.clone(), closing.clone());
         let worker_ref = Trusted::new(&*worker);
 
         let worker_load_origin = WorkerScriptLoadOrigin {
@@ -246,11 +242,21 @@ impl WorkerMethods<crate::DomTypeHolder> for Worker {
             }
         }
 
+        #[cfg(feature = "webgl")]
         let webgl_chan = global
             .downcast::<Window>()
             .and_then(|window| window.webgl_chan_value());
-        let init =
-            prepare_workerscope_init(global, Some(devtools_sender), Some(worker_id), webgl_chan);
+        let init = prepare_workerscope_init(
+            global,
+            Some(devtools_sender),
+            Some(worker_id),
+            #[cfg(feature = "webgl")]
+            webgl_chan,
+        );
+        let animation_frame_provider_supported = global
+            .downcast::<DedicatedWorkerGlobalScope>()
+            .map(|worker| worker.animation_frame_provider_supported_flag())
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(init.animation_frame_provider_supported)));
 
         let (control_sender, control_receiver) = unbounded();
         let (context_sender, context_receiver) = unbounded();
@@ -270,6 +276,7 @@ impl WorkerMethods<crate::DomTypeHolder> for Worker {
             worker_load_origin,
             worker_options,
             closing.clone(),
+            animation_frame_provider_supported.clone(),
             global.image_cache(),
             browsing_context,
             #[cfg(feature = "webgpu")]
@@ -278,7 +285,7 @@ impl WorkerMethods<crate::DomTypeHolder> for Worker {
             context_sender,
             global.insecure_requests_policy(),
             global.policy_container(),
-            global.font_context().cloned(),
+            global.font_context(),
         );
 
         let context = context_receiver
@@ -286,7 +293,13 @@ impl WorkerMethods<crate::DomTypeHolder> for Worker {
             .expect("Couldn't receive a context for worker.");
 
         worker.set_context_for_interrupt(context.clone());
-        global.track_worker(closing, join_handle, control_sender, context);
+        global.track_worker(
+            closing,
+            animation_frame_provider_supported,
+            join_handle,
+            control_sender,
+            context,
+        );
 
         Ok(worker)
     }
@@ -306,17 +319,14 @@ impl WorkerMethods<crate::DomTypeHolder> for Worker {
         &self,
         cx: &mut JSContext,
         message: HandleValue,
-        options: RootedTraceableBox<StructuredSerializeOptions>,
+        options: &StructuredSerializeOptions,
     ) -> ErrorResult {
-        let mut rooted = CustomAutoRooter::new(
+        auto_root!(&in(cx) let guard =
             options
                 .transfer
                 .iter()
                 .map(|js: &RootedTraceableBox<Heap<*mut JSObject>>| js.get())
-                .collect(),
-        );
-        #[expect(unsafe_code)]
-        let guard = unsafe { CustomAutoRooterGuard::new(cx.raw_cx(), &mut rooted) };
+                .collect::<Vec<_>>());
         self.post_message_impl(cx, message, guard)
     }
 

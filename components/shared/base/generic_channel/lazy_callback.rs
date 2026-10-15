@@ -24,7 +24,6 @@ use malloc_size_of::{MallocSizeOf as MallocSizeOfTrait, MallocSizeOfOps};
 use malloc_size_of_derive::MallocSizeOf;
 use serde::de::VariantAccess;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use servo_config::opts;
 
 use crate::generic_channel::{GenericCallback, SendError, SendResult, use_ipc};
 
@@ -220,10 +219,7 @@ where
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
 {
     /// This sets the callback.
-    pub fn set_callback<F: FnMut(Result<T, ipc_channel::IpcError>) + Send + 'static>(
-        self,
-        mut callback: F,
-    ) {
+    pub fn set_callback<F: FnMut(Result<T, SendError>) + Send + 'static>(self, mut callback: F) {
         match self.0 {
             CallbackSetterVariants::InProcess(sender) => {
                 let callback = GenericCallback::new(callback).expect("Could not create callback");
@@ -275,7 +271,7 @@ pub fn lazy_callback<T>() -> (LazyCallback<T>, CallbackSetter<T>)
 where
     T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
 {
-    if opts::get().multiprocess || opts::get().force_ipc {
+    if use_ipc() {
         lazy_callback_ipc()
     } else {
         lazy_callback_inprocess()

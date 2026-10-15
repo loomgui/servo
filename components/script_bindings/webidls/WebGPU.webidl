@@ -151,6 +151,8 @@ interface GPUDevice : EventTarget {
     [Throws]
     GPUTexture createTexture(GPUTextureDescriptor descriptor);
     GPUSampler createSampler(optional GPUSamplerDescriptor descriptor = {});
+    [Throws]
+    GPUExternalTexture importExternalTexture(GPUExternalTextureDescriptor descriptor);
 
     [Throws]
     GPUBindGroupLayout createBindGroupLayout(GPUBindGroupLayoutDescriptor descriptor);
@@ -267,7 +269,7 @@ namespace GPUTextureUsage {
     const GPUFlagsConstant TEXTURE_BINDING      = 0x04;
     const GPUFlagsConstant STORAGE_BINDING      = 0x08;
     const GPUFlagsConstant RENDER_ATTACHMENT    = 0x10;
-    //const GPUFlagsConstant TRANSIENT_ATTACHMENT = 0x20;
+    const GPUFlagsConstant TRANSIENT_ATTACHMENT = 0x20;
 };
 
 [Exposed=(Window, Worker), SecureContext, Pref="dom_webgpu_enabled"]
@@ -429,6 +431,17 @@ enum GPUTextureFormat {
 };
 
 [Exposed=(Window, Worker), SecureContext, Pref="dom_webgpu_enabled"]
+interface GPUExternalTexture {
+};
+GPUExternalTexture includes GPUObjectBase;
+
+dictionary GPUExternalTextureDescriptor : GPUObjectDescriptorBase {
+    // TODO: VideoFrame
+    required HTMLVideoElement source;
+    PredefinedColorSpace colorSpace = "srgb";
+};
+
+[Exposed=(Window, Worker), SecureContext, Pref="dom_webgpu_enabled"]
 interface GPUSampler {
 };
 GPUSampler includes GPUObjectBase;
@@ -567,7 +580,8 @@ typedef (GPUSampler or
          GPUTexture or
          GPUTextureView or
          GPUBuffer or
-         GPUBufferBinding) GPUBindingResource;
+         GPUBufferBinding or
+         GPUExternalTexture) GPUBindingResource;
 
 dictionary GPUBindGroupEntry {
     required GPUIndex32 binding;
@@ -1113,7 +1127,7 @@ interface mixin GPURenderCommandsMixin {
                              optional GPUSize64 offset = 0,
                              optional GPUSize64 size = 0);
     undefined setVertexBuffer(GPUIndex32 slot,
-                             GPUBuffer buffer,
+                             GPUBuffer? buffer,
                              optional GPUSize64 offset = 0,
                              optional GPUSize64 size = 0);
 
@@ -1210,6 +1224,9 @@ partial interface GPUCanvasContext {
     [Throws, Pref="dom_webgpu_enabled"]
     undefined configure(GPUCanvasConfiguration descriptor);
     [Pref="dom_webgpu_enabled"] undefined unconfigure();
+
+    [Pref="dom_webgpu_enabled"]
+    GPUCanvasConfiguration? getConfiguration();
     [Throws, Pref="dom_webgpu_enabled"]
     GPUTexture getCurrentTexture();
 };

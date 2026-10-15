@@ -3,14 +3,16 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 //! Utilities for querying the layout, as needed by layout.
+use std::borrow::Cow;
 use std::cell::LazyCell;
+use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use app_units::Au;
+use bitflags::bitflags;
 use embedder_traits::UntrustedNodeAddress;
 use euclid::{Point2D, Rect, Size2D};
-use itertools::Itertools;
 use layout_api::{
     AxesOverflow, BoxAreaType, CSSPixelRectVec, DangerousStyleElementOf, LayoutElement,
     LayoutElementType, LayoutNode, LayoutNodeType, OffsetParentResponse, PhysicalSides,
@@ -19,6 +21,7 @@ use layout_api::{
 use paint_api::display_list::ScrollTree;
 use script::layout_dom::ServoLayoutNode;
 use servo_arc::Arc as ServoArc;
+use servo_base::text::Utf32CodeUnits;
 use servo_geometry::{FastLayoutTransform, au_rect_to_f32_rect, f32_rect_to_au_rect};
 use servo_url::ServoUrl;
 use style::computed_values::display::T as Display;
@@ -26,7 +29,7 @@ use style::computed_values::position::T as Position;
 use style::computed_values::visibility::T as Visibility;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapseValue;
 use style::context::{QuirksMode, SharedStyleContext, StyleContext, ThreadLocalStyleContext};
-use style::dom::NodeInfo;
+use style::dom::{NodeInfo, OpaqueNode};
 use style::properties::style_structs::Font;
 use style::properties::{
     ComputedValues, Importance, LonghandId, PropertyDeclarationBlock, PropertyDeclarationId,
@@ -43,27 +46,25 @@ use style::values::generics::font::LineHeight;
 use style::values::generics::position::AspectRatio;
 use style::values::specified::GenericGridTemplateComponent;
 use style::values::specified::box_::DisplayInside;
-use style::values::specified::text::TextTransformCase;
 use style_traits::{CSSPixel, ParsingMode, ToCss};
+use webrender_api::units::LayoutPixel;
 
 use crate::cell::RefOrAtomicRef;
-use crate::display_list::{StackingContextTree, au_rect_to_length_rect};
+use crate::display_list::{ClosestFragmentSearch, StackingContextTree, au_rect_to_length_rect};
 use crate::dom::NodeExt;
-use crate::flow::inline::construct::{TextTransformation, WhitespaceCollapse, capitalize_string};
+use crate::flow::inline::text_transform::TextTransformationIterator;
 use crate::fragment_tree::{
-    BoxFragment, Fragment, FragmentFlags, FragmentTree, SpecificLayoutInfo, TextFragment,
+    BoxFragment, Fragment, FragmentFlags, FragmentTree, SpecificLayoutInfo,
 };
 use crate::layout_impl::LayoutThread;
 use crate::style_ext::ComputedValuesExt;
 use crate::taffy::SpecificTaffyGridInfo;
 
-/// Get a scroll node that would represents this [`ServoLayoutNode`]'s transform and
-/// calculate its cumulative transform from its root scroll node to the scroll node.
-fn root_transform_for_layout_node(
+/// Calculate the cumulative transform from the root scroll node for `fragments`.
+fn root_transform_for_fragments(
     scroll_tree: &ScrollTree,
-    node: ServoLayoutNode<'_>,
+    fragments: &[Fragment],
 ) -> Option<FastLayoutTransform> {
-    let fragments = node.fragments_for_pseudo(None);
     let box_fragment = fragments
         .first()
         .and_then(Fragment::retrieve_box_fragment)?;
@@ -90,39 +91,50 @@ pub(crate) fn process_padding_request(node: ServoLayoutNode<'_>) -> Option<Physi
     )
 }
 
+bitflags! {
+    #[derive(Clone, Copy)]
+    pub(crate) struct BoxAreaInclusion: u8 {
+        const Transforms = 1 << 0;
+        const Inlines = 1 << 1;
+    }
+}
+
 pub(crate) fn process_box_area_request(
     layout_thread: &LayoutThread,
     stacking_context_tree: &StackingContextTree,
     node: ServoLayoutNode<'_>,
     area: BoxAreaType,
-    exclude_transform_and_inline: bool,
+    inclusion: BoxAreaInclusion,
 ) -> Option<Rect<Au, CSSPixel>> {
-    let fragments = node.fragments_for_pseudo(None);
-    let mut rects = fragments
-        .iter()
-        .filter(|fragment| {
-            !exclude_transform_and_inline ||
-                fragment
-                    .retrieve_box_fragment()
-                    .is_none_or(|fragment| !fragment.with_style().is_inline_box())
-        })
-        .filter_map(|node| node.cumulative_box_area_rect(area, layout_thread.into()))
-        .peekable();
+    // Borrow fragments to avoid cloning on this hot path for accessibility and
+    // `getBoundingClientRect()`.
+    node.with_fragments(|fragments| {
+        let mut rects = fragments
+            .iter()
+            .filter(|fragment| {
+                inclusion.contains(BoxAreaInclusion::Inlines) ||
+                    fragment
+                        .retrieve_box_fragment()
+                        .is_none_or(|fragment| !fragment.with_style().is_inline_box())
+            })
+            .filter_map(|node| node.cumulative_box_area_rect(area, layout_thread.into()))
+            .peekable();
 
-    rects.peek()?;
-    let rect_union = rects.fold(Rect::zero(), |unioned_rect, rect| rect.union(&unioned_rect));
+        rects.peek()?;
+        let rect_union = rects.fold(Rect::zero(), |unioned_rect, rect| rect.union(&unioned_rect));
 
-    if exclude_transform_and_inline {
-        return Some(rect_union);
-    }
+        if !inclusion.contains(BoxAreaInclusion::Transforms) {
+            return Some(rect_union);
+        }
 
-    let Some(transform) =
-        root_transform_for_layout_node(&stacking_context_tree.paint_info.scroll_tree, node)
-    else {
-        return Some(Rect::new(rect_union.origin, Size2D::zero()));
-    };
+        let Some(transform) =
+            root_transform_for_fragments(&stacking_context_tree.paint_info.scroll_tree, fragments)
+        else {
+            return Some(Rect::new(rect_union.origin, Size2D::zero()));
+        };
 
-    transform_au_rectangle(rect_union, transform)
+        transform_au_rectangle(rect_union, transform)
+    })?
 }
 
 pub(crate) fn process_box_areas_request(
@@ -131,20 +143,21 @@ pub(crate) fn process_box_areas_request(
     node: ServoLayoutNode<'_>,
     area: BoxAreaType,
 ) -> CSSPixelRectVec {
-    let fragments = node
-        .fragments_for_pseudo(None)
+    let fragments = node.fragments_for_pseudo(None);
+    let transform =
+        root_transform_for_fragments(&stacking_context_tree.paint_info.scroll_tree, &fragments);
+
+    let rects = fragments
         .into_iter()
         .filter_map(move |fragment| fragment.cumulative_box_area_rect(area, layout_thread.into()));
 
-    let Some(transform) =
-        root_transform_for_layout_node(&stacking_context_tree.paint_info.scroll_tree, node)
-    else {
-        return fragments
+    let Some(transform) = transform else {
+        return rects
             .map(|rect| Rect::new(rect.origin, Size2D::zero()))
             .collect();
     };
 
-    fragments
+    rects
         .filter_map(move |rect| transform_au_rectangle(rect, transform))
         .collect()
 }
@@ -465,32 +478,13 @@ fn resolve_grid_template(
     style: &ComputedValues,
     longhand_id: LonghandId,
 ) -> Option<String> {
-    /// <https://drafts.csswg.org/css-grid/#resolved-track-list-standalone>
-    fn serialize_standalone_non_subgrid_track_list(track_sizes: &[Au]) -> Option<String> {
-        match track_sizes.is_empty() {
-            // Standalone non subgrid grids with empty track lists should compute to `none`.
-            // As of current standard, this behaviour should only invoked by `none` computed value,
-            // therefore we can fallback into computed value resolving.
-            true => None,
-            // <https://drafts.csswg.org/css-grid/#resolved-track-list-standalone>
-            // > - Every track listed individually, whether implicitly or explicitly created,
-            //     without using the repeat() notation.
-            // > - Every track size given as a length in pixels, regardless of sizing function.
-            // > - Adjacent line names collapsed into a single bracketed set.
-            // TODO: implement line names
-            false => Some(
-                track_sizes
-                    .iter()
-                    .map(|size| size.to_css_string())
-                    .join(" "),
-            ),
-        }
-    }
-
     let (track_info, computed_value) = match longhand_id {
-        LonghandId::GridTemplateRows => (&grid_info.rows, &style.get_position().grid_template_rows),
+        LonghandId::GridTemplateRows => (
+            &grid_info.info.rows,
+            &style.get_position().grid_template_rows,
+        ),
         LonghandId::GridTemplateColumns => (
-            &grid_info.columns,
+            &grid_info.info.columns,
             &style.get_position().grid_template_columns,
         ),
         _ => return None,
@@ -503,7 +497,7 @@ fn resolve_grid_template(
         GenericGridTemplateComponent::None |
         GenericGridTemplateComponent::TrackList(_) |
         GenericGridTemplateComponent::Masonry => {
-            serialize_standalone_non_subgrid_track_list(&track_info.sizes)
+            (!track_info.positions.is_empty()).then(|| track_info.to_track_list_string())
         },
 
         // <https://drafts.csswg.org/css-grid/#resolved-track-list-subgrid>
@@ -587,7 +581,7 @@ fn shorthand_to_css_string(
         );
     }
     match block.shorthand_to_css(id, &mut dest) {
-        Ok(_) => dest.to_owned(),
+        Ok(_) => dest,
         Err(_) => String::new(),
     }
 }
@@ -808,6 +802,8 @@ fn containing_block_for_node<'a>(node: ServoLayoutNode<'a>) -> Option<ServoLayou
 
     #[expect(unsafe_code)]
     while let Some(ancestor) = unsafe { current_ancestor.dangerous_flat_tree_parent() } {
+        current_ancestor = ancestor;
+
         let Some((ancestor_style, ancestor_flags)) = style_and_flags_for_node(&ancestor) else {
             continue;
         };
@@ -818,7 +814,6 @@ fn containing_block_for_node<'a>(node: ServoLayoutNode<'a>) -> Option<ServoLayou
         }
 
         current_position_value = ancestor_style.clone_position();
-        current_ancestor = ancestor;
     }
     None
 }
@@ -943,7 +938,7 @@ pub fn get_the_text_steps(node: ServoLayoutNode<'_>) -> String {
                 if !s.is_empty() {
                     if max_req_line_break_count > 0 {
                         // Step 5.
-                        output.push_str(&"\u{000A}".repeat(max_req_line_break_count));
+                        output.extend(std::iter::repeat_n('\u{000A}', max_req_line_break_count));
                         max_req_line_break_count = 0;
                     }
                     output.push_str(&s);
@@ -968,7 +963,7 @@ pub fn get_the_text_steps(node: ServoLayoutNode<'_>) -> String {
 }
 
 enum InnerOrOuterTextItem {
-    Text(String),
+    Text(Cow<'static, str>),
     RequiredLineBreakCount(usize),
 }
 
@@ -1113,16 +1108,15 @@ fn rendered_text_collection_steps(
                     display,
                     Display::InlineBlock | Display::InlineFlex | Display::InlineGrid
                 );
+
                 // Now we need to decide on whether to remove beginning white space or not, this
                 // is mainly decided by the elements we rendered before, but may be overwritten by the white-space
                 // property.
-                let trim_beginning_white_space =
+                let trim_leading_white_space =
                     !preserve_whitespace && (state.may_start_with_whitespace || is_inline);
-                let with_white_space_rules_applied = WhitespaceCollapse::new(
-                    text_content.chars(),
-                    white_space_collapse,
-                    trim_beginning_white_space,
-                );
+                // FIXME: This assumes the element always start at a word boundary. But can fail:
+                // a<span style="text-transform: capitalize">b</span>c
+                let on_word_boundary = true;
 
                 // Step 4: If node is a Text node, then for each CSS text box produced by node, in
                 // content order, compute the text of the box after application of the CSS
@@ -1131,16 +1125,14 @@ fn rendered_text_collection_steps(
                 // rules are slightly modified: collapsible spaces at the end of lines are always
                 // collapsed, but they are only removed if the line is the last line of the block,
                 // or it ends with a br element. Soft hyphens should be preserved.
-                let text_transform = style.clone_text_transform().case();
-                let mut transformed_text: String =
-                    TextTransformation::new(with_white_space_rules_applied, text_transform)
-                        .collect();
-
-                // Since iterator for capitalize not doing anything, we must handle it outside here
-                // FIXME: This assumes the element always start at a word boundary. But can fail:
-                // a<span style="text-transform: capitalize">b</span>c
-                if TextTransformCase::Capitalize == text_transform {
-                    transformed_text = capitalize_string(&transformed_text, true);
+                let mut transformed_text = String::with_capacity(text_content.len());
+                for iteration in TextTransformationIterator::new(
+                    &text_content,
+                    style,
+                    trim_leading_white_space,
+                    on_word_boundary,
+                ) {
+                    transformed_text.extend(iteration.characters());
                 }
 
                 let is_preformatted_element =
@@ -1162,7 +1154,7 @@ fn rendered_text_collection_steps(
                 // encounter another text node we can ensure no trailing white space for
                 // normal text without having to look ahead
                 if state.did_truncate_trailing_white_space && !is_first_character_whitespace {
-                    items.push(InnerOrOuterTextItem::Text(String::from(" ")));
+                    items.push(InnerOrOuterTextItem::Text(Cow::Borrowed(" ")));
                 };
 
                 if !transformed_text.is_empty() {
@@ -1176,12 +1168,14 @@ fn rendered_text_collection_steps(
                         state.may_start_with_whitespace = is_final_character_whitespace;
                         state.did_truncate_trailing_white_space = false;
                     }
-                    items.push(InnerOrOuterTextItem::Text(transformed_text));
+                    items.push(InnerOrOuterTextItem::Text(Cow::Owned(transformed_text)));
                 }
             } else {
                 // If we don't have a parent element then there's no style data available,
                 // in this (pretty unlikely) case we just return the Text fragment as is.
-                items.push(InnerOrOuterTextItem::Text(node.text_content().into()));
+                items.push(InnerOrOuterTextItem::Text(Cow::Owned(
+                    node.text_content().deref().into(),
+                )));
             }
         },
         Some(LayoutNodeType::Element(LayoutElementType::HTMLBRElement)) => {
@@ -1189,7 +1183,7 @@ fn rendered_text_collection_steps(
             // LF code point to items.
             state.did_truncate_trailing_white_space = false;
             state.may_start_with_whitespace = true;
-            items.push(InnerOrOuterTextItem::Text(String::from("\u{000A}")));
+            items.push(InnerOrOuterTextItem::Text(Cow::Borrowed("\u{000A}")));
         },
         _ => {
             // First we need to gather some infos to setup the various flags
@@ -1239,7 +1233,7 @@ fn rendered_text_collection_steps(
                 // a single U+0009 TAB code point to items.
                 Display::TableCell => {
                     if !state.first_table_cell {
-                        items.push(InnerOrOuterTextItem::Text(String::from(
+                        items.push(InnerOrOuterTextItem::Text(Cow::Borrowed(
                             "\u{0009}", /* tab */
                         )));
                         // Make sure we don't add a white-space we removed from the previous node
@@ -1254,7 +1248,7 @@ fn rendered_text_collection_steps(
                 // LF code point to items.
                 Display::TableRow => {
                     if !state.first_table_row {
-                        items.push(InnerOrOuterTextItem::Text(String::from(
+                        items.push(InnerOrOuterTextItem::Text(Cow::Borrowed(
                             "\u{000A}", /* Line Feed */
                         )));
                         // Make sure we don't add a white-space we removed from the previous node
@@ -1278,7 +1272,7 @@ fn rendered_text_collection_steps(
                 Display::InlineFlex | Display::InlineGrid | Display::InlineBlock
                     if state.did_truncate_trailing_white_space =>
                 {
-                    items.push(InnerOrOuterTextItem::Text(String::from(" ")));
+                    items.push(InnerOrOuterTextItem::Text(Cow::Borrowed(" ")));
                     state.did_truncate_trailing_white_space = false;
                     state.may_start_with_whitespace = true;
                 },
@@ -1325,7 +1319,7 @@ fn rendered_text_collection_steps(
                     LayoutNodeType::Element(LayoutElementType::HTMLMediaElement),
                 ) => {
                     if display != Display::Block && state.did_truncate_trailing_white_space {
-                        items.push(InnerOrOuterTextItem::Text(String::from(" ")));
+                        items.push(InnerOrOuterTextItem::Text(Cow::Borrowed(" ")));
                         state.did_truncate_trailing_white_space = false;
                     };
                     state.may_start_with_whitespace = false;
@@ -1367,94 +1361,20 @@ fn rendered_text_collection_steps(
     items
 }
 
-struct ClosestFragment {
-    fragment: Arc<TextFragment>,
-    point_in_fragment: Point2D<Au, CSSPixel>,
-    distance: Au,
-    point_in_vertical_bounds: bool,
-}
-
-impl ClosestFragment {
-    fn should_replace(&self, new_distance: Au, point_in_vertical_bounds: bool) -> bool {
-        if point_in_vertical_bounds && !self.point_in_vertical_bounds {
-            return true;
-        }
-        if self.point_in_vertical_bounds && !point_in_vertical_bounds {
-            return false;
-        }
-        new_distance <= self.distance
-    }
-}
-
 pub fn find_character_offset_in_fragment_descendants(
     node: &ServoLayoutNode,
     stacking_context_tree: &StackingContextTree,
     point_in_viewport: Point2D<Au, CSSPixel>,
-) -> Option<usize> {
-    fn maybe_update_closest(
-        fragment: &Fragment,
-        point_in_fragment: Point2D<Au, CSSPixel>,
-        closest_relative_fragment: &mut Option<ClosestFragment>,
-    ) {
-        let Fragment::Text(text_fragment) = fragment else {
-            return;
-        };
-
-        let (distance, point_in_vertical_bounds) = {
-            (
-                text_fragment.distance_to_point_for_glyph_offset(point_in_fragment),
-                text_fragment.point_is_within_vertical_boundaries(point_in_fragment),
-            )
-        };
-
-        if closest_relative_fragment
-            .as_ref()
-            .is_none_or(|closest_fragment| {
-                closest_fragment.should_replace(distance, point_in_vertical_bounds)
-            })
-        {
-            *closest_relative_fragment = Some(ClosestFragment {
-                fragment: text_fragment.clone(),
-                point_in_fragment,
-                distance,
-                point_in_vertical_bounds,
-            });
-        }
-    }
-
-    fn collect_relevant_children(
-        fragment: &Fragment,
-        point_in_viewport: Point2D<Au, CSSPixel>,
-        closest_relative_fragment: &mut Option<ClosestFragment>,
-    ) {
-        maybe_update_closest(fragment, point_in_viewport, closest_relative_fragment);
-
-        if let Some(children) = fragment.children() {
-            for child in children.iter() {
-                let offset = child
-                    .base()
-                    .map(|base| base.rect().origin)
-                    .unwrap_or_default();
-                let point = point_in_viewport - offset.to_vector();
-                collect_relevant_children(child, point, closest_relative_fragment);
-            }
-        }
-    }
-
-    let mut closest_relative_fragment = None;
+) -> Option<(OpaqueNode, Utf32CodeUnits)> {
+    let mut search = ClosestFragmentSearch::default();
     for fragment in &node.fragments_for_pseudo(None) {
         if let Some(point_in_fragment) =
             stacking_context_tree.offset_in_fragment(fragment, point_in_viewport)
         {
-            collect_relevant_children(fragment, point_in_fragment, &mut closest_relative_fragment);
+            search.collect_relevant_children(fragment, point_in_fragment);
         }
     }
-
-    closest_relative_fragment.and_then(|closest_fragment| {
-        closest_fragment
-            .fragment
-            .character_offset(closest_fragment.point_in_fragment)
-    })
+    search.into_dom_position()
 }
 
 pub fn process_containing_block_query(node: ServoLayoutNode) -> Option<UntrustedNodeAddress> {
@@ -1580,14 +1500,23 @@ pub(crate) fn transform_au_rectangle(
     rect_to_transform: Rect<Au, CSSPixel>,
     transform: FastLayoutTransform,
 ) -> Option<Rect<Au, CSSPixel>> {
-    let rect_to_transform = &au_rect_to_f32_rect(rect_to_transform).cast_unit();
-    let outer_transformed_rect = match transform {
+    transform_f32_rectangle(
+        au_rect_to_f32_rect(rect_to_transform).cast_unit(),
+        transform,
+    )
+    .map(|transformed_rect| f32_rect_to_au_rect(transformed_rect).cast_unit())
+}
+
+pub(crate) fn transform_f32_rectangle(
+    rect_to_transform: Rect<f32, LayoutPixel>,
+    transform: FastLayoutTransform,
+) -> Option<Rect<f32, LayoutPixel>> {
+    match transform {
         FastLayoutTransform::Offset(offset) => Some(rect_to_transform.translate(offset)),
         FastLayoutTransform::Transform { transform, .. } => {
-            transform.outer_transformed_rect(rect_to_transform)
+            transform.outer_transformed_rect(&rect_to_transform)
         },
-    };
-    outer_transformed_rect.map(|transformed_rect| f32_rect_to_au_rect(transformed_rect).cast_unit())
+    }
 }
 
 pub(crate) fn process_effective_overflow_query(node: ServoLayoutNode<'_>) -> Option<AxesOverflow> {

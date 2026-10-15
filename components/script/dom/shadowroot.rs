@@ -8,9 +8,10 @@ use std::collections::hash_map::Entry;
 
 use dom_struct::dom_struct;
 use html5ever::serialize::TraversalScope;
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use js::rust::{HandleValue, MutableHandleValue};
 use script_bindings::cell::{DomRefCell, RefMut};
+use script_bindings::dom::UnrootedDom;
 use script_bindings::error::{ErrorResult, Fallible};
 use script_bindings::reflector::reflect_dom_object;
 use servo_arc::Arc;
@@ -22,6 +23,7 @@ use style::stylist::{CascadeData, Stylist};
 use stylo_atoms::Atom;
 
 use crate::conversions::Convert;
+use crate::css::stylesheet_set::StylesheetSetRef;
 use crate::dom::bindings::codegen::Bindings::ElementBinding::GetHTMLOptions;
 use crate::dom::bindings::codegen::Bindings::HTMLSlotElementBinding::HTMLSlotElement_Binding::HTMLSlotElementMethods;
 use crate::dom::bindings::codegen::Bindings::SanitizerBinding::{
@@ -60,8 +62,6 @@ use crate::dom::sanitizer::Sanitizer;
 use crate::dom::trustedtypes::trustedhtml::TrustedHTML;
 use crate::dom::types::EventTarget;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
-use crate::stylesheet_set::StylesheetSetRef;
 
 /// Whether a shadow root hosts an User Agent widget.
 #[derive(JSTraceable, MallocSizeOf, PartialEq)]
@@ -160,15 +160,16 @@ impl ShadowRoot {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         host: &Element,
         document: &Document,
         mode: ShadowRootMode,
         slot_assignment_mode: SlotAssignmentMode,
         clonable: bool,
         is_user_agent_widget: IsUserAgentWidget,
-        can_gc: CanGc,
     ) -> DomRoot<ShadowRoot> {
         reflect_dom_object(
+            cx,
             Box::new(ShadowRoot::new_inherited(
                 host,
                 document,
@@ -178,8 +179,13 @@ impl ShadowRoot {
                 is_user_agent_widget,
             )),
             document.window(),
-            can_gc,
         )
+    }
+
+    pub(crate) fn host_unrooted<'a>(&self, no_gc: &'a NoGC) -> UnrootedDom<'a, Element> {
+        self.upcast::<DocumentFragment>()
+            .host_unrooted(no_gc)
+            .expect("ShadowRoot always has an element as host")
     }
 
     pub(crate) fn owner_doc(&self) -> &Document {
@@ -190,12 +196,16 @@ impl ShadowRoot {
         self.author_styles.borrow().stylesheets.len()
     }
 
-    pub(crate) fn stylesheet_at(&self, index: usize) -> Option<DomRoot<CSSStyleSheet>> {
+    pub(crate) fn stylesheet_at(
+        &self,
+        cx: &mut JSContext,
+        index: usize,
+    ) -> Option<DomRoot<CSSStyleSheet>> {
         let stylesheets = &self.author_styles.borrow().stylesheets;
 
         stylesheets
             .get(index)
-            .and_then(|s| s.owner.get_cssom_object())
+            .and_then(|s| s.owner.get_cssom_object(cx))
     }
 
     /// Add a stylesheet owned by `owner_node` to the list of shadow root sheets, in the
@@ -206,7 +216,7 @@ impl ShadowRoot {
     #[cfg_attr(crown, expect(crown::unrooted_must_root))] // Owner needs to be rooted already necessarily.
     pub(crate) fn add_owned_stylesheet(
         &self,
-        cx: &mut JSContext,
+        no_gc: &NoGC,
         owner_node: &Element,
         sheet: Arc<Stylesheet>,
     ) {
@@ -217,19 +227,15 @@ impl ShadowRoot {
             .iter()
             .find(|sheet_in_shadow| {
                 match &sheet_in_shadow.owner {
-                    StylesheetSource::Element(other_node) => {
-                        owner_node.upcast::<Node>().is_before(other_node.upcast())
-                    },
+                    StylesheetSource::Element(other_node) => owner_node
+                        .upcast::<Node>()
+                        .is_before(no_gc, other_node.upcast()),
                     // Non-constructed stylesheet should be ordered before the
                     // constructed ones.
                     StylesheetSource::Constructed(_) => true,
                 }
             })
             .cloned();
-
-        if self.document.has_browsing_context() {
-            self.document.load_web_fonts_from_stylesheet(cx, &sheet);
-        }
 
         DocumentOrShadowRoot::add_stylesheet(
             StylesheetSource::Element(Dom::from_ref(owner_node)),
@@ -242,21 +248,13 @@ impl ShadowRoot {
 
     /// Append a constructed stylesheet to the back of shadow root stylesheet set.
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
-    pub(crate) fn append_constructed_stylesheet(
-        &self,
-        cx: &mut JSContext,
-        cssom_stylesheet: &CSSStyleSheet,
-    ) {
+    pub(crate) fn append_constructed_stylesheet(&self, cssom_stylesheet: &CSSStyleSheet) {
         debug_assert!(cssom_stylesheet.is_constructed());
 
         let stylesheets = &mut self.author_styles.borrow_mut().stylesheets;
         let sheet = cssom_stylesheet.style_stylesheet().clone();
 
         let insertion_point = stylesheets.iter().last().cloned();
-
-        if self.document.has_browsing_context() {
-            self.document.load_web_fonts_from_stylesheet(cx, &sheet);
-        }
 
         DocumentOrShadowRoot::add_stylesheet(
             StylesheetSource::Constructed(Dom::from_ref(cssom_stylesheet)),
@@ -277,11 +275,11 @@ impl ShadowRoot {
         )
     }
 
-    pub(crate) fn invalidate_stylesheets(&self) {
+    pub(crate) fn invalidate_stylesheets(&self, no_gc: &NoGC) {
         self.document.invalidate_shadow_roots_stylesheets();
         self.author_styles.borrow_mut().stylesheets.force_dirty();
         // Mark the host element dirty so a reflow will be performed.
-        self.Host().upcast::<Node>().dirty(NodeDamage::Style);
+        self.Host().upcast::<Node>().dirty(no_gc, NodeDamage::Style);
 
         // Also mark the host element with `RestyleHint::restyle_subtree` so a reflow
         // can traverse into the shadow tree.
@@ -296,7 +294,7 @@ impl ShadowRoot {
     }
 
     /// Associate an element present in this shadow tree with the provided id.
-    pub(crate) fn register_element_id(&self, element: &Element, id: &Atom, _can_gc: CanGc) {
+    pub(crate) fn register_element_id(&self, element: &Element, id: &Atom) {
         self.document_fragment.id_map().add(id, element)
     }
 
@@ -367,9 +365,12 @@ impl ShadowRoot {
         self.delegates_focus.set(delegates_focus);
     }
 
-    pub(crate) fn details_name_groups(&self) -> RefMut<'_, DetailsNameGroups> {
+    pub(crate) fn details_name_groups<'a: 'b, 'b>(
+        &'a self,
+        no_gc: &'b NoGC,
+    ) -> RefMut<'b, DetailsNameGroups> {
         RefMut::map(
-            self.details_name_groups.borrow_mut(),
+            self.details_name_groups.safe_borrow_mut(no_gc),
             |details_name_groups| details_name_groups.get_or_insert_default(),
         )
     }
@@ -378,9 +379,9 @@ impl ShadowRoot {
         self.document_or_shadow_root.custom_element_registry()
     }
 
-    pub(crate) fn set_custom_element_registry(&self, registry: &CustomElementRegistry) {
+    pub(crate) fn set_custom_element_registry(&self, registry: Option<&CustomElementRegistry>) {
         self.document_or_shadow_root
-            .set_custom_element_registry(Some(registry));
+            .set_custom_element_registry(registry);
     }
 }
 
@@ -466,12 +467,12 @@ impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
     }
 
     /// <https://drafts.csswg.org/cssom/#dom-document-stylesheets>
-    fn StyleSheets(&self) -> DomRoot<StyleSheetList> {
+    fn StyleSheets(&self, cx: &mut JSContext) -> DomRoot<StyleSheetList> {
         self.stylesheet_list.or_init(|| {
             StyleSheetList::new(
+                cx,
                 &self.window,
                 StyleSheetListOwner::ShadowRoot(Dom::from_ref(self)),
-                CanGc::deprecated_note(),
             )
         })
     }
@@ -602,13 +603,17 @@ impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
     fn SetAdoptedStyleSheets(&self, cx: &mut JSContext, val: HandleValue) -> ErrorResult {
         let result = DocumentOrShadowRoot::set_adopted_stylesheet_from_jsval(
             cx,
-            self.adopted_stylesheets.borrow_mut().as_mut(),
+            &self.adopted_stylesheets,
             val,
             &StyleSheetListOwner::ShadowRoot(Dom::from_ref(self)),
         );
 
-        // If update is successful, clear the FrozenArray cache.
         if result.is_ok() {
+            if self.author_styles.borrow().stylesheets.dirty() {
+                self.invalidate_stylesheets(cx.no_gc());
+            }
+
+            // Clear the FrozenArray cache.
             self.adopted_stylesheets_frozen_types.clear();
         }
 

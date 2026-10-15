@@ -9,7 +9,8 @@ use style::attr::AttrValue;
 
 use crate::dom::bindings::inheritance::{
     Castable, DocumentFragmentTypeId, ElementTypeId, HTMLElementTypeId, HTMLMediaElementTypeId,
-    NodeTypeId, SVGElementTypeId, SVGGraphicsElementTypeId,
+    NodeTypeId, SVGElementTypeId, SVGGeometryElementTypeId, SVGGradientElementTypeId,
+    SVGGraphicsElementTypeId, SVGTextContentElementTypeId, SVGTextPositioningElementTypeId,
 };
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
@@ -17,6 +18,7 @@ use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::element::attributes::storage::AttrRef;
 use crate::dom::element::{AttributeMutation, Element};
 use crate::dom::event::Event;
+use crate::dom::html::form_controls::htmlinputelement::HTMLInputElement;
 use crate::dom::html::htmlanchorelement::HTMLAnchorElement;
 use crate::dom::html::htmlareaelement::HTMLAreaElement;
 use crate::dom::html::htmlbaseelement::HTMLBaseElement;
@@ -57,17 +59,37 @@ use crate::dom::html::htmltablesectionelement::HTMLTableSectionElement;
 use crate::dom::html::htmltemplateelement::HTMLTemplateElement;
 use crate::dom::html::htmltextareaelement::HTMLTextAreaElement;
 use crate::dom::html::htmltitleelement::HTMLTitleElement;
+use crate::dom::html::htmltrackelement::HTMLTrackElement;
 use crate::dom::html::htmlvideoelement::HTMLVideoElement;
-use crate::dom::html::input_element::HTMLInputElement;
 use crate::dom::htmlbuttonelement::CommandState;
 use crate::dom::htmldialogelement::HTMLDialogElement;
+use crate::dom::inputevent::HitTestResult;
 use crate::dom::node::{
     BindContext, ChildrenMutation, CloneChildrenFlag, MoveContext, Node, UnbindContext,
 };
 use crate::dom::shadowroot::ShadowRoot;
+use crate::dom::svg::svgaelement::SVGAElement;
+use crate::dom::svg::svgcircleelement::SVGCircleElement;
+use crate::dom::svg::svgdefselement::SVGDefsElement;
 use crate::dom::svg::svgelement::SVGElement;
+use crate::dom::svg::svgellipseelement::SVGEllipseElement;
+use crate::dom::svg::svggelement::SVGGElement;
 use crate::dom::svg::svgimageelement::SVGImageElement;
+use crate::dom::svg::svglineargradientelement::SVGLinearGradientElement;
+use crate::dom::svg::svglineelement::SVGLineElement;
+use crate::dom::svg::svgpathelement::SVGPathElement;
+use crate::dom::svg::svgpatternelement::SVGPatternElement;
+use crate::dom::svg::svgpolygonelement::SVGPolygonElement;
+use crate::dom::svg::svgpolylineelement::SVGPolylineElement;
+use crate::dom::svg::svgradialgradientelement::SVGRadialGradientElement;
+use crate::dom::svg::svgrectelement::SVGRectElement;
+use crate::dom::svg::svgstopelement::SVGStopElement;
 use crate::dom::svg::svgsvgelement::SVGSVGElement;
+use crate::dom::svg::svgsymbolelement::SVGSymbolElement;
+use crate::dom::svg::svgtextelement::SVGTextElement;
+use crate::dom::svg::svgtspanelement::SVGTSpanElement;
+use crate::dom::svg::svguseelement::SVGUseElement;
+use crate::dom::types::MouseEvent;
 
 /// Trait to allow DOM nodes to opt-in to overriding (or adding to) common
 /// behaviours. Replicates the effect of C++ virtual methods.
@@ -151,6 +173,20 @@ pub(crate) trait VirtualMethods {
     fn handle_event(&self, cx: &mut js::context::JSContext, event: &Event) {
         if let Some(s) = self.super_type() {
             s.handle_event(cx, event);
+        }
+    }
+
+    /// Called after `mousedown`/`pointerdown` event dispatch completes. This needs to be
+    /// separate from `handle_event` because it's only invoked if `preventDefault` was
+    /// called on neither the `mousedown` nor the `pointerdown` event handler.
+    fn handle_mousedown_event(
+        &self,
+        cx: &mut js::context::JSContext,
+        mouse_event: &MouseEvent,
+        hit_test_result: &HitTestResult,
+    ) {
+        if let Some(super_type) = self.super_type() {
+            super_type.handle_mousedown_event(cx, mouse_event, hit_test_result);
         }
     }
 
@@ -334,12 +370,85 @@ pub(crate) fn vtable_for(node: &Node) -> &dyn VirtualMethods {
         NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLTitleElement)) => {
             node.downcast::<HTMLTitleElement>().unwrap() as &dyn VirtualMethods
         },
+        NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLTrackElement)) => {
+            node.downcast::<HTMLTrackElement>().unwrap() as &dyn VirtualMethods
+        },
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
+            SVGGraphicsElementTypeId::SVGGeometryElement(
+                SVGGeometryElementTypeId::SVGCircleElement,
+            ),
+        ))) => node.downcast::<SVGCircleElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
+            SVGGraphicsElementTypeId::SVGGeometryElement(
+                SVGGeometryElementTypeId::SVGEllipseElement,
+            ),
+        ))) => node.downcast::<SVGEllipseElement>().unwrap() as &dyn VirtualMethods,
         NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
             SVGGraphicsElementTypeId::SVGImageElement,
         ))) => node.downcast::<SVGImageElement>().unwrap() as &dyn VirtualMethods,
         NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
+            SVGGraphicsElementTypeId::SVGTextContentElement(
+                SVGTextContentElementTypeId::SVGTextPositioningElement(
+                    SVGTextPositioningElementTypeId::SVGTextElement,
+                ),
+            ),
+        ))) => node.downcast::<SVGTextElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
+            SVGGraphicsElementTypeId::SVGTextContentElement(
+                SVGTextContentElementTypeId::SVGTextPositioningElement(
+                    SVGTextPositioningElementTypeId::SVGTSpanElement,
+                ),
+            ),
+        ))) => node.downcast::<SVGTSpanElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
+            SVGGraphicsElementTypeId::SVGGeometryElement(SVGGeometryElementTypeId::SVGRectElement),
+        ))) => node.downcast::<SVGRectElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
+            SVGGraphicsElementTypeId::SVGGeometryElement(SVGGeometryElementTypeId::SVGLineElement),
+        ))) => node.downcast::<SVGLineElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
+            SVGGraphicsElementTypeId::SVGGeometryElement(
+                SVGGeometryElementTypeId::SVGPolylineElement,
+            ),
+        ))) => node.downcast::<SVGPolylineElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
+            SVGGraphicsElementTypeId::SVGGeometryElement(
+                SVGGeometryElementTypeId::SVGPolygonElement,
+            ),
+        ))) => node.downcast::<SVGPolygonElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
+            SVGGraphicsElementTypeId::SVGGeometryElement(SVGGeometryElementTypeId::SVGPathElement),
+        ))) => node.downcast::<SVGPathElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
             SVGGraphicsElementTypeId::SVGSVGElement,
         ))) => node.downcast::<SVGSVGElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
+            SVGGraphicsElementTypeId::SVGGElement,
+        ))) => node.downcast::<SVGGElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
+            SVGGraphicsElementTypeId::SVGUseElement,
+        ))) => node.downcast::<SVGUseElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
+            SVGGraphicsElementTypeId::SVGSymbolElement,
+        ))) => node.downcast::<SVGSymbolElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
+            SVGGraphicsElementTypeId::SVGDefsElement,
+        ))) => node.downcast::<SVGDefsElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGradientElement(
+            SVGGradientElementTypeId::SVGLinearGradientElement,
+        ))) => node.downcast::<SVGLinearGradientElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGradientElement(
+            SVGGradientElementTypeId::SVGRadialGradientElement,
+        ))) => node.downcast::<SVGRadialGradientElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGStopElement)) => {
+            node.downcast::<SVGStopElement>().unwrap() as &dyn VirtualMethods
+        },
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGPatternElement)) => {
+            node.downcast::<SVGPatternElement>().unwrap() as &dyn VirtualMethods
+        },
+        NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
+            SVGGraphicsElementTypeId::SVGAElement,
+        ))) => node.downcast::<SVGAElement>().unwrap() as &dyn VirtualMethods,
         NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGElement)) => {
             node.downcast::<SVGElement>().unwrap() as &dyn VirtualMethods
         },

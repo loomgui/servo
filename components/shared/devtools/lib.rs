@@ -27,9 +27,9 @@ pub use embedder_traits::ConsoleLogLevel;
 use embedder_traits::Theme;
 use http::{HeaderMap, Method};
 use malloc_size_of_derive::MallocSizeOf;
+use net_traits::TlsSecurityInfo;
 use net_traits::http_status::HttpStatus;
 use net_traits::request::Destination;
-use net_traits::{DebugVec, TlsSecurityInfo};
 use profile_traits::mem::ReportsChan;
 use serde::de::{Error, Visitor};
 use serde::{Deserialize, Serialize};
@@ -140,6 +140,9 @@ pub enum ScriptToDevtoolsControlMsg {
     /// Get frame information from script
     CreateFrameActor(GenericSender<String>, PipelineId, FrameInfo),
 
+    /// Get object information from script
+    CreateObjectActor(GenericSender<String>, DebuggerValue),
+
     /// Get environment information from script
     CreateEnvironmentActor(
         GenericSender<String>,
@@ -179,10 +182,6 @@ pub struct FunctionPreview {
     pub parameter_names: Vec<String>,
     pub is_async: Option<bool>,
     pub is_generator: Option<bool>,
-}
-
-fn debugger_value_uuid() -> String {
-    Uuid::new_v4().to_string()
 }
 
 struct DebuggerNumberVisitor;
@@ -235,8 +234,7 @@ pub enum DebuggerValue {
     NumberValue(#[serde(deserialize_with = "deserialize_debugger_number")] f64),
     StringValue(String),
     ObjectValue {
-        #[serde(default = "debugger_value_uuid")]
-        uuid: String,
+        actor: Option<String>,
         class: String,
         own_property_length: Option<u32>,
         preview: Option<Box<ObjectPreview>>,
@@ -469,7 +467,7 @@ pub enum DevtoolScriptControlMsg {
     /// Gets the list of all allowed CSS rules and possible values.
     GetCssDatabase(GenericSender<HashMap<String, CssDatabaseProperty>>),
     /// Simulates a light or dark color scheme for the given pipeline
-    SimulateColorScheme(PipelineId, Theme),
+    SimulateColorScheme(PipelineId, Option<Theme>),
     /// Highlight the given DOM node
     HighlightDomNode(PipelineId, Option<String>),
 
@@ -477,6 +475,7 @@ pub enum DevtoolScriptControlMsg {
         String,
         PipelineId,
         Option<String>,
+        bool,
         GenericSender<EvaluateJSReply>,
     ),
     GetPossibleBreakpoints(u32, GenericSender<Vec<RecommendedBreakpointLocation>>),
@@ -485,9 +484,15 @@ pub enum DevtoolScriptControlMsg {
     Interrupt,
     Resume(Option<String>, Option<String>),
     ListFrames(PipelineId, u32, u32, GenericSender<Vec<String>>),
-    GetEnvironment(String, GenericSender<String>),
+    GetEnvironment(GetEnvironmentRequest, GenericSender<String>),
     Blackbox(u32, BlackboxCoverage),
     Unblackbox(u32, BlackboxCoverage),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum GetEnvironmentRequest {
+    Global(PipelineId),
+    Frame(String),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -564,7 +569,7 @@ pub struct HttpRequest {
     pub url: ServoUrl,
     pub method: Method,
     pub headers: HeaderMap,
-    pub body: Option<DebugVec>,
+    pub body: Option<bytes::Bytes>,
     pub pipeline_id: PipelineId,
     pub started_date_time: SystemTime,
     pub time_stamp: i64,
@@ -580,7 +585,7 @@ pub struct HttpResponse {
     #[ignore_malloc_size_of = "Http type"]
     pub headers: Option<HeaderMap>,
     pub status: HttpStatus,
-    pub body: Option<DebugVec>,
+    pub body: Option<bytes::Bytes>,
     pub from_cache: bool,
     pub pipeline_id: PipelineId,
     pub browsing_context_id: BrowsingContextId,

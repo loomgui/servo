@@ -116,6 +116,9 @@ impl BoxFragmentRareData {
 pub(crate) struct BoxFragment {
     pub base: BaseFragment,
 
+    /// The style for this [`BoxFragment`].
+    pub style: SharedStyle,
+
     pub children: Vec<Fragment>,
 
     /// This [`BoxFragment`]'s containing block rectangle in coordinates relative to
@@ -167,7 +170,8 @@ impl BoxFragment {
     ) -> Self {
         let rare_data = BoxFragmentRareData::new(specific_layout_info);
         Self {
-            base: BaseFragment::new(base_fragment_info, style.into(), content_rect),
+            base: BaseFragment::new(base_fragment_info, content_rect),
+            style: style.into(),
             children,
             cumulative_containing_block_rect: Default::default(),
             padding,
@@ -189,7 +193,7 @@ impl BoxFragment {
     }
 
     pub(crate) fn style<'a>(&'a self) -> AtomicRef<'a, ServoArc<ComputedValues>> {
-        self.base.style()
+        self.style.borrow()
     }
 
     pub(crate) fn with_style(self: &Arc<Self>) -> BoxFragmentWithStyle<'_> {
@@ -253,6 +257,15 @@ impl BoxFragment {
         AtomicRef::filter_map(rare_data, |rare_data| {
             rare_data.specific_layout_info.as_ref()
         })
+    }
+
+    pub(crate) fn clear_stacking_context_tree_traversal_data(&self) {
+        if let Some(rare_data) = self.rare_data.get() {
+            let mut rare_data = rare_data.borrow_mut();
+            rare_data.generated_clip_id = None;
+            rare_data.generated_scroll_tree_node_id = None;
+            rare_data.resolved_sticky_insets = None;
+        }
     }
 
     pub(crate) fn resolved_sticky_insets(

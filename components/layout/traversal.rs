@@ -9,10 +9,9 @@ use layout_api::{
 };
 use script::layout_dom::ServoLayoutNode;
 use style::context::{SharedStyleContext, StyleContext};
-use style::data::ElementData;
 use style::dom::{NodeInfo, TElement, TNode};
 use style::selector_parser::RestyleDamage;
-use style::traversal::{DomTraversal, PerLevelTraversalData, recalc_style_at};
+use style::traversal::{DomTraversal, recalc_style_at};
 
 use crate::BoxTree;
 use crate::context::LayoutContext;
@@ -40,7 +39,6 @@ where
 {
     fn process_preorder<F>(
         &self,
-        traversal_data: &PerLevelTraversalData,
         context: &mut StyleContext<E>,
         node: E::ConcreteNode,
         note_child: F,
@@ -62,7 +60,6 @@ where
 
         recalc_style_at(
             self,
-            traversal_data,
             context,
             dangerous_style_element,
             &mut element_data,
@@ -77,10 +74,6 @@ where
 
     fn process_postorder(&self, _style_context: &mut StyleContext<E>, _node: E::ConcreteNode) {
         panic!("this should never be called")
-    }
-
-    fn text_node_needs_traversal(node: E::ConcreteNode, parent_data: &ElementData) -> bool {
-        node.layout_node().layout_data().is_none() || !parent_data.damage.is_empty()
     }
 
     fn shared_context(&self) -> &SharedStyleContext<'_> {

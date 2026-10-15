@@ -4,24 +4,25 @@
 
 use dom_struct::dom_struct;
 use euclid::default::Size2D;
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use pixels::Snapshot;
-use script_bindings::reflector::{AssociatedMemory, Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{AssociatedMemory, Reflector, reflect_dom_object};
 use servo_base::{Epoch, generic_channel};
 use servo_canvas_traits::canvas::{CanvasCommand, CanvasId};
-use servo_url::ServoUrl;
 use webrender_api::ImageKey;
 
 use super::canvas_state::CanvasState;
 use crate::canvas_context::{CanvasContext, CanvasHelpers, HTMLCanvasElementOrOffscreenCanvas};
 use crate::dom::bindings::codegen::Bindings::CanvasRenderingContext2DBinding::{
-    CanvasDirection, CanvasFillRule, CanvasImageSource, CanvasLineCap, CanvasLineJoin,
-    CanvasRenderingContext2DMethods, CanvasTextAlign, CanvasTextBaseline,
+    CanvasColorType, CanvasDirection, CanvasFillRule, CanvasImageSource, CanvasLineCap,
+    CanvasLineJoin, CanvasRenderingContext2DMethods, CanvasRenderingContext2DSettings,
+    CanvasTextAlign, CanvasTextBaseline, PredefinedColorSpace,
 };
 use crate::dom::bindings::codegen::Bindings::DOMMatrixBinding::DOMMatrix2DInit;
 use crate::dom::bindings::codegen::UnionTypes::{
     HTMLCanvasElementOrOffscreenCanvas as RootedHTMLCanvasElementOrOffscreenCanvas,
     StringOrCanvasGradientOrCanvasPattern,
+    UnrestrictedDoubleOrDOMPointInitOrUnrestrictedDoubleOrDOMPointInitSequence,
 };
 use crate::dom::bindings::error::{ErrorResult, Fallible};
 use crate::dom::bindings::num::Finite;
@@ -37,18 +38,42 @@ use crate::dom::imagedata::ImageData;
 use crate::dom::path2d::Path2D;
 use crate::dom::textmetrics::TextMetrics;
 
-// https://html.spec.whatwg.org/multipage/#canvasrenderingcontext2d
-#[dom_struct(associated_memory)]
+/// <https://html.spec.whatwg.org/multipage/#canvasrenderingcontext2d>
+#[dom_struct]
 pub(crate) struct CanvasRenderingContext2D {
     reflector_: Reflector<AssociatedMemory>,
     canvas: HTMLCanvasElementOrOffscreenCanvas,
     canvas_state: CanvasState,
+    /// <https://html.spec.whatwg.org/multipage/#concept-canvas-alpha>
+    alpha: bool,
+    /// <https://html.spec.whatwg.org/multipage/#concept-canvas-desynchronized>
+    desynchronized: bool,
+    /// <https://html.spec.whatwg.org/multipage/#concept-canvas-color-space>
+    color_space: PredefinedColorSpace,
+    /// <https://html.spec.whatwg.org/multipage/#concept-canvas-color-type>
+    color_type: CanvasColorType,
+    /// <https://html.spec.whatwg.org/multipage/#concept-canvas-will-read-frequently>
+    will_read_frequently: bool,
 }
 
 impl CanvasRenderingContext2D {
     const RGBA8_BYTES_PER_PIXEL: usize = 4;
-    /// We have two bitmap buffers one in Canvas Paint Thread and one for WebRender
-    const ASSOCIATED_MEMORY_BUFFER_COUNT: usize = 2;
+    /// Ideally this would be two bitmap buffers, unfortunately we currently have ~4 copies
+    /// which are all retained until GC:
+    ///
+    /// 1. The draw target's backing bitmap in the canvas paint thread
+    ///    (`CanvasData::draw_target`, e.g. `pixmap` in `VelloCPUDrawTarget`).
+    /// 2. Additional backend resources (approximated with 1 bitmap buffer, actually depends on backend):
+    ///    e.g. `ctx` and `resources` in `VelloCPUDrawTarget` for vello_cpu.
+    ///    TODO: #46785 tracks getting accurate statistics from the backend.
+    /// 3. `CachedImageData::Raw` in WebRender (cpu memory copy).
+    /// 4. GPU memory in webrender / driver (also lives in RAM on unified memory systems).
+    ///
+    /// This metric is only used to inform the GC about memory pressure, so it doesn't need to
+    /// be completely accurate, but undercounting may delay GCs and hence increase memory usage.
+    /// On mobile devices this slightly undercounts (usually unified memory), on desktop this
+    /// slightly overcounts, since GPU memory is separate.
+    const ASSOCIATED_MEMORY_BUFFER_COUNT: usize = 4;
 
     fn associated_memory_size(size: Size2D<u64>) -> usize {
         (size.width as usize)
@@ -64,11 +89,13 @@ impl CanvasRenderingContext2D {
         );
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#canvas-setting-init-bitmap>
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn new_inherited(
         global: &GlobalScope,
         canvas: HTMLCanvasElementOrOffscreenCanvas,
         size: Size2D<u32>,
+        settings: &CanvasRenderingContext2DSettings,
     ) -> Option<CanvasRenderingContext2D> {
         let canvas_state =
             CanvasState::new(global, Size2D::new(size.width as u64, size.height as u64))?;
@@ -76,6 +103,16 @@ impl CanvasRenderingContext2D {
             reflector_: Reflector::new(),
             canvas,
             canvas_state,
+            // Step 1. Set context's alpha to settings["alpha"].
+            alpha: settings.alpha,
+            // Step 2. Set context's desynchronized to settings["desynchronized"].
+            desynchronized: settings.desynchronized,
+            // Step 3. Set context's color space to settings["colorSpace"].
+            color_space: settings.colorSpace,
+            // Step 4. Set context's color type to settings["colorType"].
+            color_type: settings.colorType,
+            // Step 5. Set context's will read frequently to settings["willReadFrequently"].
+            will_read_frequently: settings.willReadFrequently,
         })
     }
 
@@ -84,29 +121,19 @@ impl CanvasRenderingContext2D {
         global: &GlobalScope,
         canvas: &HTMLCanvasElement,
         size: Size2D<u32>,
+        settings: &CanvasRenderingContext2DSettings,
     ) -> Option<DomRoot<CanvasRenderingContext2D>> {
         CanvasRenderingContext2D::new_inherited(
             global,
             HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(Dom::from_ref(canvas)),
             size,
+            settings,
         )
         .map(|context| {
-            let context = reflect_dom_object_with_cx(Box::new(context), global, cx);
+            let context = reflect_dom_object(cx, Box::new(context), global);
             context.update_associated_memory_size();
             context
         })
-    }
-
-    pub(crate) fn take_missing_image_urls(&self) -> Vec<ServoUrl> {
-        std::mem::take(&mut self.canvas_state.get_missing_image_urls().borrow_mut())
-    }
-
-    pub(crate) fn get_canvas_id(&self) -> CanvasId {
-        self.canvas_state.get_canvas_id()
-    }
-
-    pub(crate) fn send_canvas_command(&self, msg: CanvasCommand) {
-        self.canvas_state.send_canvas_command(msg)
     }
 
     pub(crate) fn send_canvas_command_immediate(&self, msg: CanvasCommand) {
@@ -175,6 +202,20 @@ impl CanvasContext for CanvasRenderingContext2D {
 //
 // FIXME: this behavior should might be generated by some annotations to idl.
 impl CanvasRenderingContext2DMethods<crate::DomTypeHolder> for CanvasRenderingContext2D {
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-canvas-getcontextattributes>
+    fn GetContextAttributes(&self) -> CanvasRenderingContext2DSettings {
+        // The getContextAttributes() method steps are to return «[ "alpha" → this's alpha,
+        // "desynchronized" → this's desynchronized, "colorSpace" → this's color space,
+        // "colorType" → this's color type, "willReadFrequently" → this's will read frequently ]».
+        CanvasRenderingContext2DSettings {
+            alpha: self.alpha,
+            desynchronized: self.desynchronized,
+            colorSpace: self.color_space,
+            colorType: self.color_type,
+            willReadFrequently: self.will_read_frequently,
+        }
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-canvas>
     fn Canvas(&self) -> DomRoot<HTMLCanvasElement> {
         match &self.canvas {
@@ -467,6 +508,18 @@ impl CanvasRenderingContext2DMethods<crate::DomTypeHolder> for CanvasRenderingCo
         self.canvas_state.rect(x, y, width, height)
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-roundrect>
+    fn RoundRect(
+        &self,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        radii: UnrestrictedDoubleOrDOMPointInitOrUnrestrictedDoubleOrDOMPointInitSequence,
+    ) -> ErrorResult {
+        self.canvas_state.round_rect(x, y, width, height, radii)
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-quadraticcurveto>
     fn QuadraticCurveTo(&self, cpx: f64, cpy: f64, x: f64, y: f64) {
         self.canvas_state.quadratic_curve_to(cpx, cpy, x, y)
@@ -571,15 +624,16 @@ impl CanvasRenderingContext2DMethods<crate::DomTypeHolder> for CanvasRenderingCo
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-putimagedata>
-    fn PutImageData(&self, imagedata: &ImageData, dx: i32, dy: i32) {
+    fn PutImageData(&self, no_gc: &NoGC, imagedata: &ImageData, dx: i32, dy: i32) {
         self.canvas_state
-            .put_image_data(self.canvas.size(), imagedata, dx, dy);
+            .put_image_data(no_gc, self.canvas.size(), imagedata, dx, dy);
         self.mark_as_dirty();
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-context-2d-putimagedata
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-putimagedata>
     fn PutImageData_(
         &self,
+        no_gc: &NoGC,
         imagedata: &ImageData,
         dx: i32,
         dy: i32,
@@ -589,6 +643,7 @@ impl CanvasRenderingContext2DMethods<crate::DomTypeHolder> for CanvasRenderingCo
         dirty_height: i32,
     ) {
         self.canvas_state.put_image_data_(
+            no_gc,
             self.canvas.size(),
             imagedata,
             dx,

@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::{JSContext, NoGC};
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_arc::Arc;
 use style::stylesheets::Stylesheet;
@@ -16,7 +17,6 @@ use crate::dom::documentorshadowroot::StylesheetSource;
 use crate::dom::element::Element;
 use crate::dom::shadowroot::ShadowRoot;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 #[derive(Clone, JSTraceable, MallocSizeOf, PartialEq)]
@@ -33,40 +33,42 @@ impl StyleSheetListOwner {
         }
     }
 
-    pub(crate) fn stylesheet_at(&self, index: usize) -> Option<DomRoot<CSSStyleSheet>> {
+    pub(crate) fn stylesheet_at(
+        &self,
+        cx: &mut JSContext,
+        index: usize,
+    ) -> Option<DomRoot<CSSStyleSheet>> {
         match *self {
-            StyleSheetListOwner::Document(ref doc) => doc.stylesheet_at(index),
-            StyleSheetListOwner::ShadowRoot(ref shadow_root) => shadow_root.stylesheet_at(index),
+            StyleSheetListOwner::Document(ref doc) => doc.stylesheet_at(cx, index),
+            StyleSheetListOwner::ShadowRoot(ref shadow_root) => {
+                shadow_root.stylesheet_at(cx, index)
+            },
         }
     }
 
     pub(crate) fn add_owned_stylesheet(
         &self,
-        cx: &mut js::context::JSContext,
+        no_gc: &NoGC,
         owner_node: &Element,
         sheet: Arc<Stylesheet>,
     ) {
         match *self {
             StyleSheetListOwner::Document(ref doc) => {
-                doc.add_owned_stylesheet(cx, owner_node, sheet)
+                doc.add_owned_stylesheet(no_gc, owner_node, sheet)
             },
             StyleSheetListOwner::ShadowRoot(ref shadow_root) => {
-                shadow_root.add_owned_stylesheet(cx, owner_node, sheet)
+                shadow_root.add_owned_stylesheet(no_gc, owner_node, sheet)
             },
         }
     }
 
-    pub(crate) fn append_constructed_stylesheet(
-        &self,
-        cx: &mut js::context::JSContext,
-        cssom_stylesheet: &CSSStyleSheet,
-    ) {
+    pub(crate) fn append_constructed_stylesheet(&self, cssom_stylesheet: &CSSStyleSheet) {
         match *self {
             StyleSheetListOwner::Document(ref doc) => {
-                doc.append_constructed_stylesheet(cx, cssom_stylesheet)
+                doc.append_constructed_stylesheet(cssom_stylesheet)
             },
             StyleSheetListOwner::ShadowRoot(ref shadow_root) => {
-                shadow_root.append_constructed_stylesheet(cx, cssom_stylesheet)
+                shadow_root.append_constructed_stylesheet(cssom_stylesheet)
             },
         }
     }
@@ -81,11 +83,11 @@ impl StyleSheetListOwner {
         }
     }
 
-    pub(crate) fn invalidate_stylesheets(&self) {
+    pub(crate) fn invalidate_stylesheets(&self, no_gc: &NoGC) {
         match *self {
-            StyleSheetListOwner::Document(ref doc) => doc.invalidate_stylesheets(),
+            StyleSheetListOwner::Document(ref doc) => doc.invalidate_stylesheets(no_gc),
             StyleSheetListOwner::ShadowRoot(ref shadow_root) => {
-                shadow_root.invalidate_stylesheets()
+                shadow_root.invalidate_stylesheets(no_gc)
             },
         }
     }
@@ -108,14 +110,14 @@ impl StyleSheetList {
 
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn new(
+        cx: &mut js::context::JSContext,
         window: &Window,
         doc_or_sr: StyleSheetListOwner,
-        can_gc: CanGc,
     ) -> DomRoot<StyleSheetList> {
         reflect_dom_object(
+            cx,
             Box::new(StyleSheetList::new_inherited(doc_or_sr)),
             window,
-            can_gc,
         )
     }
 }
@@ -127,16 +129,16 @@ impl StyleSheetListMethods<crate::DomTypeHolder> for StyleSheetList {
     }
 
     /// <https://drafts.csswg.org/cssom/#dom-stylesheetlist-item>
-    fn Item(&self, index: u32) -> Option<DomRoot<StyleSheet>> {
+    fn Item(&self, cx: &mut JSContext, index: u32) -> Option<DomRoot<StyleSheet>> {
         // XXXManishearth this  doesn't handle the origin clean flag and is a
         // cors vulnerability
         self.document_or_shadow_root
-            .stylesheet_at(index as usize)
+            .stylesheet_at(cx, index as usize)
             .map(DomRoot::upcast)
     }
 
     // check-tidy: no specs after this line
-    fn IndexedGetter(&self, index: u32) -> Option<DomRoot<StyleSheet>> {
-        self.Item(index)
+    fn IndexedGetter(&self, cx: &mut JSContext, index: u32) -> Option<DomRoot<StyleSheet>> {
+        self.Item(cx, index)
     }
 }

@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 use std::cell::UnsafeCell;
+use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::{mem, ptr};
 
@@ -9,26 +11,10 @@ use js::context::NoGC;
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 
 use crate::DomObject;
-use crate::assert::{assert_in_layout, assert_in_script};
+use crate::assert::assert_in_script;
 use crate::conversions::DerivedFrom;
 use crate::inheritance::Castable;
 use crate::root::{Dom, DomRoot};
-
-pub trait ToLayout<'dom, T: DomObject, L: LayoutFromRaw<'dom, T>> {
-    /// Returns `LayoutDom<T>` containing the same pointer.
-    ///
-    /// # Safety
-    ///
-    /// The `self` parameter to this method must meet all the requirements of [`ptr::NonNull::as_ref`].
-    unsafe fn to_layout(&self) -> L;
-}
-
-impl<'dom, T: DomObject, L: LayoutFromRaw<'dom, T>> ToLayout<'dom, T, L> for Dom<T> {
-    unsafe fn to_layout(&self) -> L {
-        assert_in_layout();
-        L::from_raw(unsafe { self.as_ptr().as_ref().unwrap() })
-    }
-}
 
 /// A holder that provides interior mutability for GC-managed values such as
 /// `Dom<T>`.  Essentially a `Cell<Dom<T>>`, but safer.
@@ -63,6 +49,29 @@ impl<T: DomObject> MutDom<T> {
         assert_in_script();
         unsafe { DomRoot::from_ref(&*ptr::read(self.val.get())) }
     }
+
+    /// Get the [`DomObject`] without rooting it as an [`UnrootedDom`]. This is safe as
+    /// the return value shares the lifetime of the provided [`NoGC`] This implies that
+    /// while the [`UnrootedDom`] is alive, garbage collection will not happen.
+    pub fn get_unrooted<'a>(&self, _: &'a NoGC) -> UnrootedDom<'a, T> {
+        assert_in_script();
+        UnrootedDom {
+            inner: unsafe { ptr::read(self.val.get()) },
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Get a reference to the traced inner value of this [`MutDom`].
+    ///
+    /// # Safety
+    ///
+    /// - The caller *must not* modify the value of the [`MutDom`] while the
+    ///   reference is alive.
+    /// - The caller *must ensure* that no garbage collection happens while the
+    ///   reference is alive.
+    pub unsafe fn as_ref_unsafe(&self) -> &Dom<T> {
+        unsafe { &*self.val.get() }
+    }
 }
 
 impl<T: DomObject> MallocSizeOf for MutDom<T> {
@@ -84,21 +93,51 @@ impl<T: DomObject + PartialEq> PartialEq<T> for MutDom<T> {
     }
 }
 
-/// A struct to make Unrooted Dom objects work. By taking a no_gc as reference, we ensure that the lifetime of this object
-/// is bounded by the lifetime of NoGC which enforces no gc happening.
+/// A reference to a [`DomObject`] that can live on the stack unrooted by having it
+/// inherit the lifetime of a [`NoGC`], which is a token that ensures that garbage
+/// collection will not happen.
 #[cfg_attr(crown, crown::unrooted_must_root_lint::allow_unrooted_interior)]
 pub struct UnrootedDom<'a, T: DomObject> {
     inner: Dom<T>,
-    no_gc: &'a NoGC,
+    _phantom: PhantomData<&'a ()>,
+}
+
+impl<'a, T: DomObject + std::fmt::Debug> std::fmt::Debug for UnrootedDom<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl<'a, T: DomObject> Clone for UnrootedDom<'a, T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            _phantom: PhantomData,
+        }
+    }
 }
 
 impl<'a, T: DomObject> UnrootedDom<'a, T> {
-    /// Construct an `UnrootedDom` with the lifetime of `NoGC`. This is safe, as `NoGC` implies no garbage collection will happen
+    /// Construct an [`UnrootedDom`] with the lifetime of the given [`NoGC`] token. It is
+    /// safe to keep the returned value on the stack as it cannot outlive the lifetime of
+    /// the token and the token should ensure that no garbage collection will take place
+    /// as long as it is alive.
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
-    pub fn from_dom(object: Dom<T>, no_gc: &'a NoGC) -> UnrootedDom<'a, T> {
+    pub(crate) fn from_dom(object: Dom<T>, _no_gc: &'a NoGC) -> UnrootedDom<'a, T> {
         UnrootedDom {
             inner: object,
-            no_gc,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Construct an [`UnrootedDom`] with the lifetime of the given [`NoGC`] token. It is
+    /// safe to keep the returned value on the stack as it cannot outlive the lifetime of
+    /// the token and the token should ensure that no garbage collection will take place
+    /// as long as it is alive.
+    pub fn from_ref(object: &T, _no_gc: &'a NoGC) -> UnrootedDom<'a, T> {
+        UnrootedDom {
+            inner: Dom::from_ref(object),
+            _phantom: PhantomData,
         }
     }
 }
@@ -111,9 +150,6 @@ impl<'a, T: DomObject> Deref for UnrootedDom<'a, T> {
     }
 }
 
-/// Safety:
-/// We enforce the same lifetime as the given `UnrootedDom`, so the same
-/// guarantee about no GC happening in this lifetime.
 impl<'a, T: Castable> UnrootedDom<'a, T> {
     /// Cast a DOM object root upwards to one of the interfaces it derives from.
     pub fn upcast<U>(dom: UnrootedDom<'a, T>) -> UnrootedDom<'a, U>
@@ -123,7 +159,7 @@ impl<'a, T: Castable> UnrootedDom<'a, T> {
     {
         UnrootedDom {
             inner: unsafe { mem::transmute::<Dom<T>, Dom<U>>(dom.inner) },
-            no_gc: dom.no_gc,
+            _phantom: PhantomData,
         }
     }
 
@@ -135,7 +171,7 @@ impl<'a, T: Castable> UnrootedDom<'a, T> {
         if dom.is::<U>() {
             Some(UnrootedDom {
                 inner: unsafe { mem::transmute::<Dom<T>, Dom<U>>(dom.inner) },
-                no_gc: dom.no_gc,
+                _phantom: PhantomData,
             })
         } else {
             None
@@ -149,19 +185,20 @@ impl<'a, T: DomObject> PartialEq<T> for UnrootedDom<'a, T> {
     }
 }
 
-impl<'a, T: DomObject> PartialEq<UnrootedDom<'a, T>> for UnrootedDom<'a, T> {
+/// Forwards to `impl PartialEq for Dom<T>` which compares by pointer address
+impl<'a, 'b, T: DomObject> PartialEq<UnrootedDom<'a, T>> for UnrootedDom<'b, T> {
     fn eq(&self, other: &UnrootedDom<'a, T>) -> bool {
         self.inner == other.inner
     }
 }
 
-/// Trait that creates a specific struct from a raw DomObject.
-/// The implementer needs to be sure that this does not violate any lifetimes
-/// # Safety
-/// The dom object needs the lifetimes to be safe.
-/// Only [`LayoutDom`] should implement this.
-pub unsafe trait LayoutFromRaw<'dom, T: DomObject> {
-    fn from_raw(d: &'dom T) -> Self;
+impl<'a, T: DomObject> Eq for UnrootedDom<'a, T> {}
+
+/// Forwards to `impl Hash for Dom<T>` which hashes the pointer address
+impl<'a, T: DomObject> Hash for UnrootedDom<'a, T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.inner.hash(state);
+    }
 }
 
 /// A holder that provides interior mutability for GC-managed values such as
@@ -202,30 +239,37 @@ impl<T: DomObject> MutNullableDom<T> {
         }
     }
 
-    /// Retrieve a copy of the inner optional `Dom<T>` as `LayoutDom<T>`.
-    /// For use by layout, which can't use safe types like Temporary.
-    /// # Safety
-    /// Needs to meet the safety requirements of [`lLayoutFromRaw`].
-    pub unsafe fn get_inner_as_layout<'dom, L: LayoutFromRaw<'dom, T>>(&'dom self) -> Option<L> {
-        assert_in_layout();
-        unsafe { (*self.ptr.get()).as_ref().map(|js| js.to_layout()) }
-    }
-
-    /// Get a rooted value out of this object
+    /// Get a rooted ([`DomRoot`]) reference to the value contained in this
+    /// [`MutNullableDom`].
     pub fn get(&self) -> Option<DomRoot<T>> {
         assert_in_script();
         unsafe { ptr::read(self.ptr.get()).map(|o| DomRoot::from_ref(&*o)) }
+    }
+
+    /// Get a reference to the traced inner value of this [`MutNullableDom`].
+    ///
+    /// # Safety
+    ///
+    /// - The caller *must not* modify the value of the [`MutNullableDom`] while the
+    ///   reference is alive.
+    /// - The caller *must ensure* that no garbage collection happens while the
+    ///   reference is alive.
+    pub unsafe fn as_ref_unsafe(&self) -> Option<&Dom<T>> {
+        unsafe { (*self.ptr.get()).as_ref() }
     }
 
     /// Get the `DomObject` without rooting it. Constructing an UnrootedDom. This is safe
     /// as we take a reference to NoGC and bound the lifetime by NoGC bound. This implies that
     /// while the `UnrootedDom` is alive we do not have a GC run.
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
-    pub fn get_unrooted<'a>(&self, no_gc: &'a NoGC) -> Option<UnrootedDom<'a, T>> {
+    pub fn get_unrooted<'a>(&self, _: &'a NoGC) -> Option<UnrootedDom<'a, T>> {
         assert_in_script();
         let ptr = unsafe { ptr::read(self.ptr.get()) };
-        ptr.map(|o| Dom::from_ref(&*o))
-            .map(|dom| UnrootedDom { inner: dom, no_gc })
+        ptr.map(|traced_value| Dom::from_ref(&*traced_value))
+            .map(|dom| UnrootedDom {
+                inner: dom,
+                _phantom: PhantomData,
+            })
     }
 
     /// Set this `MutNullableDom` to the given value.

@@ -17,10 +17,10 @@ use harfbuzz_sys::{
     HB_MEMORY_MODE_READONLY, HB_OT_LAYOUT_BASELINE_TAG_HANGING,
     HB_OT_LAYOUT_BASELINE_TAG_IDEO_EMBOX_BOTTOM_OR_LEFT, HB_OT_LAYOUT_BASELINE_TAG_ROMAN,
     hb_blob_create, hb_blob_t, hb_bool_t, hb_buffer_add_utf8, hb_buffer_create, hb_buffer_destroy,
-    hb_buffer_get_glyph_infos, hb_buffer_get_glyph_positions, hb_buffer_get_length,
-    hb_buffer_set_cluster_level, hb_buffer_set_direction, hb_buffer_set_language,
-    hb_buffer_set_script, hb_buffer_t, hb_codepoint_t, hb_face_create_for_tables, hb_face_destroy,
-    hb_face_t, hb_feature_t, hb_font_create, hb_font_destroy, hb_font_funcs_create,
+    hb_buffer_get_glyph_infos, hb_buffer_get_glyph_positions, hb_buffer_set_cluster_level,
+    hb_buffer_set_direction, hb_buffer_set_language, hb_buffer_set_script, hb_buffer_t,
+    hb_codepoint_t, hb_face_create_for_tables, hb_face_destroy, hb_face_t, hb_feature_t,
+    hb_font_create, hb_font_create_sub_font, hb_font_destroy, hb_font_funcs_create,
     hb_font_funcs_set_glyph_h_advance_func, hb_font_funcs_set_nominal_glyph_func, hb_font_funcs_t,
     hb_font_set_funcs, hb_font_set_ppem, hb_font_set_scale, hb_font_set_variations, hb_font_t,
     hb_glyph_info_t, hb_glyph_position_t, hb_language_from_string, hb_ot_layout_get_baseline,
@@ -208,14 +208,6 @@ impl Shaper {
                 Shaper::float_to_fixed(pt_size) as c_int,
             );
 
-            // configure static function callbacks.
-            hb_font_set_funcs(
-                hb_font,
-                HB_FONT_FUNCS.0,
-                font as *const Font as *mut c_void,
-                None,
-            );
-
             if servo_config::pref!(layout_variable_fonts_enabled) {
                 let variations = &font.variations();
                 if !variations.is_empty() {
@@ -231,6 +223,22 @@ impl Shaper {
                     hb_font_set_variations(hb_font, variations.as_ptr(), variations.len() as u32);
                 }
             }
+
+            // Create a subfont before setting font-funcs so that we can
+            // inherit the default font-funcs for the funcs we don't set.
+            let hb_font = {
+                let sub_font = hb_font_create_sub_font(hb_font);
+                hb_font_destroy(hb_font);
+                sub_font
+            };
+
+            // Now configure the subset of function callbacks that we do implement.
+            hb_font_set_funcs(
+                hb_font,
+                HB_FONT_FUNCS.0,
+                font as *const Font as *mut c_void,
+                None,
+            );
 
             Shaper {
                 hb_face,
@@ -283,8 +291,8 @@ impl Shaper {
                 .map(|(tag, value)| hb_feature_t {
                     tag: u32::from_be_bytes(tag.to_be_bytes()),
                     value: *value,
-                    start: 0,
-                    end: hb_buffer_get_length(hb_buffer),
+                    start: 0,      // HB_FEATURE_GLOBAL_START
+                    end: u32::MAX, // HB_FEATURE_GLOBAL_END
                 })
                 .collect();
             hb_shape(

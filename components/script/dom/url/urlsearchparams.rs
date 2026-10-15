@@ -6,7 +6,7 @@ use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::rust::HandleObject;
 use script_bindings::cell::DomRefCell;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto_and_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use url::form_urlencoded;
 
 use crate::dom::bindings::codegen::Bindings::URLSearchParamsBinding::URLSearchParamsMethods;
@@ -52,11 +52,11 @@ impl URLSearchParams {
         proto: Option<HandleObject>,
         url: Option<&URL>,
     ) -> DomRoot<URLSearchParams> {
-        reflect_dom_object_with_proto_and_cx(
+        reflect_dom_object_with_proto(
+            cx,
             Box::new(URLSearchParams::new_inherited(url)),
             global,
             proto,
-            cx,
         )
     }
 
@@ -234,17 +234,17 @@ impl Iterable for URLSearchParams {
     type Key = USVString;
     type Value = USVString;
 
-    fn get_iterable_length(&self) -> u32 {
+    fn get_iterable_length(&self, _cx: &mut JSContext) -> u32 {
         self.list.borrow().len() as u32
     }
 
-    fn get_value_at_index(&self, n: u32) -> USVString {
-        let value = self.list.borrow()[n as usize].1.clone();
+    fn get_value_at_index(&self, _cx: &mut JSContext, index: u32) -> USVString {
+        let value = self.list.borrow()[index as usize].1.clone();
         USVString(value)
     }
 
-    fn get_key_at_index(&self, n: u32) -> USVString {
-        let key = self.list.borrow()[n as usize].0.clone();
+    fn get_key_at_index(&self, _cx: &mut JSContext, index: u32) -> USVString {
+        let key = self.list.borrow()[index as usize].0.clone();
         USVString(key)
     }
 }

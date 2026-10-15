@@ -11,7 +11,6 @@ use crate::dom::bindings::codegen::Bindings::ServoTestUtilsBinding::LayoutResult
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::utils::to_frozen_array;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct LayoutResult {
@@ -39,14 +38,15 @@ impl LayoutResult {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         phases: Vec<DOMString>,
         rebuilt_fragment_count: u32,
         restyle_fragment_count: u32,
         only_descendants_changed_count: u32,
-        can_gc: CanGc,
     ) -> DomRoot<Self> {
         reflect_dom_object(
+            cx,
             Box::new(Self::new_inherited(
                 phases,
                 rebuilt_fragment_count,
@@ -54,7 +54,6 @@ impl LayoutResult {
                 only_descendants_changed_count,
             )),
             global,
-            can_gc,
         )
     }
 }

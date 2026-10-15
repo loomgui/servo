@@ -10,9 +10,9 @@ use js::context::JSContext;
 use js::gc::CustomAutoRooterGuard;
 use js::rust::HandleObject;
 use js::typedarray::Float32Array;
-use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
+use script_bindings::reflector::reflect_dom_object_with_proto;
+use servo_media::audio::audio_node::AudioNodeInit;
 use servo_media::audio::iir_filter_node::{IIRFilterNode as IIRFilter, IIRFilterNodeOptions};
-use servo_media::audio::node::AudioNodeInit;
 
 use crate::conversions::Convert;
 use crate::dom::audio::audionode::{AudioNode, AudioNodeOptionsHelper};
@@ -91,11 +91,11 @@ impl IIRFilterNode {
         options: &IIRFilterOptions,
     ) -> Fallible<DomRoot<IIRFilterNode>> {
         let node = IIRFilterNode::new_inherited(cx, window, context, options)?;
-        Ok(reflect_dom_object_with_proto_and_cx(
+        Ok(reflect_dom_object_with_proto(
+            cx,
             Box::new(node),
             window,
             proto,
-            cx,
         ))
     }
 }
@@ -119,15 +119,16 @@ impl IIRFilterNodeMethods<crate::DomTypeHolder> for IIRFilterNode {
         mut mag_response: CustomAutoRooterGuard<Float32Array>,
         mut phase_response: CustomAutoRooterGuard<Float32Array>,
     ) -> Result<(), Error> {
+        let frequency_hz_vec = frequency_hz.to_vec().unwrap_or(vec![]);
+        let mut mag_response_vec = mag_response.to_vec().unwrap_or(vec![]);
+        let mut phase_response_vec = phase_response.to_vec().unwrap_or(vec![]);
+
         let len = frequency_hz.len();
         if len != mag_response.len() || len != phase_response.len() {
             return Err(Error::InvalidAccess(None));
         }
         let feedforward: Vec<f64> = (self.feedforward.iter().map(|v| **v).collect_vec()).to_vec();
         let feedback: Vec<f64> = (self.feedback.iter().map(|v| **v).collect_vec()).to_vec();
-        let frequency_hz_vec = frequency_hz.to_vec();
-        let mut mag_response_vec = mag_response.to_vec();
-        let mut phase_response_vec = phase_response.to_vec();
         IIRFilter::get_frequency_response(
             &feedforward,
             &feedback,

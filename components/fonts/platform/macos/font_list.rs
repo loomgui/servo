@@ -5,7 +5,7 @@
 use std::ffi::c_void;
 
 use fonts_traits::LocalFontIdentifier;
-use icu_locid::subtags::language;
+use icu_locale_core::subtags::language;
 use log::debug;
 use objc2_core_foundation::{CFDictionary, CFRetained, CFSet, CFString, CFType, CFURL};
 use objc2_core_text::{
@@ -63,7 +63,6 @@ pub(crate) fn font_template_for_local_font_descriptor(
     Some(FontTemplate::new(
         FontIdentifier::Local(identifier),
         font_template_descriptor_from_ctfont_attributes(traits),
-        None,
         None,
     ))
 }

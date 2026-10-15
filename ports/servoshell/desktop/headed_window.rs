@@ -9,9 +9,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::env;
 use std::rc::Rc;
-use std::time::Duration;
 
 use euclid::{Angle, Length, Point2D, Rect, Rotation3D, Scale, Size2D, UnknownUnit, Vector3D};
 use keyboard_types::ShortcutMatcher;
@@ -56,7 +54,7 @@ use crate::prefs::ServoShellPreferences;
 use crate::running_app_state::{RunningAppState, UserInterfaceCommand};
 use crate::window::{
     LINE_HEIGHT, LINE_WIDTH, MIN_WINDOW_INNER_SIZE, PlatformWindow, ServoShellWindow,
-    ServoShellWindowId,
+    ServoShellWindowId, TopLevelWebViewCreationRequest,
 };
 
 pub(crate) const INITIAL_WINDOW_TITLE: &str = "Servo";
@@ -71,6 +69,7 @@ pub struct HeadedWindow {
     /// It equals viewport size + (0, toolbar height).
     inner_size: Cell<PhysicalSize<u32>>,
     fullscreen: Cell<bool>,
+    fullscreen_from_document: Cell<bool>,
     device_pixel_ratio_override: Option<f32>,
     xr_window_poses: RefCell<Vec<Rc<XRWindowPose>>>,
     modifiers_state: Cell<ModifiersState>,
@@ -199,6 +198,7 @@ impl HeadedWindow {
             winit_window,
             webview_relative_mouse_point: Cell::new(Point2D::zero()),
             fullscreen: Cell::new(false),
+            fullscreen_from_document: Cell::new(false),
             inner_size: Cell::new(inner_size),
             screen_size,
             device_pixel_ratio_override: servoshell_preferences.device_pixel_ratio_override,
@@ -224,7 +224,7 @@ impl HeadedWindow {
     fn handle_keyboard_input(
         &self,
         state: Rc<RunningAppState>,
-        window: &ServoShellWindow,
+        window: &Rc<ServoShellWindow>,
         winit_event: KeyEvent,
     ) {
         // First, handle servoshell key bindings that are not overridable by, or visible to, the page.
@@ -275,9 +275,9 @@ impl HeadedWindow {
         }
 
         let mouse_button = match &button {
-            MouseButton::Left => ServoMouseButton::Left,
-            MouseButton::Right => ServoMouseButton::Right,
-            MouseButton::Middle => ServoMouseButton::Middle,
+            MouseButton::Left => ServoMouseButton::Primary,
+            MouseButton::Right => ServoMouseButton::Secondary,
+            MouseButton::Middle => ServoMouseButton::Auxiliary,
             MouseButton::Back => ServoMouseButton::Back,
             MouseButton::Forward => ServoMouseButton::Forward,
             MouseButton::Other(value) => ServoMouseButton::Other(*value),
@@ -330,7 +330,7 @@ impl HeadedWindow {
     fn handle_intercepted_key_bindings(
         &self,
         state: Rc<RunningAppState>,
-        window: &ServoShellWindow,
+        window: &Rc<ServoShellWindow>,
         key_event: &KeyboardEvent,
     ) -> bool {
         let Some(active_webview) = window.active_webview() else {
@@ -341,33 +341,6 @@ impl HeadedWindow {
         ShortcutMatcher::from_event(key_event.event.clone())
             .shortcut(CMD_OR_CONTROL, 'W', || {
                 window.close_webview(active_webview.id());
-            })
-            .shortcut(CMD_OR_CONTROL, 'P', || {
-                let rate = env::var("SAMPLING_RATE")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(10);
-                let duration = env::var("SAMPLING_DURATION")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(10);
-                active_webview.toggle_sampling_profiler(
-                    Duration::from_millis(rate),
-                    Duration::from_secs(duration),
-                );
-            })
-            .shortcut(CMD_OR_CONTROL, 'X', || {
-                active_webview
-                    .notify_input_event(InputEvent::EditingAction(servo::EditingActionEvent::Cut));
-            })
-            .shortcut(CMD_OR_CONTROL, 'C', || {
-                active_webview
-                    .notify_input_event(InputEvent::EditingAction(servo::EditingActionEvent::Copy));
-            })
-            .shortcut(CMD_OR_CONTROL, 'V', || {
-                active_webview.notify_input_event(InputEvent::EditingAction(
-                    servo::EditingActionEvent::Paste,
-                ));
             })
             .shortcut(Modifiers::CONTROL, Key::Named(NamedKey::F9), || {
                 active_webview.capture_webrender();
@@ -437,10 +410,11 @@ impl HeadedWindow {
                 }
             })
             .shortcut(CMD_OR_CONTROL, 'T', || {
+                let url = Url::parse("servo:newtab")
+                    .expect("Should be able to unconditionally parse 'servo:newtab' as URL");
                 window.create_and_activate_toplevel_webview(
                     state.clone(),
-                    Url::parse("servo:newtab")
-                        .expect("Should be able to unconditionally parse 'servo:newtab' as URL"),
+                    TopLevelWebViewCreationRequest::WithUrl(url),
                 );
             })
             .shortcut(CMD_OR_CONTROL, 'Q', || state.schedule_exit())
@@ -631,12 +605,12 @@ impl HeadedWindow {
                     .borrow_mut()
                     .on_window_event(&self.winit_window, event);
 
-                if let WindowEvent::Focused(true) = event {
-                    state.handle_focused(window.clone());
-                }
-
                 if response.repaint && *event != WindowEvent::RedrawRequested {
                     self.winit_window.request_redraw();
+                }
+
+                if let WindowEvent::Focused(focused) = event {
+                    state.set_window_has_focus(window.clone(), *focused);
                 }
 
                 // All CursorMoved events, even when forwarded to the WebView, are also
@@ -805,9 +779,17 @@ impl HeadedWindow {
             }
         }
     }
+
+    pub(crate) fn is_fullscreen_from_document(&self) -> bool {
+        self.fullscreen_from_document.get()
+    }
 }
 
 impl PlatformWindow for HeadedWindow {
+    fn platform_manages_focus(&self) -> bool {
+        true
+    }
+
     fn as_headed_window(&self) -> Option<&Self> {
         Some(self)
     }
@@ -872,8 +854,8 @@ impl PlatformWindow for HeadedWindow {
         let inner_size = self.winit_window.inner_size();
         let outer_size = self.winit_window.outer_size();
         let decoration_size: DeviceIntSize = Size2D::new(
-            outer_size.height - inner_size.height,
             outer_size.width - inner_size.width,
+            outer_size.height - inner_size.height,
         )
         .cast();
 
@@ -894,6 +876,13 @@ impl PlatformWindow for HeadedWindow {
                 new_inner_size.height,
             ))
             .map(|resulting_size| {
+                // `Some` means that winit applied the resize synchronously, in which case it may
+                // not emit a subsequent `WindowEvent::Resized`.
+                if self.inner_size.get() != resulting_size {
+                    self.inner_size.set(resulting_size);
+                    self.window_rendering_context.resize(resulting_size);
+                }
+
                 DeviceIntSize::new(
                     resulting_size.width as i32 + decoration_size.width,
                     resulting_size.height as i32 + decoration_size.height,
@@ -937,6 +926,7 @@ impl PlatformWindow for HeadedWindow {
             });
         }
         self.fullscreen.set(state);
+        self.fullscreen_from_document.set(state);
     }
 
     fn get_fullscreen(&self) -> bool {
@@ -1062,10 +1052,6 @@ impl PlatformWindow for HeadedWindow {
             .shortcut(Modifiers::empty(), Key::Named(NamedKey::F5), || {
                 webview.reload()
             });
-    }
-
-    fn focus(&self) {
-        self.winit_window.focus_window();
     }
 
     fn has_platform_focus(&self) -> bool {

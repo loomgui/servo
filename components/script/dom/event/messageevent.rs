@@ -8,7 +8,7 @@ use js::jsapi::Heap;
 use js::jsval::JSVal;
 use js::rust::{HandleObject, HandleValue, MutableHandleValue};
 use script_bindings::cell::DomRefCell;
-use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
+use script_bindings::reflector::reflect_dom_object_with_proto;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
@@ -20,7 +20,6 @@ use crate::dom::bindings::frozenarray::CachedFrozenArray;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
-use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
@@ -114,7 +113,7 @@ impl MessageEvent {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new_initialized(
         cx: &mut JSContext,
         global: &GlobalScope,
@@ -131,13 +130,13 @@ impl MessageEvent {
             lastEventId,
             ports,
         ));
-        let ev = reflect_dom_object_with_proto_and_cx(ev, global, proto, cx);
+        let ev = reflect_dom_object_with_proto(cx, ev, global, proto);
         ev.data.set(data.get());
 
         ev
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         cx: &mut JSContext,
         global: &GlobalScope,
@@ -165,7 +164,7 @@ impl MessageEvent {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new_with_proto(
         cx: &mut JSContext,
         global: &GlobalScope,
@@ -249,7 +248,7 @@ impl MessageEventMethods<crate::DomTypeHolder> for MessageEvent {
         global: &GlobalScope,
         proto: Option<HandleObject>,
         type_: DOMString,
-        init: RootedTraceableBox<MessageEventBinding::MessageEventInit>,
+        init: &MessageEventBinding::MessageEventInit,
     ) -> Fallible<DomRoot<MessageEvent>> {
         let ev = MessageEvent::new_with_proto(
             cx,
@@ -322,7 +321,7 @@ impl MessageEventMethods<crate::DomTypeHolder> for MessageEvent {
     #[expect(non_snake_case)]
     fn InitMessageEvent(
         &self,
-        _cx: &mut JSContext,
+        cx: &mut JSContext,
         type_: DOMString,
         bubbles: bool,
         cancelable: bool,
@@ -333,10 +332,10 @@ impl MessageEventMethods<crate::DomTypeHolder> for MessageEvent {
         ports: Vec<DomRoot<MessagePort>>,
     ) {
         self.data.set(data.get());
-        *self.origin.borrow_mut() = origin;
-        *self.source.borrow_mut() = source.as_ref().map(|source| source.into());
-        *self.lastEventId.borrow_mut() = lastEventId;
-        *self.ports.borrow_mut() = ports
+        *self.origin.safe_borrow_mut(cx.no_gc()) = origin;
+        *self.source.safe_borrow_mut(cx.no_gc()) = source.as_ref().map(|source| source.into());
+        *self.lastEventId.safe_borrow_mut(cx.no_gc()) = lastEventId;
+        *self.ports.safe_borrow_mut(cx.no_gc()) = ports
             .into_iter()
             .map(|port| Dom::from_ref(&*port))
             .collect();

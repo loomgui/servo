@@ -7,7 +7,7 @@ use js::context::JSContext;
 use js::jsapi::Heap;
 use js::jsval::JSVal;
 use js::rust::{HandleObject, MutableHandleValue};
-use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
+use script_bindings::reflector::reflect_dom_object_with_proto;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::Event_Binding::EventMethods;
@@ -23,7 +23,6 @@ use crate::dom::window::Window;
 use crate::dom::xrinputsource::XRInputSource;
 use crate::dom::xrsession::XRSession;
 use crate::realms::enter_auto_realm;
-use crate::script_runtime::JSContext as SafeJSContext;
 
 #[dom_struct]
 pub(crate) struct XRInputSourcesChangeEvent {
@@ -73,11 +72,11 @@ impl XRInputSourcesChangeEvent {
         added: &[DomRoot<XRInputSource>],
         removed: &[DomRoot<XRInputSource>],
     ) -> DomRoot<XRInputSourcesChangeEvent> {
-        let changeevent = reflect_dom_object_with_proto_and_cx(
+        let changeevent = reflect_dom_object_with_proto(
+            cx,
             Box::new(XRInputSourcesChangeEvent::new_inherited(session)),
             window,
             proto,
-            cx,
         );
         {
             let event = changeevent.upcast::<Event>();
@@ -122,12 +121,12 @@ impl XRInputSourcesChangeEventMethods<crate::DomTypeHolder> for XRInputSourcesCh
     }
 
     /// <https://immersive-web.github.io/webxr/#dom-xrinputsourceschangeevent-added>
-    fn Added(&self, _cx: SafeJSContext, mut retval: MutableHandleValue) {
+    fn Added(&self, mut retval: MutableHandleValue) {
         retval.set(self.added.get())
     }
 
     /// <https://immersive-web.github.io/webxr/#dom-xrinputsourceschangeevent-removed>
-    fn Removed(&self, _cx: SafeJSContext, mut retval: MutableHandleValue) {
+    fn Removed(&self, mut retval: MutableHandleValue) {
         retval.set(self.removed.get())
     }
 

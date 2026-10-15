@@ -1,9 +1,8 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
-use std::rc::Rc;
-
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::realm::CurrentRealm;
 use script_bindings::codegen::GenericBindings::CredentialsContainerBinding::{
     CredentialCreationOptions, CredentialRequestOptions,
@@ -17,8 +16,7 @@ use crate::dom::bindings::codegen::DomTypeHolder::DomTypeHolder;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::credentialmanagement::credential::Credential;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::promise::Promise;
-use crate::script_runtime::CanGc;
+use crate::dom::promise::{Promise, RootedPromise};
 
 #[dom_struct]
 pub(crate) struct CredentialsContainer {
@@ -32,12 +30,8 @@ impl CredentialsContainer {
         }
     }
 
-    pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<CredentialsContainer> {
-        reflect_dom_object(
-            Box::new(CredentialsContainer::new_inherited()),
-            global,
-            can_gc,
-        )
+    pub(crate) fn new(cx: &mut JSContext, global: &GlobalScope) -> DomRoot<CredentialsContainer> {
+        reflect_dom_object(cx, Box::new(CredentialsContainer::new_inherited()), global)
     }
 
     /// <https://www.w3.org/TR/credential-management-1/#abstract-opdef-request-a-credential>
@@ -45,7 +39,7 @@ impl CredentialsContainer {
         &self,
         cx: &mut CurrentRealm,
         options: &CredentialRequestOptions<DomTypeHolder>,
-    ) -> Fallible<Rc<Promise>> {
+    ) -> Fallible<RootedPromise> {
         // Step 1. Let settings be the current settings object.
         let global = GlobalScope::from_current_realm(cx);
         // Step 2. Assert: settings is a secure context.
@@ -73,7 +67,7 @@ impl CredentialsContainer {
         &self,
         cx: &mut CurrentRealm,
         _credential: &Credential,
-    ) -> Fallible<Rc<Promise>> {
+    ) -> Fallible<RootedPromise> {
         // Step 1. Let settings be the current settings object.
         let global = GlobalScope::from_current_realm(cx);
         // Step 2. Assert: settings is a secure context.
@@ -94,7 +88,7 @@ impl CredentialsContainer {
         &self,
         cx: &mut CurrentRealm,
         _options: &CredentialCreationOptions<DomTypeHolder>,
-    ) -> Fallible<Rc<Promise>> {
+    ) -> Fallible<RootedPromise> {
         // Step 1. Let settings be the current settings object.
         let global = GlobalScope::from_current_realm(cx);
         // Step 2. Assert: settings is a secure context.
@@ -120,12 +114,12 @@ impl CredentialsContainerMethods<DomTypeHolder> for CredentialsContainer {
         &self,
         cx: &mut CurrentRealm,
         options: &CredentialRequestOptions<DomTypeHolder>,
-    ) -> Fallible<Rc<Promise>> {
+    ) -> Fallible<RootedPromise> {
         self.request_credential(cx, options)
     }
 
     /// <https://www.w3.org/TR/credential-management-1/#dom-credentialscontainer-store>
-    fn Store(&self, cx: &mut CurrentRealm, credential: &Credential) -> Fallible<Rc<Promise>> {
+    fn Store(&self, cx: &mut CurrentRealm, credential: &Credential) -> Fallible<RootedPromise> {
         self.store_credential(cx, credential)
     }
 
@@ -134,12 +128,12 @@ impl CredentialsContainerMethods<DomTypeHolder> for CredentialsContainer {
         &self,
         cx: &mut CurrentRealm,
         options: &CredentialCreationOptions<DomTypeHolder>,
-    ) -> Fallible<Rc<Promise>> {
+    ) -> Fallible<RootedPromise> {
         self.create_credential(cx, options)
     }
 
     /// <https://www.w3.org/TR/credential-management-1/#dom-credentialscontainer-preventsilentaccess>
-    fn PreventSilentAccess(&self, cx: &mut CurrentRealm) -> Fallible<Rc<Promise>> {
+    fn PreventSilentAccess(&self, cx: &mut CurrentRealm) -> Fallible<RootedPromise> {
         let promise = Promise::new_in_realm(cx);
         promise.reject_error(cx, Error::NotSupported(None));
         Ok(promise)

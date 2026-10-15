@@ -31,9 +31,9 @@ on:
         default: false
         type: boolean
       force-github-hosted-runner:
-          required: false
-          type: boolean
-          default: false
+        required: false
+        type: boolean
+        default: false
       bencher:
         required: false
         default: false
@@ -65,9 +65,9 @@ on:
         default: false
         type: boolean
       force-github-hosted-runner:
-          required: false
-          type: boolean
-          default: false
+        required: false
+        type: boolean
+        default: false
       bencher:
         required: false
         default: false
@@ -101,27 +101,7 @@ jobs:
       - name: Kill XProtectBehaviorService
         run: |
           echo Killing XProtect.; sudo pkill -9 XProtect >/dev/null || true;
-      - uses: actions/checkout@v6
-        if: runner.environment != 'self-hosted' && github.event_name != 'pull_request_target'
-      # This is necessary to checkout the pull request if this run was triggered via a
-      # `pull_request_target` event.
-      - uses: actions/checkout@v6
-        if: runner.environment != 'self-hosted' && github.event_name == 'pull_request_target'
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-      # Faster checkout for self-hosted runner that uses prebaked repo.
-      - if: ${{ runner.environment == 'self-hosted' && github.event_name != 'pull_request_target' }}
-        run: git fetch --depth=1 origin $GITHUB_SHA
-      - if: ${{ runner.environment == 'self-hosted' && github.event_name == 'pull_request_target' }}
-        run: git fetch --depth=1 origin ${{ github.event.pull_request.head.sha }}
-      - if: ${{ runner.environment == 'self-hosted' }}
-        # Same as `git switch --detach FETCH_HEAD`, but fixes up dirty working
-        # trees, in case the runner image was baked with a dirty working tree.
-        # Safeguard: -- means FETCH_HEAD is revision instead of path.
-        # See <https://github.com/servo/servo/pull/44309>
-        run: |
-          git switch --detach
-          git reset --hard FETCH_HEAD --
+      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
 
       - if: runner.environment != 'self-hosted'
         name: Setup Python
@@ -139,16 +119,16 @@ jobs:
         if: ${{ inputs.unit-tests }}
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest
+          tool: nextest@0.9.140
 
       - if: runner.environment != 'self-hosted'
         name: Bootstrap
         run: |
           ./mach bootstrap --yes --skip-lints --skip-nextest
-          brew install gnu-tar
+          brew install gnu-tar shellcheck
       - name: Build (${{ inputs.profile }})
         env:
-          RUSTFLAGS: "-D warnings"
+          RUSTFLAGS: ${{ inputs.profile == 'checked-release' && '-D warnings' || '' }}
         run: |
           ./mach build --use-crown --locked --profile ${{ inputs.profile }}  ${{ inputs.build-args }}
           mv target/cargo-timings target/cargo-timings-macos-arm64
@@ -231,7 +211,7 @@ jobs:
     if: ${{ inputs.bencher && inputs.profile != 'debug' && github.event_name != 'workflow_dispatch' && github.event_name != 'merge_group' }}
     uses: ./.github/workflows/bencher.yml
     with:
-      target: 'macos-arm64'
+      target: "macos-arm64"
       profile: ${{ inputs.profile }}
       compressed-file-path: ${{ inputs.profile }}-binary-macos-arm64/target.tar.gz
       binary-path: target/${{ inputs.profile }}/servoshell
@@ -245,17 +225,7 @@ jobs:
     name: Build libservo and MSRV check
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v6
-        if: github.event_name != 'pull_request_target'
-        with:
-          fetch-depth: 1
-      # This is necessary to checkout the pull request if this run was triggered via a
-      # `pull_request_target` event.
-      - uses: actions/checkout@v6
-        if: github.event_name == 'pull_request_target'
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 1
+      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
       - name: Setup Python
         uses: ./.github/actions/setup-python
       - name: Determine MSRV
@@ -274,21 +244,11 @@ jobs:
     name: Build and test Servo's C API
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v5
-        if: github.event_name != 'pull_request_target'
-        with:
-          fetch-depth: 1
-      # This is necessary to checkout the pull request if this run was triggered via a
-      # `pull_request_target` event.
-      - uses: actions/checkout@v5
-        if: github.event_name == 'pull_request_target'
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 1
+      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
       - name: Install cargo-c # required by servo-capi-tests's build.rs
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-c
+          tool: cargo-c@0.10.23
       - name: Build and test servo-capi-tests
         env:
           # `cargo-c` doesn't seem to work with sccache so disabled it for this job.

@@ -6,13 +6,10 @@ use sha3::digest::Digest;
 use sha3::{Sha3_256, Sha3_384, Sha3_512};
 
 use crate::dom::bindings::error::Error;
-use crate::dom::subtlecrypto::{CryptoAlgorithm, SubtleAlgorithm};
+use crate::dom::subtlecrypto::{Algorithm, CryptoAlgorithm};
 
 /// <https://wicg.github.io/webcrypto-modern-algos/#sha3-operations-digest>
-pub(crate) fn digest(
-    normalized_algorithm: &SubtleAlgorithm,
-    message: &[u8],
-) -> Result<Vec<u8>, Error> {
+pub(crate) fn digest(normalized_algorithm: &Algorithm, message: &[u8]) -> Result<Vec<u8>, Error> {
     // Step 1.
     // If the name member of normalizedAlgorithm is a case-sensitive string match for "SHA3-256":
     //     Let result be the result of performing the SHA3-256 hash function defined in Section 6.1
@@ -28,7 +25,7 @@ pub(crate) fn digest(
         CryptoAlgorithm::Sha3_256 => Sha3_256::new_with_prefix(message).finalize().to_vec(),
         CryptoAlgorithm::Sha3_384 => Sha3_384::new_with_prefix(message).finalize().to_vec(),
         CryptoAlgorithm::Sha3_512 => Sha3_512::new_with_prefix(message).finalize().to_vec(),
-        _ => return Err(Error::NotSupported(None)),
+        _ => return Err(Error::NotSupported(Some("Algorithm not supported".into()))),
     };
 
     // Step 3. Return result.

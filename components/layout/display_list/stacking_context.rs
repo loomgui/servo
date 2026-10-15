@@ -11,8 +11,8 @@ use embedder_traits::ViewportDetails;
 use euclid::{Point2D, Rect, SideOffsets2D, Size2D};
 use malloc_size_of_derive::MallocSizeOf;
 use paint_api::display_list::{
-    AxesScrollSensitivity, PaintDisplayListInfo, ReferenceFrameNodeInfo, ScrollableNodeInfo,
-    SpatialTreeNodeInfo, StickyNodeInfo,
+    AxesScrollSensitivity, PaintDisplayListInfo, ReferenceFrameNodeInfo, ScrollType,
+    ScrollableNodeInfo, SpatialTreeNodeInfo, StickyNodeInfo, TouchAction,
 };
 use servo_base::id::ScrollTreeNodeId;
 use servo_base::print_tree::PrintTree;
@@ -23,6 +23,7 @@ use style::color::AbsoluteColor;
 use style::computed_values::overflow_x::T as ComputedOverflow;
 use style::computed_values::position::T as ComputedPosition;
 use style::computed_values::text_decoration_style::T as TextDecorationStyle;
+use style::computed_values::text_decoration_thickness::T as TextDecorationThickness;
 use style::values::computed::angle::Angle;
 use style::values::computed::{ClipRectOrAuto, Length, TextDecorationLine};
 use style::values::generics::box_::{OverflowClipMarginBox, Perspective};
@@ -44,7 +45,8 @@ use crate::fragment_tree::{
     Fragment, FragmentFlags, FragmentTree, PositioningFragment,
 };
 use crate::geom::{
-    AuOrAuto, LengthPercentageOrAuto, PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalVec,
+    AuOrAuto, LengthPercentageOrAuto, PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalSize,
+    PhysicalVec,
 };
 use crate::style_ext::{ComputedValuesExt, TransformExt};
 
@@ -71,6 +73,9 @@ pub(crate) struct ContainingBlock {
     /// accumulated offset from the origin of the parent reference frame of this
     /// containing block.
     accumulated_reference_frame_offset: PhysicalVec<Au>,
+
+    /// Whether current containing block established a scroll frame.
+    established_scroll_frame: bool,
 }
 
 impl ContainingBlock {
@@ -80,6 +85,7 @@ impl ContainingBlock {
         scroll_frame_size: Option<LayoutSize>,
         clip_id: ClipId,
         accumulated_reference_frame_offset: PhysicalVec<Au>,
+        established_scroll_frame: bool,
     ) -> Self {
         ContainingBlock {
             scroll_node_id,
@@ -87,6 +93,7 @@ impl ContainingBlock {
             clip_id,
             rect,
             accumulated_reference_frame_offset,
+            established_scroll_frame,
         }
     }
 
@@ -152,6 +159,7 @@ impl StackingContextTree {
             Some(viewport_size),
             ClipId::INVALID,
             PhysicalVec::zero(),
+            true,
         );
         let cb_for_fixed_descendants = ContainingBlock::new(
             fragment_tree.initial_containing_block,
@@ -159,6 +167,7 @@ impl StackingContextTree {
             None,
             ClipId::INVALID,
             PhysicalVec::zero(),
+            false,
         );
 
         // We need to specify all three containing blocks here, because absolute
@@ -235,6 +244,7 @@ impl StackingContextTree {
         content_rect: LayoutRect,
         clip_rect: LayoutRect,
         scroll_sensitivity: AxesScrollSensitivity,
+        touch_action: TouchAction,
     ) -> ScrollTreeNodeId {
         self.paint_info.scroll_tree.add_scroll_tree_node(
             Some(parent_scroll_node_id),
@@ -243,6 +253,7 @@ impl StackingContextTree {
                 content_rect,
                 clip_rect,
                 scroll_sensitivity,
+                touch_action,
                 offset: LayoutVector2D::zero(),
                 offset_changed: Cell::new(false),
             }),
@@ -315,6 +326,7 @@ pub(crate) struct FragmentTextDecoration {
     pub line: TextDecorationLine,
     pub color: AbsoluteColor,
     pub style: TextDecorationStyle,
+    pub thickness: TextDecorationThickness,
 }
 
 #[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
@@ -324,9 +336,15 @@ pub(crate) enum StackingContextType {
 }
 
 #[derive(MallocSizeOf)]
-pub enum StackingContextFragments {
+pub(crate) enum StackingContextFragments {
     Root,
     Fragment(#[conditional_malloc_size_of] Arc<BoxFragment>),
+}
+
+#[derive(MallocSizeOf)]
+pub(crate) struct StackingContextReferenceFrameInfo {
+    pub(crate) parent_spatial_node_id: ScrollTreeNodeId,
+    pub(crate) captured_clip_id: ClipId,
 }
 
 /// Either a stacking context or a stacking container, per the definitions in
@@ -366,6 +384,10 @@ pub struct StackingContext {
     /// The text decorations that apply to this [`StackingContext`] propagated via the box tree.
     #[conditional_malloc_size_of]
     pub(crate) text_decorations: Rc<Vec<FragmentTextDecoration>>,
+
+    /// If this [`StackingContext`] also created a WebRender reference frame, this field
+    /// holds information about that reference frame.
+    pub(crate) reference_frame_info: Option<StackingContextReferenceFrameInfo>,
 }
 
 impl StackingContext {
@@ -379,9 +401,11 @@ impl StackingContext {
             clip_id: ClipId::INVALID,
             z_index: 0,
             text_decorations: Default::default(),
+            reference_frame_info: None,
         }
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn create_descendant(
         &self,
         context_type: StackingContextType,
@@ -390,6 +414,7 @@ impl StackingContext {
         clip_id: ClipId,
         initializing_fragment: Arc<BoxFragment>,
         text_decorations: Rc<Vec<FragmentTextDecoration>>,
+        reference_frame_info: Option<StackingContextReferenceFrameInfo>,
     ) -> Self {
         let z_index = initializing_fragment
             .style()
@@ -403,6 +428,7 @@ impl StackingContext {
             clip_id,
             z_index,
             text_decorations,
+            reference_frame_info,
         }
     }
 
@@ -564,6 +590,7 @@ impl BoxFragment {
         parent_stacking_context: &mut StackingContext,
         text_decorations: &Rc<Vec<FragmentTextDecoration>>,
     ) {
+        self.clear_stacking_context_tree_traversal_data();
         self.build_stacking_context_tree_maybe_creating_reference_frame(
             fragment,
             stacking_context_tree,
@@ -594,6 +621,7 @@ impl BoxFragment {
                         containing_block_info,
                         parent_stacking_context,
                         text_decorations,
+                        None, /* reference_frame_info */
                     );
                 },
             };
@@ -602,7 +630,7 @@ impl BoxFragment {
         // > If a transform function causes the current transformation matrix of an object
         // > to be non-invertible, the object and its content do not get displayed.
         if !reference_frame_data.transform.is_invertible() {
-            self.clear_spatial_tree_node_including_descendants();
+            self.clear_stacking_context_tree_traversal_data_recursively();
             return;
         }
 
@@ -637,11 +665,17 @@ impl BoxFragment {
             containing_block.rect.translate(-reference_frame_offset),
             new_spatial_id,
             None,
-            containing_block.clip_id,
+            ClipId::INVALID,
             containing_block.accumulated_reference_frame_offset + reference_frame_offset,
+            false,
         );
         let new_containing_block_info =
             containing_block_info.new_for_non_absolute_descendants(&adjusted_containing_block);
+
+        let reference_frame_info = StackingContextReferenceFrameInfo {
+            parent_spatial_node_id: containing_block.scroll_node_id,
+            captured_clip_id: containing_block.clip_id,
+        };
 
         self.build_stacking_context_tree_maybe_creating_stacking_context(
             fragment,
@@ -650,9 +684,11 @@ impl BoxFragment {
             &new_containing_block_info,
             parent_stacking_context,
             text_decorations,
+            Some(reference_frame_info),
         );
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn build_stacking_context_tree_maybe_creating_stacking_context(
         self: &Arc<Self>,
         fragment: Fragment,
@@ -661,6 +697,7 @@ impl BoxFragment {
         containing_block_info: &ContainingBlockInfo,
         parent_stacking_context: &mut StackingContext,
         text_decorations: &Rc<Vec<FragmentTextDecoration>>,
+        reference_frame_info: Option<StackingContextReferenceFrameInfo>,
     ) {
         let with_style = &self.with_style();
         let style = with_style.style();
@@ -683,6 +720,7 @@ impl BoxFragment {
             containing_block.scroll_node_id,
             &containing_block.rect,
             &new_scroll_frame_size,
+            containing_block.established_scroll_frame,
         );
 
         let clip_id = with_style.build_clip_frame_if_necessary(
@@ -730,6 +768,7 @@ impl BoxFragment {
             containing_block.clip_id,
             box_fragment,
             text_decorations.clone(),
+            reference_frame_info,
         );
         with_style.build_stacking_context_tree_for_children(
             stacking_context_tree,
@@ -779,6 +818,13 @@ impl BoxFragmentWithStyle<'_> {
         let mut new_scroll_frame_size = containing_block_info
             .for_non_absolute_descendants
             .scroll_frame_size;
+
+        let mut established_scroll_frame = containing_block.established_scroll_frame;
+        // We want to skip leaving scroll frame for anonymous fragments,
+        // because anonymous fragment belong to same node as its closest non-anonymous child.
+        if established_scroll_frame && !self.base.is_anonymous() {
+            established_scroll_frame = false;
+        }
         let mut new_clip_id = containing_block.clip_id;
         if let Some(overflow_frame_data) = self.build_overflow_frame_if_necessary(
             stacking_context_tree,
@@ -792,6 +838,7 @@ impl BoxFragmentWithStyle<'_> {
             if let Some(scroll_frame_data) = overflow_frame_data.scroll_frame_data {
                 new_scroll_node_id = scroll_frame_data.scroll_tree_node_id;
                 new_scroll_frame_size = Some(scroll_frame_data.scroll_frame_rect.size());
+                established_scroll_frame = true;
                 self.set_generated_scroll_tree_node_id(new_scroll_node_id);
             }
         }
@@ -809,6 +856,7 @@ impl BoxFragmentWithStyle<'_> {
             new_scroll_frame_size,
             new_clip_id,
             containing_block.accumulated_reference_frame_offset,
+            established_scroll_frame,
         );
         let for_non_absolute_descendants = ContainingBlock::new(
             content_rect,
@@ -816,6 +864,7 @@ impl BoxFragmentWithStyle<'_> {
             new_scroll_frame_size,
             new_clip_id,
             containing_block.accumulated_reference_frame_offset,
+            established_scroll_frame,
         );
 
         // Create a new `ContainingBlockInfo` for descendants depending on
@@ -861,6 +910,7 @@ impl BoxFragmentWithStyle<'_> {
                         .clone_text_decoration_color()
                         .resolve_to_absolute(color),
                     style: style.clone_text_decoration_style(),
+                    thickness: style.clone_text_decoration_thickness(),
                 });
                 new_text_decoration = Rc::new(new_vector);
                 &new_text_decoration
@@ -1001,9 +1051,28 @@ impl BoxFragmentWithStyle<'_> {
             stacking_context_tree.paint_info.pipeline_id,
         );
 
+        let mut x_sensitivity: ScrollType = overflow.x.into();
+        let mut y_sensitivity: ScrollType = overflow.y.into();
+        let touch_action = TouchAction::from(style.get_box().touch_action);
+        // `touch-action` only restricts direct touch manipulation; mouse wheel
+        // (`InputEvents`) and script-driven scrolling are unaffected, so we only
+        // strip `ScrollType::Touch` from the excluded axis.
+        match touch_action {
+            TouchAction::PanX => {
+                y_sensitivity.remove(ScrollType::Touch);
+            },
+            TouchAction::PanY => {
+                x_sensitivity.remove(ScrollType::Touch);
+            },
+            TouchAction::None => {
+                x_sensitivity.remove(ScrollType::Touch);
+                y_sensitivity.remove(ScrollType::Touch);
+            },
+            TouchAction::Auto => {},
+        }
         let sensitivity = AxesScrollSensitivity {
-            x: overflow.x.into(),
-            y: overflow.y.into(),
+            x: x_sensitivity,
+            y: y_sensitivity,
         };
 
         let scroll_tree_node_id = stacking_context_tree.define_scroll_frame(
@@ -1012,6 +1081,7 @@ impl BoxFragmentWithStyle<'_> {
             self.scrollable_overflow().to_webrender(),
             scroll_frame_rect,
             sensitivity,
+            touch_action,
         );
 
         Some(OverflowFrameData {
@@ -1031,6 +1101,7 @@ impl BoxFragment {
         parent_scroll_node_id: ScrollTreeNodeId,
         containing_block_rect: &PhysicalRect<Au>,
         scroll_frame_size: &Option<LayoutSize>,
+        established_scroll_frame: bool,
     ) -> Option<ScrollTreeNodeId> {
         let style = self.style();
         if style.get_box().position != ComputedPosition::Sticky {
@@ -1094,17 +1165,35 @@ impl BoxFragment {
         // The logic below is a simplified (but equivalent) version of the description above.
         let border_rect = self.border_rect();
         let computed_margin = style.physical_margin();
-
+        let parent_scroll_node = stacking_context_tree
+            .paint_info
+            .scroll_tree
+            .get_node(parent_scroll_node_id);
+        let sticky_offset_boundary = match parent_scroll_node.info {
+            SpatialTreeNodeInfo::Scroll(ref scrollable_node_info) if established_scroll_frame => {
+                let content_rect = &scrollable_node_info.content_rect;
+                &PhysicalRect::new(
+                    PhysicalPoint::new(
+                        Au::from_f32_px(content_rect.min.x),
+                        Au::from_f32_px(content_rect.min.y),
+                    ),
+                    PhysicalSize::new(
+                        Au::from_f32_px(content_rect.max.x - content_rect.min.x),
+                        Au::from_f32_px(content_rect.max.y - content_rect.min.y),
+                    ),
+                )
+            },
+            _ => containing_block_rect,
+        };
         // Signed distance between each side of the border box to the corresponding side of the
         // containing block. Note that |border_rect| is already in the coordinate system of the
         // containing block.
         let distance_from_border_box_to_cb = PhysicalSides::new(
             border_rect.min_y(),
-            containing_block_rect.width() - border_rect.max_x(),
-            containing_block_rect.height() - border_rect.max_y(),
+            sticky_offset_boundary.width() - border_rect.max_x(),
+            sticky_offset_boundary.height() - border_rect.max_y(),
             border_rect.min_x(),
         );
-
         // Shrinks the signed distance by the margin, producing a limit on how much we can shift
         // the sticky positioned box without forcing the margin to move outside of the containing
         // block.
@@ -1303,18 +1392,20 @@ impl BoxFragment {
         }
     }
 
-    fn clear_spatial_tree_node_including_descendants(&self) {
-        fn assign_spatial_tree_node_on_fragments(fragments: &[Fragment]) {
+    fn clear_stacking_context_tree_traversal_data_recursively(&self) {
+        fn clear_stacking_context_tree_traversal_data_on_fragments(fragments: &[Fragment]) {
             for fragment in fragments.iter() {
                 match fragment {
                     Fragment::LayoutRoot(layout_root_fragment) => layout_root_fragment
                         .inner_box_fragment()
-                        .clear_spatial_tree_node_including_descendants(),
+                        .clear_stacking_context_tree_traversal_data_recursively(),
                     Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
-                        box_fragment.clear_spatial_tree_node_including_descendants();
+                        box_fragment.clear_stacking_context_tree_traversal_data_recursively();
                     },
                     Fragment::Positioning(positioning_fragment) => {
-                        assign_spatial_tree_node_on_fragments(&positioning_fragment.children);
+                        clear_stacking_context_tree_traversal_data_on_fragments(
+                            &positioning_fragment.children,
+                        );
                     },
                     _ => {},
                 }
@@ -1322,7 +1413,8 @@ impl BoxFragment {
         }
 
         self.spatial_tree_node.set(None);
-        assign_spatial_tree_node_on_fragments(&self.children);
+        self.clear_stacking_context_tree_traversal_data();
+        clear_stacking_context_tree_traversal_data_on_fragments(&self.children);
     }
 }
 

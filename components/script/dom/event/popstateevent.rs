@@ -7,7 +7,7 @@ use js::context::JSContext;
 use js::jsapi::Heap;
 use js::jsval::JSVal;
 use js::rust::{HandleObject, HandleValue, MutableHandleValue};
-use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
+use script_bindings::reflector::reflect_dom_object_with_proto;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
@@ -17,13 +17,11 @@ use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
-use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::window::Window;
-use crate::script_runtime::JSContext as SafeJSContext;
 
-// https://html.spec.whatwg.org/multipage/#the-popstateevent-interface
+/// <https://html.spec.whatwg.org/multipage/#the-popstateevent-interface>
 #[dom_struct]
 pub(crate) struct PopStateEvent {
     event: Event,
@@ -44,12 +42,7 @@ impl PopStateEvent {
         window: &Window,
         proto: Option<HandleObject>,
     ) -> DomRoot<PopStateEvent> {
-        reflect_dom_object_with_proto_and_cx(
-            Box::new(PopStateEvent::new_inherited()),
-            window,
-            proto,
-            cx,
-        )
+        reflect_dom_object_with_proto(cx, Box::new(PopStateEvent::new_inherited()), window, proto)
     }
 
     fn new(
@@ -88,7 +81,7 @@ impl PopStateEventMethods<crate::DomTypeHolder> for PopStateEvent {
         window: &Window,
         proto: Option<HandleObject>,
         type_: DOMString,
-        init: RootedTraceableBox<PopStateEventBinding::PopStateEventInit>,
+        init: &PopStateEventBinding::PopStateEventInit,
     ) -> Fallible<DomRoot<PopStateEvent>> {
         Ok(PopStateEvent::new(
             cx,
@@ -102,7 +95,7 @@ impl PopStateEventMethods<crate::DomTypeHolder> for PopStateEvent {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-popstateevent-state>
-    fn State(&self, _cx: SafeJSContext, mut retval: MutableHandleValue) {
+    fn State(&self, mut retval: MutableHandleValue) {
         retval.set(self.state.get())
     }
 

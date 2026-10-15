@@ -12,10 +12,10 @@ use glow::{
     self as gl, NativeBuffer, NativeFence, NativeFramebuffer, NativeProgram, NativeQuery,
     NativeRenderbuffer, NativeSampler, NativeShader, NativeTexture, NativeVertexArray,
 };
+use log::warn;
 use malloc_size_of_derive::MallocSizeOf;
 use pixels::{PixelFormat, SnapshotAlphaMode};
 use serde::{Deserialize, Serialize};
-use servo_base::Epoch;
 /// Receiver type used in WebGLCommands.
 pub use servo_base::generic_channel::GenericReceiver;
 /// Sender type used in WebGLCommands.
@@ -24,6 +24,7 @@ use servo_base::generic_channel::GenericSharedMemory;
 /// Result type for send()/recv() calls in in WebGLCommands.
 pub use servo_base::generic_channel::SendResult as WebGLSendResult;
 use servo_base::id::PainterId;
+use servo_base::{Epoch, generic_channel};
 use webrender_api::ImageKey;
 use webxr_api::{
     ContextId as WebXRContextId, Error as WebXRError, LayerId as WebXRLayerId,
@@ -78,9 +79,24 @@ impl WebGLThreads {
         WebGLPipeline(WebGLChan(self.0.clone()))
     }
 
-    /// Sends a exit message to close the WebGLThreads and release all WebGLContexts.
-    pub fn exit(&self, sender: GenericSender<()>) -> WebGLSendResult {
-        self.0.send(WebGLMsg::Exit(sender))
+    /// Sends an exit message to close the WebGLThreads and release all WebGLContexts.
+    pub fn exit(&self) {
+        if self.0.send(WebGLMsg::Exit).is_err() {
+            warn!("Could not exit WebGLThread.");
+        }
+    }
+
+    /// Sends a message to remove the resources for a `Painter` with the given [`PainterId`].
+    /// Returns `true` if clearing resources was successful and `false` otherwise.
+    pub fn clear_painter_resources(&self, painter_id: PainterId) -> bool {
+        let (webgl_exit_sender, webgl_exit_receiver) =
+            generic_channel::channel().expect("Failed to create IPC channel!");
+        self.0
+            .send(WebGLMsg::ClearPainterResources(
+                painter_id,
+                webgl_exit_sender,
+            ))
+            .is_ok_and(|_| webgl_exit_receiver.recv().is_ok())
     }
 
     /// Inform the WebGLThreads that WebRender has finished rendering a particular WebGL context,
@@ -127,8 +143,10 @@ pub enum WebGLMsg {
     /// readily releaseable via the `SwapChain`. This can happen when the context is
     /// released in the WebGLThread while the contents are being rendered by WebRender.
     FinishedRenderingToContext(WebGLContextId),
+    /// Frees all resources associated with a particular `Painter`.
+    ClearPainterResources(PainterId, GenericSender<()>),
     /// Frees all resources and closes the thread.
-    Exit(GenericSender<()>),
+    Exit,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
@@ -472,6 +490,7 @@ pub enum WebGLCommand {
     GetParameterBool(ParameterBool, GenericSender<bool>),
     GetParameterBool4(ParameterBool4, GenericSender<[bool; 4]>),
     GetParameterInt(ParameterInt, GenericSender<i32>),
+    GetParameterUInt(ParameterUInt, GenericSender<u32>),
     GetParameterInt2(ParameterInt2, GenericSender<[i32; 2]>),
     GetParameterInt4(ParameterInt4, GenericSender<[i32; 4]>),
     GetParameterFloat(ParameterFloat, GenericSender<f32>),
@@ -879,8 +898,6 @@ parameters! {
             StencilBackPassDepthFail = gl::STENCIL_BACK_PASS_DEPTH_FAIL,
             StencilBackPassDepthPass = gl::STENCIL_BACK_PASS_DEPTH_PASS,
             StencilBackRef = gl::STENCIL_BACK_REF,
-            StencilBackValueMask = gl::STENCIL_BACK_VALUE_MASK,
-            StencilBackWritemask = gl::STENCIL_BACK_WRITEMASK,
             StencilBits = gl::STENCIL_BITS,
             StencilClearValue = gl::STENCIL_CLEAR_VALUE,
             StencilFail = gl::STENCIL_FAIL,
@@ -888,8 +905,6 @@ parameters! {
             StencilPassDepthFail = gl::STENCIL_PASS_DEPTH_FAIL,
             StencilPassDepthPass = gl::STENCIL_PASS_DEPTH_PASS,
             StencilRef = gl::STENCIL_REF,
-            StencilValueMask = gl::STENCIL_VALUE_MASK,
-            StencilWritemask = gl::STENCIL_WRITEMASK,
             SubpixelBits = gl::SUBPIXEL_BITS,
             TransformFeedbackBinding = gl::TRANSFORM_FEEDBACK_BINDING,
             MaxTransformFeedbackInterleavedComponents = gl::MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS,
@@ -905,6 +920,12 @@ parameters! {
             UnpackSkipImages = gl::UNPACK_SKIP_IMAGES,
             UnpackSkipPixels = gl::UNPACK_SKIP_PIXELS,
             UnpackSkipRows = gl::UNPACK_SKIP_ROWS,
+        }),
+        UInt(ParameterUInt {
+            StencilBackValueMask = gl::STENCIL_BACK_VALUE_MASK,
+            StencilBackWritemask = gl::STENCIL_BACK_WRITEMASK,
+            StencilValueMask = gl::STENCIL_VALUE_MASK,
+            StencilWritemask = gl::STENCIL_WRITEMASK,
         }),
         Int2(ParameterInt2 {
             MaxViewportDims = gl::MAX_VIEWPORT_DIMS,
@@ -1371,6 +1392,16 @@ pub enum SizedDataType {
 }
 
 impl TexDataType {
+    /// Parses a texture data type constant. `HalfFloat` stores WebGL 1's `HALF_FLOAT_OES`,
+    /// while WebGL 2 uses `HALF_FLOAT` and does not define `OES_texture_half_float`.
+    pub fn from_webgl_constant(constant: u32, version: WebGLVersion) -> Option<Self> {
+        match (version, constant) {
+            (WebGLVersion::WebGL2, gl::HALF_FLOAT) => Some(TexDataType::HalfFloat),
+            (WebGLVersion::WebGL2, gl::HALF_FLOAT_OES) => None,
+            _ => Self::from_gl_constant(constant),
+        }
+    }
+
     /// Returns the compatible sized data type for this texture data type.
     pub fn sized_data_type(&self) -> SizedDataType {
         match self {

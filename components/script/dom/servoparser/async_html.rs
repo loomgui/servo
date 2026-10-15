@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 #![cfg_attr(crown, expect(crown::unrooted_must_root))]
+#![cfg_attr(crown, allow(crown::jscontext_first_arg))]
 
 use std::borrow::Cow;
 use std::cell::{Cell, Ref, RefCell, RefMut};
@@ -546,12 +547,7 @@ impl Tokenizer {
                     .downcast::<Element>()
                     .expect("tried to set attrs on non-Element in HTML parsing");
                 for attr in attrs {
-                    elem.set_attribute_from_parser(
-                        cx,
-                        attr.name,
-                        DOMString::from(attr.value),
-                        None,
-                    );
+                    elem.set_attribute_from_parser(cx, attr.name, DOMString::from(attr.value));
                 }
             },
             ParseOperation::RemoveFromParent { target } => {

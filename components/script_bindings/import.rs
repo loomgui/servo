@@ -12,15 +12,18 @@ pub(crate) mod base {
         ConversionBehavior, ConversionResult, FromJSValConvertible, ToJSValConvertible,
     };
     pub(crate) use js::error::throw_type_error;
+    pub(crate) use js::gc::RootedVec;
     pub(crate) use js::jsapi::{
-        HandleValue as RawHandleValue, HandleValueArray, Heap, IsCallable, JS_NewObject, JSObject,
+        HandleValue as RawHandleValue, HandleValueArray, Heap, IsCallable, JSObject, Value,
     };
     pub(crate) use js::jsval::{JSVal, NullValue, ObjectOrNullValue, ObjectValue, UndefinedValue};
     pub(crate) use js::panic::maybe_resume_unwind;
     #[allow(unused_imports)]
     pub(crate) use js::realm::{AutoRealm, CurrentRealm};
-    pub(crate) use js::rust::wrappers::Call;
-    pub(crate) use js::rust::{HandleObject, HandleValue, MutableHandleObject, MutableHandleValue};
+    pub(crate) use js::rust::wrappers2::{Call, JS_NewObject};
+    pub(crate) use js::rust::{
+        HandleObject, HandleValue, MutableHandle, MutableHandleObject, MutableHandleValue,
+    };
     pub(crate) use js::typedarray;
     pub(crate) use js::typedarray::{
         HeapArrayBuffer, HeapArrayBufferView, HeapFloat32Array, HeapFloat64Array, HeapUint8Array,
@@ -29,7 +32,8 @@ pub(crate) mod base {
 
     pub(crate) use crate::callback::{
         CallbackContainer, CallbackFunction, CallbackInterface, CallbackObject, ExceptionHandling,
-        ThisReflector, call_setup, wrap_call_this_value,
+        HasCallbackHolder, OwnerWindow, RootedCallback, ThisReflector, TracedCallback, call_setup,
+        create_callback_rooted, wrap_call_this_value,
     };
     pub(crate) use crate::codegen::DomTypes::DomTypes;
     pub(crate) use crate::codegen::GenericUnionTypes;
@@ -42,7 +46,6 @@ pub(crate) mod base {
     pub(crate) use crate::proxyhandler::{CrossOriginProperties, is_platform_object_same_origin};
     pub(crate) use crate::reflector::DomObject;
     pub(crate) use crate::root::DomRoot;
-    pub(crate) use crate::script_runtime::JSContext as SafeJSContext;
     pub(crate) use crate::str::{ByteString, DOMString, USVString};
     pub(crate) use crate::trace::RootedTraceableBox;
     pub(crate) use crate::utils::{get_dictionary_property, set_dictionary_property};
@@ -57,15 +60,13 @@ pub(crate) mod module {
         CreateProxyHandler, GetProxyReservedSlot, JS_GetReservedSlot, ProxyTraps,
     };
     pub(crate) use js::jsapi::{
-        __BindgenBitfieldUnit, CallArgs, GCContext, GetRealmFunctionPrototype, GetWellKnownSymbol,
-        Handle as RawHandle, HandleId as RawHandleId, HandleObject as RawHandleObject,
-        JS_ForwardGetPropertyTo, JS_HasPropertyById, JS_NewPlainObject, JS_SetReservedSlot,
-        JSAutoRealm, JSCLASS_FOREGROUND_FINALIZE, JSCLASS_RESERVED_SLOTS_SHIFT, JSClass,
-        JSClassOps, JSFunctionSpec, JSJitGetterCallArgs, JSJitInfo, JSJitInfo__bindgen_ty_1,
-        JSJitInfo__bindgen_ty_2, JSJitInfo__bindgen_ty_3, JSJitInfo_AliasSet, JSJitInfo_ArgType,
-        JSJitInfo_OpType, JSJitMethodCallArgs, JSJitSetterCallArgs, JSNativeWrapper,
-        JSPROP_ENUMERATE, JSPROP_PERMANENT, JSPROP_READONLY, JSPropertySpec,
-        JSPropertySpec_Accessor, JSPropertySpec_AccessorsOrValue,
+        __BindgenBitfieldUnit, CallArgs, GCContext, Handle as RawHandle, HandleId as RawHandleId,
+        HandleObject as RawHandleObject, JS_SetReservedSlot, JSCLASS_FOREGROUND_FINALIZE,
+        JSCLASS_RESERVED_SLOTS_SHIFT, JSClass, JSClassOps, JSFunctionSpec, JSJitGetterCallArgs,
+        JSJitInfo, JSJitInfo__bindgen_ty_1, JSJitInfo__bindgen_ty_2, JSJitInfo__bindgen_ty_3,
+        JSJitInfo_AliasSet, JSJitInfo_ArgType, JSJitInfo_OpType, JSJitMethodCallArgs,
+        JSJitSetterCallArgs, JSNativeWrapper, JSPROP_ENUMERATE, JSPROP_PERMANENT, JSPROP_READONLY,
+        JSPropertySpec, JSPropertySpec_Accessor, JSPropertySpec_AccessorsOrValue,
         JSPropertySpec_AccessorsOrValue_Accessors, JSPropertySpec_Kind, JSPropertySpec_Name,
         JSPropertySpec_ValueWrapper, JSPropertySpec_ValueWrapper__bindgen_ty_1,
         JSPropertySpec_ValueWrapper_Type, JSTracer, JSTypedMethodJitInfo, JSValueType,
@@ -74,16 +75,17 @@ pub(crate) mod module {
         ObjectOpResult, PropertyDescriptor, SymbolCode, jsid,
     };
     pub(crate) use js::panic::wrap_panic;
-    pub(crate) use js::rust::wrappers::{
-        Call, JS_CopyOwnPropertiesAndPrivateFields, JS_DefineProperty, JS_DefinePropertyById2,
-        JS_GetProperty, JS_NewObjectWithoutMetadata, JS_SetImmutablePrototype, JS_SetProperty,
-        JS_SetPrototype, RUST_SYMBOL_TO_JSID,
+    pub(crate) use js::rust::wrappers2::{
+        Call, GetRealmFunctionPrototype, GetWellKnownSymbol, JS_DefineProperty,
+        JS_DefinePropertyById2, JS_ForwardGetPropertyTo, JS_GetProperty,
+        JS_GetPropertyDescriptorById, JS_HasPropertyById, JS_NewObjectWithoutMetadata,
+        JS_NewPlainObject, JS_SetImmutablePrototype, JS_SetProperty, JS_SetPrototype,
+        RUST_SYMBOL_TO_JSID,
     };
-    pub(crate) use js::rust::wrappers2::JS_GetPropertyDescriptorById;
     pub(crate) use js::rust::{CustomAutoRooterGuard, GCMethods, Handle, MutableHandle};
     pub(crate) use js::{
-        JS_CALLEE, JSCLASS_GLOBAL_SLOT_COUNT, JSCLASS_IS_DOMJSCLASS, JSCLASS_IS_GLOBAL,
-        JSCLASS_RESERVED_SLOTS_MASK, typedarray,
+        JS_CALLEE, JSCLASS_GLOBAL_SLOT_COUNT, JSCLASS_IS_GLOBAL, JSCLASS_RESERVED_SLOTS_MASK,
+        typedarray,
     };
     pub(crate) use servo_config::pref;
 
@@ -113,17 +115,13 @@ pub(crate) mod module {
         define_guarded_properties, get_per_interface_object_handle, is_exposed_in,
     };
     pub(crate) use crate::iterable::{Iterable, IterableIterator, IteratorType};
-    #[cfg(feature = "testbinding")]
-    pub(crate) use crate::like::Maplike;
-    pub(crate) use crate::like::Setlike;
+    pub(crate) use crate::like::{Maplike, Setlike};
     pub(crate) use crate::mem::malloc_size_of_including_raw_self;
     pub(crate) use crate::namespace::NamespaceObjectClass;
     pub(crate) use crate::proxyhandler::{get_expando_object, set_property_descriptor};
-    pub(crate) use crate::realms::{AlreadyInRealm, InRealm};
     #[cfg(feature = "testbinding")]
     pub(crate) use crate::root::{Dom, DomSlice};
     pub(crate) use crate::root::{MaybeUnreflectedDom, Root};
-    pub(crate) use crate::script_runtime::CanGc;
     pub(crate) use crate::utils::{
         DOM_PROTO_UNFORGEABLE_HOLDER_SLOT, DOMClass, DOMJSClass, JSCLASS_DOM_GLOBAL,
         ProtoOrIfaceArray, call_policies, enumerate_global, enumerate_window, exception_to_promise,

@@ -5,15 +5,15 @@
 use std::sync::{Arc, OnceLock};
 
 use dom_struct::dom_struct;
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use js::rust::{CustomAutoRooterGuard, HandleObject};
 use js::typedarray::{Float32Array, Uint8Array};
 use script_bindings::cell::DomRefCell;
-use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
+use script_bindings::reflector::reflect_dom_object_with_proto;
 use servo_base::generic_channel::GenericCallback;
 use servo_media::audio::analyser_node::AnalysisEngine;
+use servo_media::audio::audio_node::AudioNodeInit;
 use servo_media::audio::block::Block;
-use servo_media::audio::node::AudioNodeInit;
 
 use crate::dom::audio::audionode::{AudioNode, AudioNodeOptionsHelper};
 use crate::dom::audio::baseaudiocontext::BaseAudioContext;
@@ -107,7 +107,7 @@ impl AnalyserNode {
         let callback_oncelock = Arc::new(OnceLock::new());
         let node =
             AnalyserNode::new_inherited(cx, window, context, options, callback_oncelock.clone())?;
-        let object = reflect_dom_object_with_proto_and_cx(Box::new(node), window, proto, cx);
+        let object = reflect_dom_object_with_proto(cx, Box::new(node), window, proto);
         let task_source = window
             .as_global_scope()
             .task_manager()
@@ -147,40 +147,44 @@ impl AnalyserNodeMethods<crate::DomTypeHolder> for AnalyserNode {
         AnalyserNode::new_with_proto(cx, window, proto, context, options)
     }
 
-    #[expect(unsafe_code)]
     /// <https://webaudio.github.io/web-audio-api/#dom-analysernode-getfloatfrequencydata>
-    fn GetFloatFrequencyData(&self, mut array: CustomAutoRooterGuard<Float32Array>) {
+    fn GetFloatFrequencyData(&self, no_gc: &NoGC, mut array: CustomAutoRooterGuard<Float32Array>) {
         // Invariant to maintain: No JS code that may touch the array should
         // run whilst we're writing to it
-        let dest = unsafe { array.as_mut_slice() };
-        self.engine.borrow_mut().fill_frequency_data(dest);
+        let dest = array.as_mut_slice_safe(no_gc);
+        self.engine
+            .borrow_mut()
+            .fill_frequency_data(dest.unwrap_or(&mut []));
     }
 
-    #[expect(unsafe_code)]
     /// <https://webaudio.github.io/web-audio-api/#dom-analysernode-getbytefrequencydata>
-    fn GetByteFrequencyData(&self, mut array: CustomAutoRooterGuard<Uint8Array>) {
+    fn GetByteFrequencyData(&self, no_gc: &NoGC, mut array: CustomAutoRooterGuard<Uint8Array>) {
         // Invariant to maintain: No JS code that may touch the array should
         // run whilst we're writing to it
-        let dest = unsafe { array.as_mut_slice() };
-        self.engine.borrow_mut().fill_byte_frequency_data(dest);
+        let dest = array.as_mut_slice_safe(no_gc);
+        self.engine
+            .borrow_mut()
+            .fill_byte_frequency_data(dest.unwrap_or(&mut []));
     }
 
-    #[expect(unsafe_code)]
     /// <https://webaudio.github.io/web-audio-api/#dom-analysernode-getfloattimedomaindata>
-    fn GetFloatTimeDomainData(&self, mut array: CustomAutoRooterGuard<Float32Array>) {
+    fn GetFloatTimeDomainData(&self, no_gc: &NoGC, mut array: CustomAutoRooterGuard<Float32Array>) {
         // Invariant to maintain: No JS code that may touch the array should
         // run whilst we're writing to it
-        let dest = unsafe { array.as_mut_slice() };
-        self.engine.borrow().fill_time_domain_data(dest);
+        let dest = array.as_mut_slice_safe(no_gc);
+        self.engine
+            .borrow()
+            .fill_time_domain_data(dest.unwrap_or(&mut []));
     }
 
-    #[expect(unsafe_code)]
     /// <https://webaudio.github.io/web-audio-api/#dom-analysernode-getbytetimedomaindata>
-    fn GetByteTimeDomainData(&self, mut array: CustomAutoRooterGuard<Uint8Array>) {
+    fn GetByteTimeDomainData(&self, no_gc: &NoGC, mut array: CustomAutoRooterGuard<Uint8Array>) {
         // Invariant to maintain: No JS code that may touch the array should
         // run whilst we're writing to it
-        let dest = unsafe { array.as_mut_slice() };
-        self.engine.borrow().fill_byte_time_domain_data(dest);
+        let dest = array.as_mut_slice_safe(no_gc);
+        self.engine
+            .borrow()
+            .fill_byte_time_domain_data(dest.unwrap_or(&mut []));
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-analysernode-fftsize>

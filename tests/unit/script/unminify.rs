@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::borrow::Cow;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 
 use script::test::unminify::{create_output_file, substitute_with_local_script};
 use servo_url::ServoUrl;
@@ -40,6 +40,17 @@ fn test_create_output_file_without_query_string() {
 }
 
 #[test]
+fn test_create_output_file_with_data_url() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let url = ServoUrl::parse("data:text/javascript,console.log('pass')").unwrap();
+
+    let result = create_output_file(dir.path().to_str().unwrap().to_owned(), &url, Some(true));
+
+    assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
+    assert_eq!(dir.path().read_dir().unwrap().count(), 0);
+}
+
+#[test]
 fn replace_script_with_query_string() {
     let dir = tempfile::tempdir().expect("create temp dir");
     let url = ServoUrl::parse("https://example.com/app.js?query=true").unwrap();
@@ -51,7 +62,7 @@ fn replace_script_with_query_string() {
     }
 
     let mut script = Cow::from("fail");
-    substitute_with_local_script(&format!("{}", dir.path().display()), &mut script, url);
+    substitute_with_local_script(&format!("{}", dir.path().display()), &mut script, &url);
     assert_eq!(script, "pass");
 }
 
@@ -67,6 +78,6 @@ fn replace_script_without_query_string() {
     }
 
     let mut script = Cow::from("fail");
-    substitute_with_local_script(&format!("{}", dir.path().display()), &mut script, url);
+    substitute_with_local_script(&format!("{}", dir.path().display()), &mut script, &url);
     assert_eq!(script, "pass");
 }

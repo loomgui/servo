@@ -2,12 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::rc::Rc;
-
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use script_bindings::cell::DomRefCell;
-use script_bindings::reflector::reflect_dom_object_with_cx;
+use script_bindings::reflector::reflect_dom_object;
 use servo_base::generic_channel::GenericSender;
 use servo_bluetooth_traits::{BluetoothRequest, BluetoothResponse};
 
@@ -26,7 +24,7 @@ use crate::dom::bluetooth::{AllowedBluetoothDevice, AsyncBluetoothListener, Blue
 use crate::dom::bluetoothdevice::BluetoothDevice;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::permissionstatus::PermissionStatus;
-use crate::dom::promise::Promise;
+use crate::dom::promise::RootedPromise;
 
 // https://webbluetoothcg.github.io/web-bluetooth/#bluetoothpermissionresult
 #[dom_struct]
@@ -51,15 +49,15 @@ impl BluetoothPermissionResult {
         global: &GlobalScope,
         status: &PermissionStatus,
     ) -> DomRoot<BluetoothPermissionResult> {
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(BluetoothPermissionResult::new_inherited(status)),
             global,
-            cx,
         )
     }
 
     pub(crate) fn get_bluetooth(&self, cx: &mut JSContext) -> DomRoot<Bluetooth> {
-        self.global().as_window().Navigator().Bluetooth(cx)
+        self.global().as_window().Navigator(cx).Bluetooth(cx)
     }
 
     pub(crate) fn get_bluetooth_thread(&self) -> GenericSender<BluetoothRequest> {
@@ -102,7 +100,7 @@ impl AsyncBluetoothListener for BluetoothPermissionResult {
         &self,
         cx: &mut JSContext,
         response: BluetoothResponse,
-        promise: &Rc<Promise>,
+        promise: &RootedPromise,
     ) {
         match response {
             // https://webbluetoothcg.github.io/web-bluetooth/#request-bluetooth-devices
@@ -110,15 +108,17 @@ impl AsyncBluetoothListener for BluetoothPermissionResult {
             BluetoothResponse::RequestDevice(device) => {
                 self.set_state(PermissionState::Granted);
                 let bluetooth = self.get_bluetooth(cx);
-                let mut device_instance_map = bluetooth.get_device_map().borrow_mut();
-                if let Some(existing_device) = device_instance_map.get(&device.id) {
-                    // https://webbluetoothcg.github.io/web-bluetooth/#request-the-bluetooth-permission
-                    // Step 3.
-                    self.set_devices(vec![Dom::from_ref(existing_device)]);
+                {
+                    let device_instance_map = bluetooth.get_device_map().borrow();
+                    if let Some(existing_device) = device_instance_map.get(&device.id) {
+                        // https://webbluetoothcg.github.io/web-bluetooth/#request-the-bluetooth-permission
+                        // Step 3.
+                        self.set_devices(vec![Dom::from_ref(existing_device)]);
 
-                    // https://w3c.github.io/permissions/#dom-permissions-request
-                    // Step 8.
-                    return promise.resolve_native(cx, self);
+                        // https://w3c.github.io/permissions/#dom-permissions-request
+                        // Step 8.
+                        return promise.resolve_native(cx, self);
+                    }
                 }
                 let bt_device = BluetoothDevice::new(
                     cx,
@@ -127,7 +127,10 @@ impl AsyncBluetoothListener for BluetoothPermissionResult {
                     device.name.map(DOMString::from),
                     &bluetooth,
                 );
-                device_instance_map.insert(device.id.clone(), Dom::from_ref(&bt_device));
+                bluetooth
+                    .get_device_map()
+                    .safe_borrow_mut(cx.no_gc())
+                    .insert(device.id.clone(), Dom::from_ref(&bt_device));
                 self.global()
                     .as_window()
                     .bluetooth_extra_permission_data()

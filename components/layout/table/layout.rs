@@ -862,8 +862,8 @@ impl<'a> TableLayout<'a> {
         let bounds = |sum_a, sum_b| target_inline_size > sum_a && target_inline_size < sum_b;
 
         let blend = |a: &[Au], sum_a: Au, b: &[Au], sum_b: Au| {
-            // First convert the Au units to f32 in order to do floating point division.
-            let weight_a = (target_inline_size - sum_b).to_f32_px() / (sum_a - sum_b).to_f32_px();
+            // First convert the Au units to f64 in order to do floating point division.
+            let weight_a = (target_inline_size - sum_b).to_f64_px() / (sum_a - sum_b).to_f64_px();
             let weight_b = 1.0 - weight_a;
 
             let mut remaining_assignable_width = target_inline_size;
@@ -871,7 +871,9 @@ impl<'a> TableLayout<'a> {
                 .iter()
                 .zip(b.iter())
                 .map(|(guess_a, guess_b)| {
-                    let column_width = guess_a.scale_by(weight_a) + guess_b.scale_by(weight_b);
+                    let column_width = Au::from_f64_px(
+                        guess_a.to_f64_px() * weight_a + guess_b.to_f64_px() * weight_b,
+                    );
                     // Clamp to avoid exceeding the assignable width. This could otherwise
                     // happen when dealing with huge values whose sum is clamped to MAX_AU.
                     let column_width = column_width.min(remaining_assignable_width);
@@ -1251,23 +1253,22 @@ impl<'a> TableLayout<'a> {
                 self.row_baselines.push(max_ascent);
                 max_row_height.max(max_ascent + max_descent)
             })
-            .collect();
+            .collect::<Vec<_>>();
         self.calculate_row_sizes_after_first_layout(&mut row_sizes, writing_mode);
         row_sizes
     }
 
-    #[allow(clippy::ptr_arg)] // Needs to be a vec because of the function above
     /// After doing layout of table rows, calculate final row size and distribute space across
     /// rowspanned cells. This follows the implementation of LayoutNG and the priority
     /// agorithm described at <https://github.com/w3c/csswg-drafts/issues/4418>.
     fn calculate_row_sizes_after_first_layout(
         &mut self,
-        row_sizes: &mut Vec<Au>,
+        row_sizes: &mut [Au],
         writing_mode: WritingMode,
     ) {
         let mut cells_to_distribute = Vec::new();
         let mut total_percentage = 0.;
-        #[allow(clippy::needless_range_loop)] // It makes sense to use it here
+        #[expect(clippy::needless_range_loop)] // It makes sense to use it here
         for row_index in 0..self.table.size.height {
             let row_measure = self
                 .table
@@ -1979,7 +1980,7 @@ impl<'a> TableLayout<'a> {
         col_group.base.style.get_inherited_box().visibility == Visibility::Collapse
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn do_final_cell_layout(
         &mut self,
         row_index: usize,
@@ -2315,7 +2316,7 @@ impl<'a> RowFragmentLayout<'a> {
         containing_block_for_children: &ContainingBlock,
         row_group_fragment_layout: &mut Option<RowGroupFragmentLayout>,
     ) -> Fragment {
-        if self.positioning_context.is_some() {
+        if self.row.base.style.clone_position() == Position::Relative {
             self.rect.start_corner +=
                 relative_adjustement(&self.row.base.style, containing_block_for_children);
         }
@@ -2407,7 +2408,7 @@ impl RowGroupFragmentLayout {
         containing_block_for_children: &ContainingBlock,
     ) -> Fragment {
         let row_group = self.row_group.borrow();
-        if self.positioning_context.is_some() {
+        if row_group.base.style.clone_position() == Position::Relative {
             self.rect.start_corner +=
                 relative_adjustement(&row_group.base.style, containing_block_for_children);
         }
@@ -2873,7 +2874,7 @@ impl TableSlotCell {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn create_fragment(
         &self,
         mut layout: CellLayout,
@@ -3059,8 +3060,11 @@ impl RowspanToDistribute<'_> {
         self.coordinates.y..self.coordinates.y + self.cell.rowspan
     }
 
+    /// Returns true if other is a proper subset of [`self`].
     fn fully_encloses(&self, other: &RowspanToDistribute) -> bool {
-        other.coordinates.y > self.coordinates.y && other.range().end < self.range().end
+        self.range() != other.range() &&
+            other.coordinates.y >= self.coordinates.y &&
+            other.range().end <= self.range().end
     }
 }
 

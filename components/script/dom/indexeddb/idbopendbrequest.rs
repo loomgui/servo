@@ -4,10 +4,10 @@
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
+use js::conversions::ToJSValConvertible;
 use js::jsval::UndefinedValue;
 use js::rust::HandleValue;
 use profile_traits::generic_callback::GenericCallback;
-use script_bindings::conversions::SafeToJSValConvertible;
 use script_bindings::reflector::reflect_dom_object_with_cx;
 use servo_base::generic_channel::GenericSend;
 use servo_url::origin::ImmutableOrigin;
@@ -30,7 +30,7 @@ use crate::dom::indexeddb::idbdatabase::IDBDatabase;
 use crate::dom::indexeddb::idbrequest::IDBRequest;
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
 use crate::dom::indexeddb::idbversionchangeevent::IDBVersionChangeEvent;
-use crate::indexeddb::map_backend_error_to_dom_error;
+use crate::dom::indexeddb::key::map_backend_error_to_dom_error;
 use crate::realms::enter_auto_realm;
 
 #[derive(Clone)]
@@ -185,7 +185,7 @@ impl IDBOpenDBRequest {
         transaction.set_active_flag(false);
 
         rooted!(&in(cx) let mut connection_val = UndefinedValue());
-        connection.safe_to_jsval(cx, connection_val.handle_mut());
+        connection.to_jsval(cx, connection_val.handle_mut());
 
         // Step 10.1: Set request’s result to connection.
         self.idbrequest.set_result(connection_val.handle());
@@ -227,6 +227,10 @@ impl IDBOpenDBRequest {
         }
     }
 
+    pub(crate) fn pending_connection(&self) -> Option<DomRoot<IDBDatabase>> {
+        self.pending_connection.get()
+    }
+
     pub(crate) fn delete_database(
         &self,
         storage_key: ImmutableOrigin,
@@ -242,7 +246,7 @@ impl IDBOpenDBRequest {
         let response_listener = OpenRequestListener {
             open_request: Trusted::new(self),
         };
-        let callback = GenericCallback::new(global.time_profiler_chan().clone(), move |message| {
+        let callback = GenericCallback::new(move |message| {
             let response_listener = response_listener.clone();
             task_source.queue(task!(request_callback: move |cx| {
                 response_listener.handle_delete_db(cx, message.unwrap());
@@ -290,14 +294,14 @@ impl IDBOpenDBRequest {
         matches
     }
 
-    pub fn dispatch_success(&self, cx: &mut JSContext, result: DomRoot<IDBDatabase>) {
+    pub fn dispatch_success(&self, cx: &mut JSContext, result: &IDBDatabase) {
         let global = self.global();
         self.idbrequest.set_ready_state_done();
 
-        let mut realm = enter_auto_realm(cx, &*result);
+        let mut realm = enter_auto_realm(cx, result);
         let cx = &mut realm.current_realm();
         rooted!(&in(cx) let mut result_val = UndefinedValue());
-        result.safe_to_jsval(cx, result_val.handle_mut());
+        result.to_jsval(cx, result_val.handle_mut());
         self.set_result(result_val.handle());
 
         let event = Event::new(

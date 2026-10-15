@@ -2,14 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::rc::Rc;
+use std::cell::Ref;
 use std::str::FromStr;
 
 use cssparser::match_ignore_ascii_case;
 use dom_struct::dom_struct;
 use http::Method as HttpMethod;
-use http::header::{HeaderName, HeaderValue};
+use http::header::{CONTENT_TYPE, HeaderValue};
 use http::method::InvalidMethod;
+use js::context::JSContext;
 use js::rust::HandleObject;
 use net_traits::ReferrerPolicy as MsgReferrerPolicy;
 use net_traits::fetch::headers::is_forbidden_method;
@@ -23,28 +24,26 @@ use script_bindings::cformat;
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use servo_url::ServoUrl;
 
-use crate::body::{
-    BodyMixin, BodyType, Extractable, body_text_stream, clone_body_stream_for_dom_body,
-    consume_body,
-};
 use crate::conversions::Convert;
+use crate::dom::RootedPromise;
 use crate::dom::abortsignal::AbortSignal;
-use crate::dom::bindings::codegen::Bindings::HeadersBinding::{HeadersInit, HeadersMethods};
+use crate::dom::bindings::codegen::Bindings::HeadersBinding::HeadersMethods;
 use crate::dom::bindings::codegen::Bindings::RequestBinding::{
-    ReferrerPolicy, RequestCache, RequestCredentials, RequestDestination, RequestInfo, RequestInit,
-    RequestMethods, RequestMode, RequestRedirect,
+    ReferrerPolicy, RequestCache, RequestCredentials, RequestDestination, RequestDuplex,
+    RequestInfo, RequestInit, RequestMethods, RequestMode, RequestRedirect,
 };
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::{ByteString, DOMString, USVString};
-use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::headers::{Guard, Headers};
-use crate::dom::promise::Promise;
 use crate::dom::stream::readablestream::ReadableStream;
-use crate::fetch::RequestWithGlobalScope;
-use crate::script_runtime::CanGc;
+use crate::fetch::body::{
+    BodyMixin, BodyType, Extractable, body_text_stream, clone_body_stream_for_dom_body,
+    consume_body,
+};
+use crate::fetch::fetch::RequestWithGlobalScope;
 use crate::url::ensure_blob_referenced_by_url_is_kept_alive;
 
 #[dom_struct]
@@ -72,27 +71,27 @@ impl Request {
         }
     }
 
-    fn new(
+    pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
         url: ServoUrl,
-        can_gc: CanGc,
     ) -> DomRoot<Request> {
         reflect_dom_object_with_proto(
+            cx,
             Box::new(Request::new_inherited(global, url)),
             global,
             proto,
-            can_gc,
         )
     }
 
     fn from_net_request(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
         net_request: NetTraitsRequest,
-        can_gc: CanGc,
     ) -> DomRoot<Request> {
-        let r = Request::new(global, proto, net_request.current_url(), can_gc);
+        let r = Request::new(cx, global, proto, net_request.current_url());
         *r.request.borrow_mut() = net_request;
         r
     }
@@ -152,7 +151,8 @@ impl Request {
         }
 
         // Step 7. Let origin be this’s relevant settings object’s origin.
-        let origin = global.origin().immutable();
+        let origin = global.origin();
+        let origin = origin.immutable();
 
         // Step 8. Let traversableForUserPrompts be "client".
         let mut traversable_for_user_prompts = TraversableForUserPrompts::Client;
@@ -188,11 +188,16 @@ impl Request {
         request.cache_mode = temporary_request.cache_mode;
         request.redirect_mode = temporary_request.redirect_mode;
         request.integrity_metadata = temporary_request.integrity_metadata;
+        // reload-navigation flag: request’s reload-navigation flag.
+        request.reload_navigation = temporary_request.reload_navigation;
+        // history-navigation flag: request’s history-navigation flag.
+        request.history_navigation = temporary_request.history_navigation;
 
         // Step 13. If init is not empty, then:
         if init.body.is_some() ||
             init.cache.is_some() ||
             init.credentials.is_some() ||
+            init.duplex.is_some() ||
             init.integrity.is_some() ||
             init.headers.is_some() ||
             init.keepalive.is_some() ||
@@ -208,9 +213,9 @@ impl Request {
                 request.mode = NetTraitsRequestMode::SameOrigin;
             }
             // Step 13.2. Unset request’s reload-navigation flag.
-            // TODO
+            request.reload_navigation = false;
             // Step 13.3. Unset request’s history-navigation flag.
-            // TODO
+            request.history_navigation = false;
             // Step 13.4. Set request’s origin to "client".
             // TODO
             // Step 13.5. Set request’s referrer to "client".
@@ -348,13 +353,14 @@ impl Request {
         // TODO
 
         // Step 28. Set this’s request to request.
-        let r = Request::from_net_request(global, proto, request, CanGc::from_cx(cx));
+        let request = Request::from_net_request(cx, global, proto, request);
 
         // Step 29. Let signals be « signal » if signal is non-null; otherwise « ».
         let signals = signal.map_or(vec![], |s| vec![s]);
         // Step 30. Set this’s signal to the result of creating a dependent
         // abort signal from signals, using AbortSignal and this’s relevant realm.
-        r.signal
+        request
+            .signal
             .set(Some(&AbortSignal::create_dependent_abort_signal(
                 cx, signals, global,
             )));
@@ -364,36 +370,21 @@ impl Request {
         //
         // "or_init" looks unclear here, but it always enters the block since r
         // hasn't had any other way to initialize its headers
-        r.headers
-            .or_init(|| Headers::for_request(&r.global(), CanGc::from_cx(cx)));
+        request
+            .headers
+            .or_init(|| Headers::for_request(cx, &request.global()));
 
         // Step 33. If init is not empty, then:
         //
         // but spec says this should only be when non-empty init?
-        let headers_copy = init
-            .headers
-            .as_ref()
-            .map(|possible_header| match possible_header {
-                HeadersInit::ByteStringSequenceSequence(init_sequence) => {
-                    HeadersInit::ByteStringSequenceSequence(init_sequence.clone())
-                },
-                HeadersInit::ByteStringByteStringRecord(init_map) => {
-                    HeadersInit::ByteStringByteStringRecord(init_map.clone())
-                },
-            });
 
         // Step 33.3
         // We cannot empty `r.Headers().header_list` because
-        // we would undo the Step 25 above.  One alternative is to set
-        // `headers_copy` as a deep copy of `r.Headers()`. However,
-        // `r.Headers()` is a `DomRoot<T>`, and therefore it is difficult
-        // to obtain a mutable reference to `r.Headers()`. Without the
-        // mutable reference, we cannot mutate `r.Headers()` to be the
-        // deep copied headers in Step 25.
+        // we would undo the Step 25 above.
 
         // Step 32. If this’s request’s mode is "no-cors", then:
-        if r.request.borrow().mode == NetTraitsRequestMode::NoCors {
-            let borrowed_request = r.request.borrow();
+        if request.request.borrow().mode == NetTraitsRequestMode::NoCors {
+            let borrowed_request = request.request.borrow();
             // Step 32.1. If this’s request’s method is not a CORS-safelisted method, then throw a TypeError.
             if !is_cors_safelisted_method(&borrowed_request.method) {
                 return Err(Error::Type(
@@ -402,10 +393,10 @@ impl Request {
                 ));
             }
             // Step 32.2. Set this’s headers’s guard to "request-no-cors".
-            r.Headers(cx).set_guard(Guard::RequestNoCors);
+            request.Headers(cx).set_guard(Guard::RequestNoCors);
         }
 
-        match headers_copy {
+        match init.headers.as_ref() {
             None => {
                 // Step 33.4. If headers is a Headers object, then for each header of its header list, append header to this’s headers.
                 //
@@ -414,21 +405,23 @@ impl Request {
                 // but an input with headers is given, set request's
                 // headers as the input's Headers.
                 if let RequestInfo::Request(ref input_request) = input {
-                    r.Headers(cx).copy_from_headers(input_request.Headers(cx))?;
+                    request
+                        .Headers(cx)
+                        .copy_from_headers(&input_request.Headers(cx))?;
                 }
             },
             // Step 33.5. Otherwise, fill this’s headers with headers.
-            Some(headers_copy) => r.Headers(cx).fill(Some(headers_copy))?,
+            Some(headers) => request.Headers(cx).fill(Some(headers))?,
         }
 
         // Step 33.5 depending on how we got here
         // Copy the headers list onto the headers of net_traits::Request
-        r.request.borrow_mut().headers = r.Headers(cx).get_headers_list();
+        request.request.borrow_mut().headers = request.Headers(cx).get_headers_list();
 
         // Step 34. Let inputBody be input’s request’s body if input is a Request object; otherwise null.
         let input_body = if let RequestInfo::Request(ref mut input_request) = input {
             let mut input_request_request = input_request.request.borrow_mut();
-            r.body_stream.set(input_request.body().as_deref());
+            request.body_stream.set(input_request.body().as_deref());
             input_request_request.body.take()
         } else {
             None
@@ -437,7 +430,7 @@ impl Request {
         // Step 35. If either init["body"] exists and is non-null or inputBody is non-null,
         // and request’s method is `GET` or `HEAD`, then throw a TypeError.
         if init.body.as_ref().is_some_and(|body| body.is_some()) || input_body.is_some() {
-            let req = r.request.borrow();
+            let req = request.request.borrow();
             let req_method = &req.method;
             match *req_method {
                 HttpMethod::GET => {
@@ -460,39 +453,40 @@ impl Request {
         if let Some(Some(ref input_init_body)) = init.body {
             // Step 37.1. Let bodyWithType be the result of extracting init["body"], with keepalive set to request’s keepalive.
             let mut body_with_type =
-                input_init_body.extract(cx, global, r.request.borrow().keep_alive)?;
+                input_init_body.extract(cx, global, request.request.borrow().keep_alive)?;
 
             // Step 37.3. Let type be bodyWithType’s type.
             if let Some(contents) = body_with_type.content_type.take() {
-                let ct_header_name = b"Content-Type";
                 // Step 37.4. If type is non-null and this’s headers’s header list
                 // does not contain `Content-Type`, then append (`Content-Type`, type) to this’s headers.
-                if !r
+                let content_type_header_name = b"Content-Type";
+                if !request
                     .Headers(cx)
-                    .Has(ByteString::new(ct_header_name.to_vec()))
+                    .Has(ByteString::new(content_type_header_name.to_vec()))
                     .unwrap()
                 {
-                    let ct_header_val = contents.as_bytes();
-                    r.Headers(cx).Append(
-                        ByteString::new(ct_header_name.to_vec()),
-                        ByteString::new(ct_header_val.to_vec()),
+                    let content_type_header_value = contents.as_bytes();
+                    request.Headers(cx).Append(
+                        ByteString::new(content_type_header_name.to_vec()),
+                        ByteString::new(content_type_header_value.to_vec()),
                     )?;
 
-                    // In Servo r.Headers's header list isn't a pointer to
-                    // the same actual list as r.request's, and so we need to
-                    // append to both lists to keep them in sync.
-                    if let Ok(v) = HeaderValue::from_bytes(&ct_header_val) {
-                        r.request
+                    // In Servo request.Headers's header list isn't a pointer to the same
+                    // actual list as request.request's, and so we need to append to both lists
+                    // to keep them in sync.
+                    if let Ok(header_value) = HeaderValue::from_bytes(&content_type_header_value) {
+                        request
+                            .request
                             .borrow_mut()
                             .headers
-                            .insert(HeaderName::from_bytes(ct_header_name).unwrap(), v);
+                            .insert(CONTENT_TYPE, header_value);
                     }
                 }
             }
 
             // Step 37.2. Set initBody to bodyWithType’s body.
-            let (net_body, stream) = body_with_type.into_net_request_body();
-            r.body_stream.set(Some(&*stream));
+            let (net_body, stream) = body_with_type.into_net_request_body(cx);
+            request.body_stream.set(Some(&*stream));
             init_body = Some(net_body);
         }
 
@@ -502,6 +496,7 @@ impl Request {
         //
         // There are multiple reassignments to similar values. In the end, all end up as
         // final_body. Therefore, final_body is equivalent to inputOrInitBody
+        let init_body_is_non_null = init_body.is_some();
         let final_body = init_body.or(input_body);
 
         // Step 39. If inputOrInitBody is non-null and inputOrInitBody’s source is null, then:
@@ -509,10 +504,15 @@ impl Request {
             .as_ref()
             .is_some_and(|body| body.source_is_null())
         {
-            // Step 39.1. If initBody is non-null and init["duplex"] does not exist, then throw a TypeError.
-            // TODO
+            // Step 39.1. “If initBody is non-null and init["duplex"] does not exist,
+            // then throw a TypeError.”
+            if init_body_is_non_null && init.duplex.is_none() {
+                return Err(Error::Type(
+                    c"Request with a ReadableStream body must specify duplex".to_owned(),
+                ));
+            }
             // Step 39.2. If this’s request’s mode is neither "same-origin" nor "cors", then throw a TypeError.
-            let request_mode = &r.request.borrow().mode;
+            let request_mode = &request.request.borrow().mode;
             if *request_mode != NetTraitsRequestMode::CorsMode &&
                 *request_mode != NetTraitsRequestMode::SameOrigin
             {
@@ -535,9 +535,9 @@ impl Request {
         }
 
         // Step 42. Set this’s request’s body to finalBody.
-        r.request.borrow_mut().body = final_body;
+        request.request.borrow_mut().body = final_body;
 
-        Ok(r)
+        Ok(request)
     }
 
     /// <https://fetch.spec.whatwg.org/#concept-request-clone>
@@ -550,7 +550,7 @@ impl Request {
         let mut new_req_inner = req.clone();
         let body = new_req_inner.body.take();
 
-        let r_clone = Request::new(&r.global(), None, url, CanGc::from_cx(cx));
+        let r_clone = Request::new(cx, &r.global(), None, url);
         *r_clone.request.borrow_mut() = new_req_inner;
 
         // Step 2. If request’s body is non-null, set newRequest’s body
@@ -559,7 +559,7 @@ impl Request {
             r_clone.request.borrow_mut().body = Some(body);
         }
 
-        r_clone.Headers(cx).copy_from_headers(r.Headers(cx))?;
+        r_clone.Headers(cx).copy_from_headers(&r.Headers(cx))?;
         r_clone.Headers(cx).set_guard(headers_guard);
 
         clone_body_stream_for_dom_body(cx, &r.body_stream, &r_clone.body_stream)?;
@@ -568,8 +568,8 @@ impl Request {
         Ok(r_clone)
     }
 
-    pub(crate) fn get_request(&self) -> NetTraitsRequest {
-        self.request.borrow().clone()
+    pub(crate) fn request(&self) -> Ref<'_, NetTraitsRequest> {
+        self.request.borrow()
     }
 }
 
@@ -617,9 +617,9 @@ impl RequestMethods<crate::DomTypeHolder> for Request {
         global: &GlobalScope,
         proto: Option<HandleObject>,
         input: RequestInfo,
-        init: RootedTraceableBox<RequestInit>,
+        init: &RequestInit,
     ) -> Fallible<DomRoot<Request>> {
-        Self::constructor(cx, global, proto, input, &init)
+        Self::constructor(cx, global, proto, input, init)
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-request-method>
@@ -636,8 +636,7 @@ impl RequestMethods<crate::DomTypeHolder> for Request {
 
     /// <https://fetch.spec.whatwg.org/#dom-request-headers>
     fn Headers(&self, cx: &mut js::context::JSContext) -> DomRoot<Headers> {
-        self.headers
-            .or_init(|| Headers::new(&self.global(), CanGc::from_cx(cx)))
+        self.headers.or_init(|| Headers::new(cx, &self.global()))
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-request-destination>
@@ -649,7 +648,7 @@ impl RequestMethods<crate::DomTypeHolder> for Request {
     fn Referrer(&self) -> USVString {
         let r = self.request.borrow();
         USVString(match r.referrer {
-            Referrer::NoReferrer => String::from(""),
+            Referrer::NoReferrer => String::new(),
             Referrer::Client(_) => String::from("about:client"),
             Referrer::ReferrerUrl(ref u) => {
                 let u_c = u.clone();
@@ -691,9 +690,27 @@ impl RequestMethods<crate::DomTypeHolder> for Request {
         self.request.borrow().integrity_metadata.clone().into()
     }
 
+    /// <https://fetch.spec.whatwg.org/#dom-request-duplex>
+    fn Duplex(&self) -> RequestDuplex {
+        // “The duplex getter steps are to return "half".”
+        RequestDuplex::Half
+    }
+
     /// <https://fetch.spec.whatwg.org/#dom-request-keepalive>
     fn Keepalive(&self) -> bool {
         self.request.borrow().keep_alive
+    }
+
+    /// <https://fetch.spec.whatwg.org/#dom-request-isreloadnavigation>
+    /// The isReloadNavigation getter steps are to return true if this’s request’s reload-navigation flag is set; otherwise false.
+    fn IsReloadNavigation(&self) -> bool {
+        self.request.borrow().reload_navigation
+    }
+
+    /// <https://fetch.spec.whatwg.org/#dom-request-ishistorynavigation>
+    // The isHistoryNavigation getter steps are to return true if this’s request’s history-navigation flag is set; otherwise false.
+    fn IsHistoryNavigation(&self) -> bool {
+        self.request.borrow().history_navigation
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-body-body>
@@ -738,32 +755,32 @@ impl RequestMethods<crate::DomTypeHolder> for Request {
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-body-text>
-    fn Text(&self, cx: &mut js::context::JSContext) -> Rc<Promise> {
+    fn Text(&self, cx: &mut js::context::JSContext) -> RootedPromise {
         consume_body(cx, self, BodyType::Text)
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-body-blob>
-    fn Blob(&self, cx: &mut js::context::JSContext) -> Rc<Promise> {
+    fn Blob(&self, cx: &mut js::context::JSContext) -> RootedPromise {
         consume_body(cx, self, BodyType::Blob)
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-body-formdata>
-    fn FormData(&self, cx: &mut js::context::JSContext) -> Rc<Promise> {
+    fn FormData(&self, cx: &mut js::context::JSContext) -> RootedPromise {
         consume_body(cx, self, BodyType::FormData)
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-body-json>
-    fn Json(&self, cx: &mut js::context::JSContext) -> Rc<Promise> {
+    fn Json(&self, cx: &mut js::context::JSContext) -> RootedPromise {
         consume_body(cx, self, BodyType::Json)
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-body-arraybuffer>
-    fn ArrayBuffer(&self, cx: &mut js::context::JSContext) -> Rc<Promise> {
+    fn ArrayBuffer(&self, cx: &mut js::context::JSContext) -> RootedPromise {
         consume_body(cx, self, BodyType::ArrayBuffer)
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-body-bytes>
-    fn Bytes(&self, cx: &mut js::context::JSContext) -> Rc<Promise> {
+    fn Bytes(&self, cx: &mut js::context::JSContext) -> RootedPromise {
         consume_body(cx, self, BodyType::Bytes)
     }
 
@@ -862,6 +879,7 @@ impl Convert<Destination> for RequestDestination {
             RequestDestination::Script => Destination::Script,
             RequestDestination::Sharedworker => Destination::SharedWorker,
             RequestDestination::Style => Destination::Style,
+            RequestDestination::Text => Destination::Text,
             RequestDestination::Track => Destination::Track,
             RequestDestination::Video => Destination::Video,
             RequestDestination::Worker => Destination::Worker,
@@ -891,6 +909,7 @@ impl Convert<RequestDestination> for Destination {
             },
             Destination::SharedWorker => RequestDestination::Sharedworker,
             Destination::Style => RequestDestination::Style,
+            Destination::Text => RequestDestination::Text,
             Destination::Track => RequestDestination::Track,
             Destination::Video => RequestDestination::Video,
             Destination::Worker => RequestDestination::Worker,

@@ -20,6 +20,7 @@ name = "script_bindings"
 path = "lib.rs"
 
 [dependencies]
+atomic_refcell = { workspace = true }
 bitflags = { workspace = true }
 crossbeam-channel = { workspace = true }
 deny_public_fields = { workspace = true }
@@ -39,11 +40,15 @@ parking_lot = { workspace = true }
 phf = { workspace = true }
 profile_traits = { workspace = true }
 regex = { workspace = true }
+rustc-hash = { workspace = true }
+serde = { workspace = true }
 servo-base = { workspace = true }
 servo-config = { workspace = true }
+servo-constellation-traits = { workspace = true }
 servo-url = { workspace = true }
 servo_arc = { workspace = true }
 smallvec = { workspace = true }
+strum = { workspace = true }
 stylo = { workspace = true }
 stylo_atoms = { workspace = true }
 tendril = { workspace = true }
@@ -57,14 +62,23 @@ phf_codegen = { workspace = true }
 phf_shared = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "dom_partial_eq"
+path = "benches/dom_partial_eq.rs"
+harness = false
+
 [features]
 bluetooth = []
 gamepad = []
 testbinding = []
 tracing = ["dep:tracing"]
+webcrypto = []
 webgpu = []
-webxr = ["webxr-api"]
+webgl = []
+webxr = ["gamepad", "webgl", "webxr-api"]
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(crown)'] }
-unsafe_op_in_unsafe_fn = { level = "allow" }
+[lints]
+workspace = true

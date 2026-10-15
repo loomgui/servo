@@ -10,7 +10,7 @@ use dom_struct::dom_struct;
 use euclid::Size2D;
 use js::context::JSContext;
 use script_bindings::cell::DomRefCell;
-use script_bindings::reflector::reflect_dom_object_with_cx;
+use script_bindings::reflector::reflect_dom_object;
 use script_bindings::weakref::WeakRef;
 use servo_canvas_traits::webgl::{
     WebGLCommand, WebGLError, WebGLFramebufferBindingRequest, WebGLFramebufferId,
@@ -144,7 +144,7 @@ impl Drop for DroppableWebGLFramebuffer {
     }
 }
 
-#[dom_struct(associated_memory)] // actual memory usage is reported in WebGLFramebufferAttachment
+#[dom_struct]
 pub(crate) struct WebGLFramebuffer {
     webgl_object: WebGLObject,
     #[no_trace]
@@ -158,7 +158,7 @@ pub(crate) struct WebGLFramebuffer {
     depth: DomRefCell<Option<WebGLFramebufferAttachment>>,
     stencil: DomRefCell<Option<WebGLFramebufferAttachment>>,
     depthstencil: DomRefCell<Option<WebGLFramebufferAttachment>>,
-    color_read_buffer: DomRefCell<u32>,
+    color_read_buffer: Cell<u32>,
     color_draw_buffers: DomRefCell<Vec<u32>>,
     is_initialized: Cell<bool>,
     // Framebuffers for XR keep a reference to the XR session.
@@ -180,7 +180,7 @@ impl WebGLFramebuffer {
             depth: DomRefCell::new(None),
             stencil: DomRefCell::new(None),
             depthstencil: DomRefCell::new(None),
-            color_read_buffer: DomRefCell::new(constants::COLOR_ATTACHMENT0),
+            color_read_buffer: Cell::new(constants::COLOR_ATTACHMENT0),
             color_draw_buffers: DomRefCell::new(vec![constants::COLOR_ATTACHMENT0]),
             is_initialized: Cell::new(false),
             #[cfg(feature = "webxr")]
@@ -221,10 +221,10 @@ impl WebGLFramebuffer {
         context: &WebGLRenderingContext,
         id: WebGLFramebufferId,
     ) -> DomRoot<Self> {
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(WebGLFramebuffer::new_inherited(context, id)),
             &*context.global(),
-            cx,
         )
     }
 }
@@ -1029,7 +1029,7 @@ impl WebGLFramebuffer {
             _ => return Err(WebGLError::InvalidOperation),
         };
 
-        *self.color_read_buffer.borrow_mut() = buffer;
+        self.color_read_buffer.set(buffer);
         context.send_command(WebGLCommand::ReadBuffer(buffer));
         Ok(())
     }
@@ -1063,7 +1063,7 @@ impl WebGLFramebuffer {
     }
 
     pub(crate) fn read_buffer(&self) -> u32 {
-        *self.color_read_buffer.borrow()
+        self.color_read_buffer.get()
     }
 
     pub(crate) fn draw_buffer_i(&self, index: usize) -> u32 {

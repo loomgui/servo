@@ -38,7 +38,7 @@ use js::context::JSContext;
 pub(crate) use js::conversions::{
     ConversionBehavior, ConversionResult, FromJSValConvertible, ToJSValConvertible,
 };
-use js::jsapi::{JSContext as RawJSContext, JSObject};
+use js::jsapi::JSObject;
 use js::jsval::UndefinedValue;
 use js::rust::wrappers2::JS_GetProperty;
 use js::rust::{HandleObject, MutableHandleValue};
@@ -63,13 +63,13 @@ where
 
 /// Get a `DomRoot<T>` for a DOM object accessible from a `HandleObject`.
 pub(crate) fn root_from_handleobject<T>(
+    cx: &mut JSContext,
     obj: HandleObject,
-    cx: *mut RawJSContext,
 ) -> Result<DomRoot<T>, ()>
 where
     T: DomObject + IDLInterface,
 {
-    unsafe { root_from_object(obj.get(), cx) }
+    unsafe { root_from_object(cx, obj.get()) }
 }
 
 /// Get a property from a JS object.
@@ -103,7 +103,7 @@ where
         return Ok(None);
     }
 
-    let value = T::safe_from_jsval(cx, result.handle(), option);
+    let value = T::from_jsval(cx, result.handle(), option);
     match value {
         Ok(ConversionResult::Success(value)) => Ok(Some(value)),
         Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into_owned())),

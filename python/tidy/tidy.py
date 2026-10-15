@@ -38,9 +38,12 @@ WPT_CONFIG_INI_PATH = os.path.join(WPT_PATH, "config.ini")
 # regex source https://stackoverflow.com/questions/6883049/
 URL_REGEX = re.compile(rb"https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+")
 UTF8_URL_REGEX = re.compile(r"https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+")
+ERROR_REGEX = re.compile(r"Error::\w+\(None\)")
 CARGO_LOCK_FILE = os.path.join(TOPDIR, "Cargo.lock")
 CARGO_DENY_CONFIG_FILE = os.path.join(TOPDIR, "deny.toml")
 ROOT_CARGO_TOML = os.path.join(TOPDIR, "Cargo.toml")
+
+ERROR_CRATES_TO_CHECK = ["script", "script_bindings", "script_webgpu"]
 
 ERROR_RAW_URL_IN_RUSTDOC = "Found raw link in rustdoc. Please escape it with angle brackets or use a markdown link."
 
@@ -116,7 +119,6 @@ WEBIDL_STANDARDS = [
     b"//developer.mozilla.org/en-US/docs/Web/API",
     b"//dev.w3.org/2006/webapi",
     b"//dev.w3.org/csswg",
-    b"//dev.w3.org/fxtf",
     b"//dvcs.w3.org/hg",
     b"//www.w3.org/TR/trusted-types/",
     b"//www.w3.org/TR/credential-management",
@@ -124,7 +126,6 @@ WEBIDL_STANDARDS = [
     b"//dom.spec.whatwg.org",
     b"//drafts.csswg.org",
     b"//drafts.css-houdini.org",
-    b"//drafts.fxtf.org",
     b"//console.spec.whatwg.org",
     b"//encoding.spec.whatwg.org",
     b"//fetch.spec.whatwg.org",
@@ -501,7 +502,18 @@ def run_cargo_deny_lints() -> Iterator[tuple[str, int, str]]:
 
     errors = []
     for line in result.stderr.splitlines():
-        error_fields = json.loads(str(line))["fields"]
+        line = str(line)
+        # Ignore empty lines. This is only relevant when `cargo-deny` crashed and we need to below print
+        # what the corrupt line is.
+        if not line.strip():
+            continue
+        try:
+            error_fields = json.loads(line)["fields"]
+        except json.JSONDecodeError as e:
+            # This can happen when `cargo-deny` crashes itself and doesn't produce any output
+            # If we don't catch the exception, we would get no output at all to debug the failure.
+            print(f"Failed to decode {line} as JSON")
+            raise e
         error_code = error_fields.get("code", "unknown")
         error_severity = error_fields.get("severity", "unknown")
         message = error_fields.get("message", "")
@@ -552,6 +564,7 @@ def check_toml(file_name: str, lines: list[bytes]) -> Iterator[tuple[int, str]]:
     if not file_name.endswith("Cargo.toml"):
         return
     ok_licensed = False
+    lints_inherited = False
     decoded_lines = [line.decode("utf-8") for line in lines]
     for idx, line in enumerate(decoded_lines):
         if idx == 0 and "[workspace]" in line:
@@ -563,8 +576,18 @@ def check_toml(file_name: str, lines: list[bytes]) -> Iterator[tuple[int, str]]:
             ok_licensed |= license_line in line
         if "license.workspace" in line:
             ok_licensed = True
+        if "[lints]" in line and len(decoded_lines) > idx + 1 and decoded_lines[idx + 1].startswith("workspace = true"):
+            lints_inherited = True
     if not ok_licensed:
         yield (0, ".toml file should contain a valid license.")
+    if (
+        not any(file_name.startswith(folder) for folder in ["./support/crown/", "./ffi/capi/"])
+        # Required for the tests of tidy itself, where we don't want to lint any of the `Cargo.toml`
+        # except for the `Cargo.toml` for this specific check, which are in `lints-configuration/`.
+        and ("/tests/" not in file_name or "lints-configuration" in file_name)
+        and not lints_inherited
+    ):
+        yield (0, ".toml file should turn on lints from workspace.")
 
     normalized_file_name = os.path.abspath(file_name)
     if normalized_file_name != ROOT_CARGO_TOML:
@@ -722,7 +745,7 @@ def check_shell(file_name: str, lines: list[bytes]) -> Iterator[tuple[int, str]]
         yield (line, f"shellcheck SC{code}: {message}")
 
 
-def check_rust(file_name: str, lines: list[bytes]) -> Iterator[tuple[int, str]]:
+def check_rust(file_name: str, lines: list[bytes], error_exceptions: dict[Any, int] = {}) -> Iterator[tuple[int, str]]:
     if (
         not file_name.endswith(".rs")
         or file_name.endswith(".mako.rs")
@@ -730,6 +753,9 @@ def check_rust(file_name: str, lines: list[bytes]) -> Iterator[tuple[int, str]]:
         or file_name.endswith(os.path.join("unit", "style", "stylesheets.rs"))
     ):
         return
+
+    errors_without_messages = 0
+    check_errors = any([f"/{crate}/" in file_name for crate in ERROR_CRATES_TO_CHECK])
 
     for idx, line in enumerate(map(lambda line: line.decode("utf-8"), lines)):
         for match in re.finditer(r"(;|\s|^)//\w", line):
@@ -751,6 +777,23 @@ def check_rust(file_name: str, lines: list[bytes]) -> Iterator[tuple[int, str]]:
         for pattern, message in rules:
             for match in re.finditer(pattern, line):
                 yield (idx + 1, message.format(*match.groups(), **match.groupdict()))
+
+        if check_errors and re.search(ERROR_REGEX, line):
+            errors_without_messages += 1
+
+    allowed_exceptions = error_exceptions.get(file_name, 0)
+    if errors_without_messages > allowed_exceptions:
+        new_uses = errors_without_messages - allowed_exceptions
+        yield (
+            0,
+            f"{new_uses} new uses of Error enum without error messages; please add missing error messages.",
+        )
+    elif errors_without_messages < allowed_exceptions:
+        yield (
+            0,
+            "Uses of Error enum without error messages is lower than allowed exceptions; great job! "
+            f"Please reduce allowed exceptions in error_message_exceptions.txt to {errors_without_messages}.",
+        )
 
 
 def check_webidl_spec(file_name: str, contents: bytes) -> Iterator[tuple[int, str]]:
@@ -1066,13 +1109,18 @@ def scan(only_changed_files: bool = False, progress: bool = False, github_annota
     directory_errors = check_directory_files(config["check_ext"])
     # standard checks
     files_to_check = filter_files(".", only_changed_files, progress)
+    error_message_exceptions = {}
+    with open(os.path.join(os.path.dirname(__file__), "error_message_exceptions.txt")) as f:
+        for line in f.readlines():
+            (path, allowed) = line.split(" ")
+            error_message_exceptions[path] = int(allowed)
     checking_functions: tuple[CheckingFunction, ...] = (check_webidl_spec,)
     line_checking_functions: tuple[LineCheckingFunction, ...] = (
         check_license,
         check_by_line,
         check_toml,
         check_shell,
-        check_rust,
+        lambda file_name, lines: check_rust(file_name, lines, error_message_exceptions),
         check_spec,
         check_modeline,
         check_feature_annotation,
@@ -1086,7 +1134,13 @@ def scan(only_changed_files: bool = False, progress: bool = False, github_annota
 
     # chain all the iterators
     errors = itertools.chain(
-        config_errors, directory_errors, file_errors, python_errors, python_type_check, wpt_errors, cargo_lock_errors
+        config_errors,
+        directory_errors,
+        file_errors,
+        python_errors,
+        python_type_check,
+        wpt_errors,
+        cargo_lock_errors,
     )
 
     colorama.init()

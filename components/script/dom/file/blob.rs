@@ -7,22 +7,25 @@ use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use encoding_rs::UTF_8;
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use js::jsapi::JSObject;
 use js::realm::CurrentRealm;
 use js::rust::HandleObject;
 use js::typedarray::{ArrayBufferU8, Uint8};
 use net_traits::filemanager_thread::RelativePos;
 use rustc_hash::FxHashMap;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto_and_cx};
+use script_bindings::reflector::{Reflector, reflect_weak_referenceable_dom_object_with_proto};
 use servo_base::id::{BlobId, BlobIndex};
 use servo_constellation_traits::{BlobData, BlobImpl};
 use uuid::Uuid;
 
-use crate::dom::bindings::buffer_source::create_buffer_source;
+use crate::dom::RootedPromise;
+use crate::dom::bindings::buffer_source::{create_buffer_source, get_buffer_source_slice};
 use crate::dom::bindings::codegen::Bindings::BlobBinding;
 use crate::dom::bindings::codegen::Bindings::BlobBinding::BlobMethods;
-use crate::dom::bindings::codegen::UnionTypes::ArrayBufferOrArrayBufferViewOrBlobOrString;
+use crate::dom::bindings::codegen::UnionTypes::{
+    ArrayBufferOrArrayBufferViewOrBlobOrString, ArrayBufferViewOrArrayBuffer,
+};
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
@@ -33,7 +36,6 @@ use crate::dom::encoding::textdecoderstream::TextDecoderStream;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 use crate::dom::stream::readablestream::{ReadableStream, pipe_through};
-use crate::script_runtime::CanGc;
 
 /// <https://w3c.github.io/FileAPI/#dfn-Blob>
 #[dom_struct]
@@ -58,11 +60,11 @@ impl Blob {
         proto: Option<HandleObject>,
         blob_impl: BlobImpl,
     ) -> DomRoot<Blob> {
-        let dom_blob = reflect_dom_object_with_proto_and_cx(
-            Box::new(Blob::new_inherited(&blob_impl)),
+        let dom_blob = reflect_weak_referenceable_dom_object_with_proto(
+            cx,
+            Rc::new(Blob::new_inherited(&blob_impl)),
             global,
             proto,
-            cx,
         );
         global.track_blob(&dom_blob, blob_impl);
         dom_blob
@@ -102,7 +104,7 @@ impl Serializable for Blob {
     type Data = BlobImpl;
 
     /// <https://w3c.github.io/FileAPI/#ref-for-serialization-steps>
-    fn serialize(&self) -> Result<(BlobId, BlobImpl), ()> {
+    fn serialize(&self, _no_gc: &NoGC) -> Result<(BlobId, BlobImpl), ()> {
         let blob_id = self.blob_id;
 
         // 1. Get a clone of the blob impl.
@@ -199,15 +201,15 @@ fn convert_line_endings_to_native(s: &[u8]) -> Vec<u8> {
 }
 
 /// <https://w3c.github.io/FileAPI/#process-blob-parts>
-#[expect(unsafe_code)]
 pub(crate) fn process_blob_parts(
-    mut blobparts: Vec<ArrayBufferOrArrayBufferViewOrBlobOrString>,
+    no_gc: &NoGC,
+    blobparts: Vec<ArrayBufferOrArrayBufferViewOrBlobOrString>,
     endings: BlobBinding::EndingType,
 ) -> Result<Vec<u8>, ()> {
     // Step 1. Let bytes be an empty sequence of bytes.
     let mut bytes = vec![];
     // Step 2. For each blobpart in blobparts:
-    for blobpart in &mut blobparts {
+    for blobpart in blobparts {
         match blobpart {
             // Step 2.1. If blobpart is a USVString, run the following substeps:
             ArrayBufferOrArrayBufferViewOrBlobOrString::String(s) => {
@@ -226,13 +228,13 @@ pub(crate) fn process_blob_parts(
             // Step 2.2. If element is a BufferSource,
             // get a copy of the bytes held by the buffer source,
             // and append those bytes to bytes.
-            ArrayBufferOrArrayBufferViewOrBlobOrString::ArrayBuffer(a) => unsafe {
-                let array_bytes = a.as_slice();
-                bytes.extend(array_bytes);
+            ArrayBufferOrArrayBufferViewOrBlobOrString::ArrayBuffer(a) => {
+                let array_buffer = ArrayBufferViewOrArrayBuffer::ArrayBuffer(a);
+                bytes.extend_from_slice(get_buffer_source_slice(&array_buffer, no_gc));
             },
-            ArrayBufferOrArrayBufferViewOrBlobOrString::ArrayBufferView(a) => unsafe {
-                let view_bytes = a.as_slice();
-                bytes.extend(view_bytes);
+            ArrayBufferOrArrayBufferViewOrBlobOrString::ArrayBufferView(a) => {
+                let array_view = ArrayBufferViewOrArrayBuffer::ArrayBufferView(a);
+                bytes.extend_from_slice(get_buffer_source_slice(&array_view, no_gc));
             },
             // Step 2.3. If element is a Blob, append the bytes it represents to bytes.
             ArrayBufferOrArrayBufferViewOrBlobOrString::Blob(b) => {
@@ -258,9 +260,11 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
     ) -> Fallible<DomRoot<Blob>> {
         let bytes: Vec<u8> = match blobParts {
             None => Vec::new(),
-            Some(blobparts) => match process_blob_parts(blobparts, blobPropertyBag.endings) {
-                Ok(bytes) => bytes,
-                Err(_) => return Err(Error::InvalidCharacter(None)),
+            Some(blobparts) => {
+                match process_blob_parts(cx.no_gc(), blobparts, blobPropertyBag.endings) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return Err(Error::InvalidCharacter(None)),
+                }
             },
         };
 
@@ -332,13 +336,13 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
     }
 
     /// <https://w3c.github.io/FileAPI/#text-method-algo>
-    fn Text(&self, cx: &mut CurrentRealm) -> Rc<Promise> {
+    fn Text(&self, cx: &mut CurrentRealm) -> RootedPromise {
         let global = self.global();
         let p = Promise::new_in_realm(cx);
         let id = self.get_blob_url_id();
         global.read_file_async(
             id,
-            p.clone(),
+            &p,
             Box::new(|cx, promise, bytes| match bytes {
                 Ok(b) => {
                     let (text, _) = UTF_8.decode_with_bom_removal(&b);
@@ -354,7 +358,7 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
     }
 
     /// <https://w3c.github.io/FileAPI/#arraybuffer-method-algo>
-    fn ArrayBuffer(&self, cx: &mut CurrentRealm) -> Rc<Promise> {
+    fn ArrayBuffer(&self, cx: &mut CurrentRealm) -> RootedPromise {
         let promise = Promise::new_in_realm(cx);
 
         // 1. Let stream be the result of calling get stream on this.
@@ -379,13 +383,9 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
                 rooted!(&in(cx) let mut js_object = ptr::null_mut::<JSObject>());
                 // 4. Return the result of transforming promise by a fulfillment handler that returns a new
                 //    [ArrayBuffer]
-                let array_buffer = create_buffer_source::<ArrayBufferU8>(
-                    cx.into(),
-                    bytes,
-                    js_object.handle_mut(),
-                    CanGc::from_cx(cx),
-                )
-                .expect("Converting input to ArrayBufferU8 should never fail");
+                let array_buffer =
+                    create_buffer_source::<ArrayBufferU8>(cx, bytes, js_object.handle_mut())
+                        .expect("Converting input to ArrayBufferU8 should never fail");
                 success_promise.resolve_native(cx, &array_buffer);
             }),
             Rc::new(move |cx, value| {
@@ -397,7 +397,7 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
     }
 
     /// <https://w3c.github.io/FileAPI/#dom-blob-bytes>
-    fn Bytes(&self, cx: &mut CurrentRealm) -> Rc<Promise> {
+    fn Bytes(&self, cx: &mut CurrentRealm) -> RootedPromise {
         let p = Promise::new_in_realm(cx);
 
         // 1. Let stream be the result of calling get stream on this.
@@ -420,13 +420,8 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
             cx,
             Rc::new(move |cx, bytes| {
                 rooted!(&in(cx) let mut js_object = ptr::null_mut::<JSObject>());
-                let arr = create_buffer_source::<Uint8>(
-                    cx.into(),
-                    bytes,
-                    js_object.handle_mut(),
-                    CanGc::from_cx(cx),
-                )
-                .expect("Converting input to uint8 array should never fail");
+                let arr = create_buffer_source::<Uint8>(cx, bytes, js_object.handle_mut())
+                    .expect("Converting input to uint8 array should never fail");
                 p_success.resolve_native(cx, &arr);
             }),
             Rc::new(move |cx, v| {
@@ -447,9 +442,9 @@ pub(crate) fn normalize_type_string(s: &str) -> String {
         s.to_ascii_lowercase()
         // match s_lower.parse() as Result<Mime, ()> {
         // Ok(_) => s_lower,
-        // Err(_) => "".to_string()
+        // Err(_) => String::new()
     } else {
-        "".to_string()
+        String::new()
     }
 }
 

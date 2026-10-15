@@ -2,13 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::rc::Rc;
-
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::rust::HandleObject;
+use script_bindings::callback::RootedCallback;
 use script_bindings::codegen::GenericBindings::WindowBinding::WindowMethods;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto_and_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 
 use crate::dom::bindings::codegen::Bindings::XPathEvaluatorBinding::XPathEvaluatorMethods;
 use crate::dom::bindings::codegen::Bindings::XPathNSResolverBinding::XPathNSResolver;
@@ -40,11 +39,11 @@ impl XPathEvaluator {
         window: &Window,
         proto: Option<HandleObject>,
     ) -> DomRoot<XPathEvaluator> {
-        reflect_dom_object_with_proto_and_cx(
+        reflect_dom_object_with_proto(
+            cx,
             Box::new(XPathEvaluator::new_inherited(window)),
             window,
             proto,
-            cx,
         )
     }
 }
@@ -64,7 +63,7 @@ impl XPathEvaluatorMethods<crate::DomTypeHolder> for XPathEvaluator {
         &self,
         cx: &mut JSContext,
         expression: DOMString,
-        resolver: Option<Rc<XPathNSResolver>>,
+        resolver: Option<RootedCallback<XPathNSResolver>>,
     ) -> Fallible<DomRoot<XPathExpression>> {
         let parsed_expression = parse_expression(
             cx,
@@ -92,7 +91,7 @@ impl XPathEvaluatorMethods<crate::DomTypeHolder> for XPathEvaluator {
         cx: &mut JSContext,
         expression: DOMString,
         context_node: &Node,
-        resolver: Option<Rc<XPathNSResolver>>,
+        resolver: Option<RootedCallback<XPathNSResolver>>,
         result_type: u16,
         result: Option<&XPathResult>,
     ) -> Fallible<DomRoot<XPathResult>> {

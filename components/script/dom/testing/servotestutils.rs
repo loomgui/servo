@@ -6,18 +6,19 @@
 
 use backtrace::Backtrace;
 use dom_struct::dom_struct;
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use layout_api::ReflowPhasesRun;
 use script_bindings::codegen::GenericBindings::WindowBinding::WindowMethods;
 use script_bindings::domstring::DOMString;
 use script_bindings::reflector::Reflector;
 use script_bindings::root::DomRoot;
-use script_bindings::script_runtime::CanGc;
+use servo_base::Epoch;
 use time::Duration;
 
 use crate::dom::bindings::codegen::Bindings::ServoTestUtilsBinding::ServoTestUtilsMethods;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::layoutresult::LayoutResult;
+use crate::dom::types::AccessibilityUpdateResult;
 
 #[dom_struct]
 pub(crate) struct ServoTestUtils {
@@ -25,10 +26,10 @@ pub(crate) struct ServoTestUtils {
 }
 
 impl ServoTestUtilsMethods<crate::DomTypeHolder> for ServoTestUtils {
-    fn AdvanceClock(global: &GlobalScope, ms: i32) {
+    fn AdvanceClock(no_gc: &NoGC, global: &GlobalScope, ms: i32) {
         global
             .as_window()
-            .advance_animation_clock(Duration::milliseconds(ms as i64));
+            .advance_animation_clock(no_gc, Duration::milliseconds(ms as i64));
     }
 
     #[expect(unsafe_code)]
@@ -41,28 +42,28 @@ impl ServoTestUtilsMethods<crate::DomTypeHolder> for ServoTestUtils {
 
         let mut phases = Vec::new();
         if phases_run.contains(ReflowPhasesRun::RanLayout) {
-            phases.push(DOMString::from("RanLayout"))
+            phases.push(DOMString::from_static("RanLayout"))
         }
         if phases_run.contains(ReflowPhasesRun::BuiltStackingContextTree) {
-            phases.push(DOMString::from("BuiltStackingContextTree"))
+            phases.push(DOMString::from_static("BuiltStackingContextTree"))
         }
         if phases_run.contains(ReflowPhasesRun::BuiltDisplayList) {
-            phases.push(DOMString::from("BuiltDisplayList"))
+            phases.push(DOMString::from_static("BuiltDisplayList"))
         }
         if phases_run.contains(ReflowPhasesRun::UpdatedScrollNodeOffset) {
-            phases.push(DOMString::from("UpdatedScrollNodeOffset"))
+            phases.push(DOMString::from_static("UpdatedScrollNodeOffset"))
         }
         if phases_run.contains(ReflowPhasesRun::UpdatedImageData) {
-            phases.push(DOMString::from("UpdatedImageData"))
+            phases.push(DOMString::from_static("UpdatedImageData"))
         }
 
         LayoutResult::new(
+            cx,
             global,
             phases,
             statistics.rebuilt_fragment_count,
             statistics.restyle_fragment_count,
             statistics.only_descendants_changed_count,
-            CanGc::from_cx(cx),
         )
     }
 
@@ -76,9 +77,28 @@ impl ServoTestUtilsMethods<crate::DomTypeHolder> for ServoTestUtils {
         panic!("explicit panic from script")
     }
 
-    fn ForceAccessibilityUpdate(cx: &mut JSContext, global: &GlobalScope) {
+    fn EnsureAccessibilityActive(global: &GlobalScope) {
         let window = global.as_window();
-        window.layout().set_needs_accessibility_update();
-        let _ = window.Document().update_the_rendering(cx);
+        window
+            .layout()
+            .set_accessibility_active(true, Epoch::default());
+    }
+
+    fn ForceAccessibilityUpdate(
+        cx: &mut JSContext,
+        global: &GlobalScope,
+    ) -> DomRoot<AccessibilityUpdateResult> {
+        let window = global.as_window();
+        window.layout().set_force_accessibility_update();
+        let (_, statistics) = window.Document().update_the_rendering(cx);
+
+        AccessibilityUpdateResult::new(
+            cx,
+            global,
+            statistics.nodes_updated_from_dom,
+            statistics.nodes_updated_from_tree,
+            statistics.nodes_updated_bounds,
+            statistics.nodes_in_tree_update,
+        )
     }
 }

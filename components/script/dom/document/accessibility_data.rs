@@ -3,19 +3,26 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use js::context::NoGC;
-use rustc_hash::FxHashSet;
+use layout_api::{AccessibilityDamage, TrustedNodeAddress};
+use rustc_hash::{FxHashMap, FxHashSet};
+use script_bindings::cell::DomRefCell;
 use script_bindings::root::Dom;
 use servo_config::pref;
 use style::dom::OpaqueNode;
 
 use crate::dom::Node;
+use crate::dom::bindings::trace::NoTrace;
 
 #[derive(Clone, Default, JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub(crate) struct AccessibilityData {
-    /// Nodes which have been unbound from the DOM but may not yet have been removed from the
+    /// Nodes which have been removed from the DOM but may not yet have been removed from the
     /// accessibility tree. This is cleared after each reflow.
     rooted_nodes: FxHashSet<Dom<Node>>,
+
+    /// Damage to the accessibility tree as a result of DOM mutations. This is drained and sent to
+    /// the accessibility tree during reflow.
+    pending_damage: DomRefCell<FxHashMap<Dom<Node>, NoTrace<AccessibilityDamage>>>,
 }
 
 impl AccessibilityData {
@@ -37,6 +44,9 @@ impl AccessibilityData {
     ///   it's kept alive by strong references in its parent, child and/or sibling [`Node`]s (and in
     ///   the case of the document itself, by a strong reference in the [`Window`]). See
     ///   [`Node::first_child`], [`Node::next_sibling`], etc.
+    ///    - Note that this means we only need to root nodes which are removed from the document,
+    ///      and not their descendants, as descendant nodes will still be rooted via these
+    ///      properties as long as the subtree root is stored here.
     /// - After a node is removed from the tree, those strong references are removed, and it _may_
     ///   become a candidate for GC if its DOM object isn't held (directly or indirectly) in script
     ///   and it isn't immediately inserted elsewhere in the DOM.
@@ -75,5 +85,29 @@ impl AccessibilityData {
     /// This should only be called during reflow.
     pub(crate) fn unroot_all_removed_nodes(&mut self) {
         self.rooted_nodes.clear();
+    }
+
+    /// Track accessibility damage to the given node caused by mutations in the DOM tree.
+    pub(crate) fn add_pending_accessibility_damage_for_node(
+        &self,
+        node: &Node,
+        damage: AccessibilityDamage,
+    ) {
+        assert!(pref!(accessibility_enabled));
+
+        let map = &mut self.pending_damage.borrow_mut();
+        let pending_damage = map.entry(Dom::from_ref(node)).or_default();
+        pending_damage.0 |= damage;
+    }
+
+    /// Drain all pending accessibility damage so that it can be passed to the accessibility tree.
+    pub(crate) fn drain_pending_accessibility_damage(
+        &mut self,
+    ) -> Vec<(TrustedNodeAddress, AccessibilityDamage)> {
+        let pending_damage = &mut self.pending_damage.borrow_mut();
+        pending_damage
+            .drain()
+            .map(|(node, damage)| (node.to_trusted_node_address(), damage.0))
+            .collect()
     }
 }

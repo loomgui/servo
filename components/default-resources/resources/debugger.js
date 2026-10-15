@@ -7,7 +7,7 @@ const debuggeesToPipelineIds = new Map;
 const debuggeesToWorkerIds = new Map;
 const sourceIdsToScripts = new Map;
 const frameActorsToFrames = new Map;
-const environmentActorsToEnvironments = new Map;
+const objectActorsToObjects = new Map;
 const environmentsToEnvironmentActors = new Map;
 const blackboxing = new Map;
 let suspendedFrame = null;
@@ -45,6 +45,16 @@ function walkScriptTree(script, callback) {
 function findKeyByValue(map, search) {
     for (const [key, value] of map) {
         if (value === search) return key;
+    }
+    return undefined;
+}
+
+// The === operator isn't really applicable to pipelineId
+function findDebuggeeByPipelineId(search) {
+    for (const [key, value] of debuggeesToPipelineIds) {
+        if (value.namespaceId == search.namespaceId && value.index == search.index) {
+            return key;
+        }
     }
     return undefined;
 }
@@ -112,6 +122,7 @@ function createValueGrip(value, depth) {
             }
             // TODO: handle typed arrays and storage independently
             const ownPropertyLength = value.getOwnPropertyNamesLength();
+            let objectActorId = findKeyByValue(objectActorsToObjects, value);
             const objectValue = {
                 class: value.class,
                 ownPropertyLength: Number.isFinite(ownPropertyLength) ? ownPropertyLength : undefined,
@@ -119,9 +130,21 @@ function createValueGrip(value, depth) {
             // Debugger.Object - get preview using registered previewers
             // <https://firefox-source-docs.mozilla.org/devtools-user/debugger-api/debugger.object/index.html>
             const preview = getPreview(value, depth + 1);
-            if (preview) {
-                objectValue.preview = preview;
+            if (!preview) {
+                // Reusing an actor with a stored preview can cause recursion, we should handle it properly at some point.
+                return { ObjectValue: objectValue };
             }
+            objectValue.preview = preview;
+
+            if (!objectActorId) {
+                objectActorId = registerObjectActor(JSON.stringify({ ObjectValue: objectValue }));
+                if (!objectActorId) {
+                    console.error("[debugger] Couldn't create object actor");
+                    return { ObjectValue: objectValue };
+                }
+                objectActorsToObjects.set(objectActorId, value);
+            }
+            objectValue.actor = objectActorId;
             return { ObjectValue: objectValue };
         default:
             return { StringValue: String(value) };
@@ -373,55 +396,149 @@ function getPreview(obj, depth) {
 // Evaluate some javascript code in the global context of the debuggee
 // See executeInGlobal() at <https://firefox-source-docs.mozilla.org/devtools-user/debugger-api/debugger.object/index.html#function-properties-of-the-debugger-object-prototype>
 addEventListener("eval", event => {
-    const {code, pipelineId, workerId, frameActorId} = event;
+    const { code, pipelineId, workerId, frameActorId } = event;
 
-    let completionValue;
+    let frame;
     if (frameActorId) {
-        const frame = frameActorsToFrames.get(frameActorId);
-        // <https://searchfox.org/firefox-main/source/js/src/doc/Debugger/Debugger.Frame.md#223>
-        if (frame?.onStack) {
-            completionValue = frame.eval(code);
+        frame = frameActorsToFrames.get(frameActorId);
+    }
+    let global = workerId !== undefined ?
+        findKeyByValue(debuggeesToWorkerIds, workerId) :
+        findDebuggeeByPipelineId(pipelineId);
+
+    let noSideEffectDebugger;
+    if (event.eager) {
+        noSideEffectDebugger = createSideEffectFreeDebugger(global);
+
+        // We need to eval in the context of the temporary debugger to apply side-effect tracking
+        if (frame) {
+            frame = noSideEffectDebugger.adoptFrame(frame);
         } else {
-            completionValue = { throw: "Frame not available" };
+            global = noSideEffectDebugger.adoptDebuggeeValue(global);
         }
-    } else {
-        const object = workerId !== undefined ?
-            findKeyByValue(debuggeesToWorkerIds, workerId) :
-            findKeyByValue(debuggeesToPipelineIds, pipelineId);
-        completionValue = object.executeInGlobal(code);
     }
 
-    // Completion values: <https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#completion-values>
-    let resultValue;
-    if (completionValue === null) {
-        resultValue = {
-            value: createValueGrip(undefined, 0),
-            hasException: false,
-        };
-    } else if ("throw" in completionValue) {
-        // See adoptDebuggeeValue() in <https://firefox-source-docs.mozilla.org/devtools-user/debugger-api/debugger/index.html>
-        // <https://searchfox.org/firefox-main/source/devtools/server/actors/webconsole/eval-with-debugger.js#312>
-        // we probably don't need adoptDebuggeeValue, as we only have one debugger instance for now
-        // let value = dbg.adoptDebuggeeValue(completionValue.throw);
-        let realError = completionValue.throw.unsafeDereference();
-        resultValue = {
-            value: createValueGrip(completionValue.throw, 0),
-            exceptionMessage: realError.message,
-            hasException: true,
-        };
-    } else if ("return" in completionValue) {
-        resultValue = {
-            value: createValueGrip(completionValue.return, 0),
-            hasException: false,
-        };
-    }
+    try {
+        let completionValue;
+        if (frame) {
+            // <https://searchfox.org/firefox-main/source/js/src/doc/Debugger/Debugger.Frame.md#223>
+            if (frame?.onStack) {
+                completionValue = frame.eval(code);
+            } else {
+                completionValue = { throw: "Frame not available" };
+            }
+        } else {
+            completionValue = global.executeInGlobal(code);
+        }
 
-    evalResult(event, {
-        serializedValue: JSON.stringify(resultValue.value),
-        exceptionMessage: resultValue.hasException ? resultValue.exceptionMessage : null,
-        hasException: resultValue.hasException,
-    });
+        // Completion values: <https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#completion-values>
+        let resultValue;
+        if (completionValue === null) {
+            resultValue = {
+                value: createValueGrip(undefined, 0),
+                hasException: false,
+            };
+        } else if ("throw" in completionValue) {
+            let exceptionMessage = null;
+            if (typeof completionValue.throw.unsafeDereference === "function") {
+                const deref = completionValue.throw.unsafeDereference();
+                if (typeof deref.message === "string") {
+                    exceptionMessage = deref.message;
+                }
+            }
+            if (!exceptionMessage) {
+                exceptionMessage = `Uncaught ${completionValue.throw}`;
+            }
+            resultValue = {
+                value: createValueGrip(completionValue.throw, 0),
+                exceptionMessage,
+                hasException: true,
+            };
+        } else if ("return" in completionValue) {
+            resultValue = {
+                value: createValueGrip(completionValue.return, 0),
+                hasException: false,
+            };
+        }
+
+        evalResult(event, {
+            serializedValue: JSON.stringify(resultValue.value),
+            exceptionMessage: resultValue.hasException ? resultValue.exceptionMessage : null,
+            hasException: resultValue.hasException,
+        });
+    } finally {
+        if (noSideEffectDebugger) {
+            noSideEffectDebugger.onNativeCall = undefined;
+            noSideEffectDebugger.shouldAvoidSideEffects = false;
+
+            // This must be called last as the cleanup above depends on the list of debuggees
+            noSideEffectDebugger.removeAllDebuggees();
+        }
+    }
 });
+
+// <https://searchfox.org/firefox-main/source/devtools/server/actors/webconsole/eval-with-debugger.js#436>
+function createSideEffectFreeDebugger(debuggee) {
+    const eagerDbg = new Debugger;
+
+    // Special flag in order to ensure that any evaluation or call being
+    // made via this debugger will be ignored by all debuggers except this one.
+    eagerDbg.exclusiveDebuggerOnEval = true;
+
+    // TODO: Add other debuggees that the evaluation might use
+    eagerDbg.addDebuggee(debuggee.unsafeDereference());
+
+    const timeoutDuration = 100;
+    const endTime = Date.now() + timeoutDuration;
+    let count = 0;
+    function shouldCancel() {
+        // To keep the evaled code as quick as possible, we avoid querying the
+        // current time on ever single step and instead check every 100 steps
+        // as an arbitrary count that seemed to be "often enough".
+        return ++count % 100 === 0 && Date.now() > endTime;
+    }
+
+    const executedScripts = new Set();
+    const handler = {
+        hit: () => null,
+    };
+    // null means abort; undefined means continue
+    eagerDbg.onEnterFrame = frame => {
+        if (shouldCancel()) {
+            return null;
+        }
+        frame.onStep = () => {
+            if (shouldCancel()) {
+                return null;
+            }
+            return undefined;
+        };
+
+        const script = frame.script;
+        if (executedScripts.has(script)) {
+            // Skip setting breakpoints in the same script again
+            return undefined;
+        }
+        executedScripts.add(script);
+
+        const offsets = script.getEffectfulOffsets();
+        for (const offset of offsets) {
+            script.setBreakpoint(offset, handler);
+        }
+
+        return undefined;
+    };
+
+    eagerDbg.onNativeCall = (_callee, _reason) => {
+        // TODO: Allow side-effect-free native calls
+        // Aborting on all native calls is naïve but safe
+        return null;
+    };
+
+    eagerDbg.shouldAvoidSideEffects = true;
+
+    return eagerDbg;
+}
 
 addEventListener("getPossibleBreakpoints", event => {
     const {spidermonkeyId} = event;
@@ -762,10 +879,15 @@ function buildBindings(environment) {
 // Get a `Debugger.Environment` instance within which evaluation is taking place.
 // <https://searchfox.org/firefox-main/source/devtools/server/actors/frame.js#109>
 addEventListener("getEnvironment", event => {
-    const {frameActorId} = event;
-    frame = frameActorsToFrames.get(frameActorId);
+    const { frameActorId, pipelineId } = event;
+    let environment;
+    if (frameActorId) {
+        environment = frameActorsToFrames.get(frameActorId).environment;
+    } else {
+        environment = findDebuggeeByPipelineId(pipelineId).asEnvironment();
+    }
 
-    const actor = createEnvironmentActor(frame.environment);
+    const actor = createEnvironmentActor(environment);
     getEnvironmentResult(actor);
 });
 

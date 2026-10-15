@@ -5,12 +5,15 @@
 use std::f64::consts::PI;
 
 use dom_struct::dom_struct;
+use embedder_traits::MouseButton;
 use euclid::Point2D;
 use js::context::JSContext;
+use js::rust::HandleObject;
 use script_bindings::inheritance::Castable;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object, reflect_dom_object_with_proto};
+use script_traits::MouseButtons;
 
-use crate::dom::bindings::codegen::Bindings::TouchBinding::TouchMethods;
+use crate::dom::bindings::codegen::Bindings::TouchBinding::{TouchInit, TouchMethods};
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::root::{DomRoot, MutDom};
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
@@ -69,12 +72,36 @@ impl Touch {
         page_x: Finite<f64>,
         page_y: Finite<f64>,
     ) -> DomRoot<Touch> {
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(Touch::new_inherited(
                 identifier, target, screen_x, screen_y, client_x, client_y, page_x, page_y,
             )),
             window,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_proto(
+        cx: &mut JSContext,
+        window: &Window,
+        proto: Option<HandleObject>,
+        identifier: i32,
+        target: &EventTarget,
+        screen_x: Finite<f64>,
+        screen_y: Finite<f64>,
+        client_x: Finite<f64>,
+        client_y: Finite<f64>,
+        page_x: Finite<f64>,
+        page_y: Finite<f64>,
+    ) -> DomRoot<Touch> {
+        reflect_dom_object_with_proto(
             cx,
+            Box::new(Touch::new_inherited(
+                identifier, target, screen_x, screen_y, client_x, client_y, page_x, page_y,
+            )),
+            window,
+            proto,
         )
     }
 
@@ -115,21 +142,21 @@ impl Touch {
             event_type == "pointerout" ||
             event_type == "pointerleave"
         {
-            -1
+            MouseButton::None
         } else {
-            0
+            MouseButton::Primary
         };
 
-        // Buttons: 1 if a button is pressed during the event, 0 otherwise
+        // Buttons: Primary if a button is pressed during the event, empty otherwise.
         // For touch: button is pressed during over/enter/down/move, not during up/cancel/out/leave
         let buttons = if event_type == "pointermove" ||
             event_type == "pointerover" ||
             event_type == "pointerenter" ||
             event_type == "pointerdown"
         {
-            1
+            MouseButtons::Primary
         } else {
-            0
+            MouseButtons::empty()
         };
 
         // For enter/leave events, they don't bubble and are not cancelable
@@ -183,6 +210,29 @@ impl Touch {
 }
 
 impl TouchMethods<crate::DomTypeHolder> for Touch {
+    /// <https://w3c.github.io/touch-events/#dom-touch-constructor>
+    #[allow(clippy::too_many_arguments)]
+    fn Constructor(
+        cx: &mut JSContext,
+        window: &Window,
+        proto: Option<HandleObject>,
+        touch_init_dict: &TouchInit,
+    ) -> DomRoot<Touch> {
+        Touch::new_with_proto(
+            cx,
+            window,
+            proto,
+            touch_init_dict.identifier,
+            &touch_init_dict.target,
+            touch_init_dict.screenX,
+            touch_init_dict.screenY,
+            touch_init_dict.clientX,
+            touch_init_dict.clientY,
+            touch_init_dict.pageX,
+            touch_init_dict.pageY,
+        )
+    }
+
     /// <https://w3c.github.io/touch-events/#widl-Touch-identifier>
     fn Identifier(&self) -> i32 {
         self.identifier

@@ -7,7 +7,7 @@ use std::cell::Cell;
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::jsapi::{Heap, JSObject};
-use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleValue};
+use js::rust::{CustomAutoRooterGuard, HandleValue};
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::reflect_dom_object;
 use servo_base::id::ServiceWorkerId;
@@ -29,8 +29,7 @@ use crate::dom::bindings::structuredclone;
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::CanGc;
-use crate::task::TaskOnce;
+use crate::tasks::task::TaskOnce;
 
 pub(crate) type TrustedServiceWorkerAddress = Trusted<ServiceWorker>;
 
@@ -61,20 +60,20 @@ impl ServiceWorker {
     }
 
     pub(crate) fn new(
+        cx: &mut js::context::JSContext,
         global: &GlobalScope,
         script_url: ServoUrl,
         scope_url: ServoUrl,
         worker_id: ServiceWorkerId,
-        can_gc: CanGc,
     ) -> DomRoot<ServiceWorker> {
         reflect_dom_object(
+            cx,
             Box::new(ServiceWorker::new_inherited(
                 script_url.as_str(),
                 scope_url,
                 worker_id,
             )),
             global,
-            can_gc,
         )
     }
 
@@ -140,17 +139,14 @@ impl ServiceWorkerMethods<crate::DomTypeHolder> for ServiceWorker {
         &self,
         cx: &mut JSContext,
         message: HandleValue,
-        options: RootedTraceableBox<StructuredSerializeOptions>,
+        options: &StructuredSerializeOptions,
     ) -> ErrorResult {
-        let mut rooted = CustomAutoRooter::new(
+        auto_root!(&in(cx) let guard =
             options
                 .transfer
                 .iter()
                 .map(|js: &RootedTraceableBox<Heap<*mut JSObject>>| js.get())
-                .collect(),
-        );
-        #[expect(unsafe_code)]
-        let guard = unsafe { CustomAutoRooterGuard::new(cx.raw_cx(), &mut rooted) };
+                .collect::<Vec<_>>());
         self.post_message_impl(cx, message, guard)
     }
 

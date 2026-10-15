@@ -2,14 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::rc::Rc;
-
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::jsapi::{Heap, JSObject};
 use js::jsval::JSVal;
 use js::rust::{HandleObject, HandleValue, MutableHandleObject, MutableHandleValue};
-use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
+use script_bindings::reflector::reflect_dom_object_with_proto;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
@@ -19,11 +17,9 @@ use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
-use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
-use crate::script_runtime::JSContext as SafeJSContext;
 
 #[dom_struct]
 pub(crate) struct PromiseRejectionEvent {
@@ -49,7 +45,7 @@ impl PromiseRejectionEvent {
         type_: Atom,
         bubbles: EventBubbles,
         cancelable: EventCancelable,
-        promise: Rc<Promise>,
+        promise: &Promise,
         reason: HandleValue,
     ) -> DomRoot<Self> {
         Self::new_with_proto(
@@ -64,7 +60,7 @@ impl PromiseRejectionEvent {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new_with_proto(
         cx: &mut JSContext,
         global: &GlobalScope,
@@ -75,11 +71,11 @@ impl PromiseRejectionEvent {
         promise: HandleObject,
         reason: HandleValue,
     ) -> DomRoot<Self> {
-        let ev = reflect_dom_object_with_proto_and_cx(
+        let ev = reflect_dom_object_with_proto(
+            cx,
             Box::new(PromiseRejectionEvent::new_inherited()),
             global,
             proto,
-            cx,
         );
         ev.promise.set(promise.get());
 
@@ -100,7 +96,7 @@ impl PromiseRejectionEventMethods<crate::DomTypeHolder> for PromiseRejectionEven
         global: &GlobalScope,
         proto: Option<HandleObject>,
         type_: DOMString,
-        init: RootedTraceableBox<PromiseRejectionEventBinding::PromiseRejectionEventInit>,
+        init: &PromiseRejectionEventBinding::PromiseRejectionEventInit,
     ) -> Fallible<DomRoot<Self>> {
         let reason = init.reason.handle();
         let bubbles = EventBubbles::from(init.parent.bubbles);
@@ -120,12 +116,12 @@ impl PromiseRejectionEventMethods<crate::DomTypeHolder> for PromiseRejectionEven
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-promiserejectionevent-promise>
-    fn Promise(&self, _cx: SafeJSContext, mut return_value: MutableHandleObject) {
+    fn Promise(&self, mut return_value: MutableHandleObject) {
         return_value.set(self.promise.get());
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-promiserejectionevent-reason>
-    fn Reason(&self, _cx: SafeJSContext, mut retval: MutableHandleValue) {
+    fn Reason(&self, mut retval: MutableHandleValue) {
         retval.set(self.reason.get())
     }
 

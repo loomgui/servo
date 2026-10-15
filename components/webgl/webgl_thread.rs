@@ -8,6 +8,7 @@ use std::collections::hash_map::Entry;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::{slice, thread};
 
 use bitflags::bitflags;
@@ -97,6 +98,8 @@ pub struct GLState {
     scissor_test_enabled: bool,
     // The WebGL view of the stencil write mask (see comment re `color_write_mask`)
     stencil_write_mask: (u32, u32),
+    // Kept here rather than read back: glGetIntegerv cannot return a full GLuint.
+    stencil_value_mask: (u32, u32),
     stencil_test_enabled: bool,
     stencil_clear_value: i32,
     // The WebGL view of the depth write mask (see comment re `color_write_mask`)
@@ -129,16 +132,20 @@ impl GLState {
 
     // We maintain invariants between the GLState object and the GL state.
     fn restore_invariant(&self, gl: &Gl) {
-        self.restore_clear_color_invariant(gl);
+        self.restore_clear_invariant(gl);
         self.restore_scissor_invariant(gl);
         self.restore_alpha_invariant(gl);
         self.restore_depth_invariant(gl);
         self.restore_stencil_invariant(gl);
     }
 
-    fn restore_clear_color_invariant(&self, gl: &Gl) {
+    fn restore_clear_invariant(&self, gl: &Gl) {
         let (r, g, b, a) = self.clear_color;
-        unsafe { gl.clear_color(r, g, b, a) };
+        unsafe {
+            gl.clear_color(r, g, b, a);
+            gl.clear_depth(self.depth_clear_value);
+            gl.clear_stencil(self.stencil_clear_value);
+        }
     }
 
     fn restore_scissor_invariant(&self, gl: &Gl) {
@@ -202,8 +209,9 @@ impl Default for GLState {
             color_write_mask: [true, true, true, true],
             clear_color: (0., 0., 0., 0.),
             scissor_test_enabled: false,
-            // Should these be 0xFFFF_FFFF?
-            stencil_write_mask: (0, 0),
+            // GL's initial stencil writemask is all ones.
+            stencil_write_mask: (u32::MAX, u32::MAX),
+            stencil_value_mask: (u32::MAX, u32::MAX),
             stencil_test_enabled: false,
             stencil_clear_value: 0,
             depth_write_mask: true,
@@ -298,14 +306,14 @@ impl WebGLThread {
 
     /// Perform all initialization required to run an instance of WebGLThread
     /// in parallel on its own dedicated thread.
-    pub(crate) fn run_on_own_thread(init: WebGLThreadInit) {
+    pub(crate) fn run_on_own_thread(init: WebGLThreadInit) -> JoinHandle<()> {
         thread::Builder::new()
             .name("WebGL".to_owned())
             .spawn(move || {
                 let mut data = WebGLThread::new(init);
                 data.process();
             })
-            .expect("Thread spawning failed");
+            .expect("Thread spawning failed")
     }
 
     fn process(&mut self) {
@@ -315,6 +323,33 @@ impl WebGLThread {
             if exit {
                 break;
             }
+        }
+    }
+
+    /// Enable GL_POINT_SPRITE and GL_PROGRAM_POINT_SIZE on desktop OpenGL.
+    ///
+    /// FIXME(nox): Should probably be done by surfman.
+    /// FIXME(sagudev): Do we even need to do this?
+    fn ensure_point_sprite_and_program_point_size_enabled(gl_context_data: &GLContextData) {
+        // Points sprites are enabled by default in OpenGL 3.2 core
+        // and in GLES.
+        if gl_context_data.gl.version().is_embedded {
+            return;
+        }
+
+        // Rather than doing version detection, it does not hurt to enable GL_POINT_SPRITE and
+        // PROGRAM_POINT_SIZE always.
+        const GL_POINT_SPRITE: u32 = 0x8861;
+        unsafe { gl_context_data.gl.enable(GL_POINT_SPRITE) };
+        let error = unsafe { gl_context_data.gl.get_error() };
+        if error != 0 {
+            warn!("Error enabling GL point sprites: {error}");
+        }
+
+        unsafe { gl_context_data.gl.enable(gl::PROGRAM_POINT_SIZE) };
+        let error = unsafe { gl_context_data.gl.get_error() };
+        if error != 0 {
+            warn!("Error enabling GL program point size: {error}");
         }
     }
 
@@ -330,35 +365,15 @@ impl WebGLThread {
                         let data = self
                             .make_current_if_needed(id)
                             .expect("WebGLContext not found");
+
+                        Self::ensure_point_sprite_and_program_point_size_enabled(data);
+
                         let glsl_version = Self::get_glsl_version(&data.gl);
                         let api_type = if data.gl.version().is_embedded {
                             GlType::Gles
                         } else {
                             GlType::Gl
                         };
-
-                        // FIXME(nox): Should probably be done by surfman.
-                        if api_type != GlType::Gles {
-                            // Points sprites are enabled by default in OpenGL 3.2 core
-                            // and in GLES. Rather than doing version detection, it does
-                            // not hurt to enable them anyways.
-
-                            unsafe {
-                                // XXX: Do we even need to this?
-                                const GL_POINT_SPRITE: u32 = 0x8861;
-                                data.gl.enable(GL_POINT_SPRITE);
-                                let err = data.gl.get_error();
-                                if err != 0 {
-                                    warn!("Error enabling GL point sprites: {}", err);
-                                }
-
-                                data.gl.enable(gl::PROGRAM_POINT_SIZE);
-                                let err = data.gl.get_error();
-                                if err != 0 {
-                                    warn!("Error enabling GL program point size: {}", err);
-                                }
-                            }
-                        }
 
                         WebGLCreateContextResult {
                             sender: WebGLMsgSender::new(id, webgl_chan.clone()),
@@ -391,15 +406,17 @@ impl WebGLThread {
             WebGLMsg::FinishedRenderingToContext(context_id) => {
                 self.handle_finished_rendering_to_context(context_id);
             },
-            WebGLMsg::Exit(sender) => {
+            WebGLMsg::ClearPainterResources(painter_id, sender) => {
+                self.device_map.remove(&painter_id);
+                if let Err(error) = sender.send(()) {
+                    warn!("Failed to send response to WebGLMsg::ClearPainterResources ({error})");
+                }
+            },
+            WebGLMsg::Exit => {
                 // Call remove_context functions in order to correctly delete WebRender image keys.
                 let context_ids: Vec<WebGLContextId> = self.contexts.keys().copied().collect();
                 for id in context_ids {
                     self.remove_webgl_context(id);
-                }
-
-                if let Err(e) = sender.send(()) {
-                    warn!("Failed to send response to WebGLMsg::Exit ({e})");
                 }
                 return true;
             },
@@ -595,10 +612,9 @@ impl WebGLThread {
             .create_attached_swap_chain(context_id, &*device, &mut ctx, surface_access)
             .map_err(|err| format!("Failed to create swap chain: {:?}", err))?;
 
-        let swap_chain = self
-            .webrender_swap_chains
-            .get(context_id)
-            .expect("Failed to get the swap chain");
+        let Some(swap_chain) = self.webrender_swap_chains.get(context_id) else {
+            return Err("Failed to get the swap chain".into());
+        };
 
         debug!(
             "Created webgl context {:?}/{:?}",
@@ -620,6 +636,8 @@ impl WebGLThread {
         let limits = GLLimits::detect(&gl, webgl_version);
 
         let size = clamp_viewport(&gl, requested_size);
+        debug_assert_eq!(unsafe { gl.get_error() }, gl::NO_ERROR);
+
         if safe_size != size {
             debug!("Resizing swap chain from {:?} to {:?}", safe_size, size);
             swap_chain
@@ -652,11 +670,12 @@ impl WebGLThread {
         }
 
         let default_vao = if let Some(vao) = WebGLImpl::create_vertex_array(&gl) {
-            WebGLImpl::bind_vertex_array(&gl, Some(vao.glow()));
+            unsafe { gl.bind_vertex_array(Some(vao.glow())) }
             Some(vao.glow())
         } else {
             None
         };
+        debug_assert_eq!(unsafe { gl.get_error() }, gl::NO_ERROR);
 
         let state = GLState {
             _gl_version: gl_version,
@@ -700,15 +719,14 @@ impl WebGLThread {
         context_id: WebGLContextId,
         requested_size: Size2D<u32>,
     ) -> Result<(), String> {
-        self.make_current_if_needed(context_id)
-            .expect("Missing WebGL context!");
+        self.make_current_if_needed(context_id);
 
-        let data = self
-            .contexts
-            .get_mut(&context_id)
-            .expect("Missing WebGL context!");
+        let Some(data) = self.contexts.get_mut(&context_id) else {
+            return Err("Missing WebGL context!".into());
+        };
 
         let size = clamp_viewport(&data.gl, requested_size);
+        debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
 
         // Check to see if any of the current framebuffer bindings are the surface we're about to
         // throw out. If so, we'll have to reset them after destroying the surface.
@@ -1308,21 +1326,32 @@ impl WebGLImpl {
                 // that can happen in the real world.
                 unsafe { gl.scissor(x, y, width as i32, height as i32) };
             },
-            WebGLCommand::StencilFunc(func, ref_, mask) => unsafe {
-                gl.stencil_func(func, ref_, mask)
+            WebGLCommand::StencilFunc(func, ref_, mask) => {
+                state.stencil_value_mask = (mask, mask);
+                unsafe { gl.stencil_func(func, ref_, mask) }
             },
-            WebGLCommand::StencilFuncSeparate(face, func, ref_, mask) => unsafe {
-                gl.stencil_func_separate(face, func, ref_, mask)
+            WebGLCommand::StencilFuncSeparate(face, func, ref_, mask) => {
+                if face != gl::BACK {
+                    state.stencil_value_mask.0 = mask;
+                }
+                if face != gl::FRONT {
+                    state.stencil_value_mask.1 = mask;
+                }
+                unsafe { gl.stencil_func_separate(face, func, ref_, mask) }
             },
             WebGLCommand::StencilMask(mask) => {
                 state.stencil_write_mask = (mask, mask);
                 state.restore_stencil_invariant(gl);
             },
             WebGLCommand::StencilMaskSeparate(face, mask) => {
-                if face == gl::FRONT {
-                    state.stencil_write_mask.0 = mask;
-                } else {
-                    state.stencil_write_mask.1 = mask;
+                match face {
+                    gl::FRONT => state.stencil_write_mask.0 = mask,
+                    gl::BACK => state.stencil_write_mask.1 = mask,
+                    gl::FRONT_AND_BACK => state.stencil_write_mask = (mask, mask),
+                    _ => debug_assert!(
+                        false,
+                        "stencilMaskSeparate face {face:#x} should have been rejected by the DOM"
+                    ),
                 }
                 state.restore_stencil_invariant(gl);
             },
@@ -1870,11 +1899,11 @@ impl WebGLImpl {
                 let _ = chan.send(id);
             },
             WebGLCommand::DeleteVertexArray(id) => {
-                Self::delete_vertex_array(gl, id);
+                unsafe { gl.delete_vertex_array(id.glow()) };
             },
             WebGLCommand::BindVertexArray(id) => {
                 let id = id.map(WebGLVertexArrayId::glow).or(state.default_vao);
-                Self::bind_vertex_array(gl, id);
+                unsafe { gl.bind_vertex_array(id) }
             },
             WebGLCommand::GetParameterBool(param, ref sender) => {
                 let value = match param {
@@ -1916,9 +1945,16 @@ impl WebGLImpl {
                     webgl::ParameterInt::AlphaBits if state.fake_no_alpha() => 0,
                     webgl::ParameterInt::DepthBits if state.fake_no_depth() => 0,
                     webgl::ParameterInt::StencilBits if state.fake_no_stencil() => 0,
-                    webgl::ParameterInt::StencilWritemask => state.stencil_write_mask.0 as i32,
-                    webgl::ParameterInt::StencilBackWritemask => state.stencil_write_mask.1 as i32,
                     _ => unsafe { gl.get_parameter_i32(param as u32) },
+                };
+                sender.send(value).unwrap()
+            },
+            WebGLCommand::GetParameterUInt(param, ref sender) => {
+                let value = match param {
+                    webgl::ParameterUInt::StencilWritemask => state.stencil_write_mask.0,
+                    webgl::ParameterUInt::StencilBackWritemask => state.stencil_write_mask.1,
+                    webgl::ParameterUInt::StencilValueMask => state.stencil_value_mask.0,
+                    webgl::ParameterUInt::StencilBackValueMask => state.stencil_value_mask.1,
                 };
                 sender.send(value).unwrap()
             },
@@ -2769,16 +2805,6 @@ impl WebGLImpl {
         vao
     }
 
-    fn bind_vertex_array(gl: &Gl, vao: Option<NativeVertexArray>) {
-        unsafe { gl.bind_vertex_array(vao) }
-        debug_assert_eq!(unsafe { gl.get_error() }, gl::NO_ERROR);
-    }
-
-    fn delete_vertex_array(gl: &Gl, vao: WebGLVertexArrayId) {
-        unsafe { gl.delete_vertex_array(vao.glow()) };
-        debug_assert_eq!(unsafe { gl.get_error() }, gl::NO_ERROR);
-    }
-
     #[inline]
     fn bind_framebuffer(
         gl: &Gl,
@@ -3206,7 +3232,6 @@ fn clamp_viewport(gl: &Gl, size: Size2D<u32>) -> Size2D<u32> {
     unsafe {
         gl.get_parameter_i32_slice(gl::MAX_VIEWPORT_DIMS, &mut max_viewport);
         gl.get_parameter_i32_slice(gl::MAX_RENDERBUFFER_SIZE, &mut max_renderbuffer);
-        debug_assert_eq!(gl.get_error(), gl::NO_ERROR);
     }
     Size2D::new(
         size.width

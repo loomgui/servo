@@ -9,9 +9,7 @@ use p256::NistP256;
 use p384::NistP384;
 use p521::NistP521;
 
-use crate::dom::bindings::codegen::Bindings::CryptoKeyBinding::{
-    CryptoKeyMethods, CryptoKeyPair, KeyType, KeyUsage,
-};
+use crate::dom::bindings::codegen::Bindings::CryptoKeyBinding::{CryptoKeyPair, KeyType, KeyUsage};
 use crate::dom::bindings::codegen::Bindings::SubtleCryptoBinding::KeyFormat;
 use crate::dom::bindings::error::Error;
 use crate::dom::bindings::root::DomRoot;
@@ -19,21 +17,19 @@ use crate::dom::cryptokey::{CryptoKey, Handle};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::subtlecrypto::ec_common::EcAlgorithm;
 use crate::dom::subtlecrypto::{
-    ExportedKey, KeyAlgorithmAndDerivatives, NAMED_CURVE_P256, NAMED_CURVE_P384, NAMED_CURVE_P521,
-    SubtleEcKeyGenParams, SubtleEcKeyImportParams, SubtleEcdsaParams, ec_common,
+    EcKeyGenParams, EcKeyImportParams, EcdsaParams, ExportedKey, KeyAlgorithmAndDerivatives,
+    NAMED_CURVE_P256, NAMED_CURVE_P384, NAMED_CURVE_P521, ec_common,
 };
 
 /// <https://w3c.github.io/webcrypto/#ecdsa-operations-sign>
 pub(crate) fn sign(
-    normalized_algorithm: &SubtleEcdsaParams,
+    normalized_algorithm: &EcdsaParams,
     key: &CryptoKey,
     message: &[u8],
 ) -> Result<Vec<u8>, Error> {
     // Step 1. If the [[type]] internal slot of key is not "private", then throw an
     // InvalidAccessError.
-    if key.Type() != KeyType::Private {
-        return Err(Error::InvalidAccess(None));
-    }
+    key.ensure_type(KeyType::Private)?;
 
     // Step 2. Let hashAlgorithm be the hash member of normalizedAlgorithm.
     let hash_algorithm = &normalized_algorithm.hash;
@@ -63,41 +59,53 @@ pub(crate) fn sign(
     //     and d and resulting in result.
     // NOTE: We currently do not support other applicable specifications.
     let KeyAlgorithmAndDerivatives::EcKeyAlgorithm(algorithm) = key.algorithm() else {
-        return Err(Error::Operation(None));
+        return Err(Error::Operation(Some(
+            "Key algorithm is not a elliptic curve key algorithm.".into(),
+        )));
     };
     let mut rng = rand::rng();
     let result = match algorithm.named_curve.as_str() {
         NAMED_CURVE_P256 => {
             let Handle::P256PrivateKey(d) = key.handle() else {
-                return Err(Error::Operation(None));
+                return Err(Error::Operation(Some(
+                    "Key handle is not a P256PrivateKey.".into(),
+                )));
             };
             let signing_key = SigningKey::<NistP256>::from(d);
             let signature: Signature<NistP256> = signing_key
                 .sign_prehash_with_rng(&mut rng, &m)
-                .map_err(|_| Error::Operation(None))?;
+                .map_err(|_| Error::Operation(Some("ECDSA signing process failed.".into())))?;
             signature.to_vec()
         },
         NAMED_CURVE_P384 => {
             let Handle::P384PrivateKey(d) = key.handle() else {
-                return Err(Error::Operation(None));
+                return Err(Error::Operation(Some(
+                    "Key handle is not a P384PrivateKey.".into(),
+                )));
             };
             let signing_key = SigningKey::<NistP384>::from(d);
             let signature: Signature<NistP384> = signing_key
                 .sign_prehash_with_rng(&mut rng, &m)
-                .map_err(|_| Error::Abort(None))?;
+                .map_err(|_| Error::Operation(Some("ECDSA signing process failed.".into())))?;
             signature.to_vec()
         },
         NAMED_CURVE_P521 => {
             let Handle::P521PrivateKey(d) = key.handle() else {
-                return Err(Error::Operation(None));
+                return Err(Error::Operation(Some(
+                    "Key handle is not a P521PrivateKey.".into(),
+                )));
             };
             let signing_key = SigningKey::<NistP521>::from(d);
             let signature: Signature<NistP521> = signing_key
                 .sign_prehash_with_rng(&mut rng, &m)
-                .map_err(|_| Error::Operation(None))?;
+                .map_err(|_| Error::Operation(Some("ECDSA signing process failed.".into())))?;
             signature.to_vec()
         },
-        _ => return Err(Error::NotSupported(None)),
+        _ => {
+            return Err(Error::NotSupported(Some(
+                "Algorithm's curve is not supported.".into(),
+            )));
+        },
     };
 
     // Step 7. Return result.
@@ -106,16 +114,14 @@ pub(crate) fn sign(
 
 /// <https://w3c.github.io/webcrypto/#ecdsa-operations-verify>
 pub(crate) fn verify(
-    normalized_algorithm: &SubtleEcdsaParams,
+    normalized_algorithm: &EcdsaParams,
     key: &CryptoKey,
     message: &[u8],
     signature: &[u8],
 ) -> Result<bool, Error> {
     // Step 1. If the [[type]] internal slot of key is not "public", then throw an
     // InvalidAccessError.
-    if key.Type() != KeyType::Public {
-        return Err(Error::InvalidAccess(None));
-    }
+    key.ensure_type(KeyType::Public)?;
 
     // Step 2. Let hashAlgorithm be the hash member of normalizedAlgorithm.
     let hash_algorithm = &normalized_algorithm.hash;
@@ -146,12 +152,16 @@ pub(crate) fn verify(
     // false otherwise.
     // NOTE: We currently do not support other applicable specifications.
     let KeyAlgorithmAndDerivatives::EcKeyAlgorithm(algorithm) = key.algorithm() else {
-        return Err(Error::Operation(None));
+        return Err(Error::Operation(Some(
+            "Key algorithm is not a elliptic curve key algorithm.".into(),
+        )));
     };
     let result = match algorithm.named_curve.as_str() {
         NAMED_CURVE_P256 => {
             let Handle::P256PublicKey(q) = key.handle() else {
-                return Err(Error::Operation(None));
+                return Err(Error::Operation(Some(
+                    "Key handle is not a P256PublicKey.".into(),
+                )));
             };
             match Signature::<NistP256>::from_slice(signature) {
                 Ok(signature) => {
@@ -163,7 +173,9 @@ pub(crate) fn verify(
         },
         NAMED_CURVE_P384 => {
             let Handle::P384PublicKey(q) = key.handle() else {
-                return Err(Error::Operation(None));
+                return Err(Error::Operation(Some(
+                    "Key handle is not a P384PublicKey.".into(),
+                )));
             };
             match Signature::<NistP384>::from_slice(signature) {
                 Ok(signature) => {
@@ -175,7 +187,9 @@ pub(crate) fn verify(
         },
         NAMED_CURVE_P521 => {
             let Handle::P521PublicKey(q) = key.handle() else {
-                return Err(Error::Operation(None));
+                return Err(Error::Operation(Some(
+                    "Key handle is not a P521PublicKey.".into(),
+                )));
             };
             match Signature::<NistP521>::from_slice(signature) {
                 Ok(signature) => {
@@ -185,7 +199,11 @@ pub(crate) fn verify(
                 Err(_) => false,
             }
         },
-        _ => return Err(Error::NotSupported(None)),
+        _ => {
+            return Err(Error::NotSupported(Some(
+                "Algorithm's curve is not supported.".into(),
+            )));
+        },
     };
 
     // Step 8. Return result.
@@ -196,14 +214,14 @@ pub(crate) fn verify(
 pub(crate) fn generate_key(
     cx: &mut JSContext,
     global: &GlobalScope,
-    normalized_algorithm: &SubtleEcKeyGenParams,
+    normalized_algorithm: &EcKeyGenParams,
     extractable: bool,
     usages: Vec<KeyUsage>,
 ) -> Result<CryptoKeyPair, Error> {
     ec_common::generate_key(
-        EcAlgorithm::Ecdsa,
         cx,
         global,
+        EcAlgorithm::Ecdsa,
         normalized_algorithm,
         extractable,
         usages,
@@ -214,16 +232,16 @@ pub(crate) fn generate_key(
 pub(crate) fn import_key(
     cx: &mut JSContext,
     global: &GlobalScope,
-    normalized_algorithm: &SubtleEcKeyImportParams,
+    normalized_algorithm: &EcKeyImportParams,
     format: KeyFormat,
     key_data: &[u8],
     extractable: bool,
     usages: Vec<KeyUsage>,
 ) -> Result<DomRoot<CryptoKey>, Error> {
     ec_common::import_key(
-        EcAlgorithm::Ecdsa,
         cx,
         global,
+        EcAlgorithm::Ecdsa,
         normalized_algorithm,
         format,
         key_data,
@@ -246,5 +264,5 @@ pub(crate) fn get_public_key(
     algorithm: &KeyAlgorithmAndDerivatives,
     usages: Vec<KeyUsage>,
 ) -> Result<DomRoot<CryptoKey>, Error> {
-    ec_common::get_public_key(cx, global, key, algorithm, usages)
+    ec_common::get_public_key(cx, global, EcAlgorithm::Ecdsa, key, algorithm, usages)
 }

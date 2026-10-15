@@ -22,55 +22,52 @@ use crate::dom::bindings::trace::NoTrace;
 use crate::dom::blob::Blob;
 use crate::dom::file::File;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::html::form_controls::htmlinputelement::HTMLInputElement;
 use crate::dom::html::htmlbuttonelement::HTMLButtonElement;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::html::htmlformelement::{
-    FormDatum, FormDatumValue, FormSubmitterElement, HTMLFormElement,
+    FormDatum, FormDatumUnrooted, FormDatumValueUnrooted, FormSubmitterElement, HTMLFormElement,
 };
-use crate::dom::html::input_element::HTMLInputElement;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct FormData {
     reflector_: Reflector,
-    data: DomRefCell<Vec<(NoTrace<LocalName>, FormDatum)>>,
+    data: DomRefCell<Vec<(NoTrace<LocalName>, FormDatumUnrooted)>>,
 }
 
 impl FormData {
     fn new_inherited(form_datums: Option<Vec<FormDatum>>) -> FormData {
-        let data = match form_datums {
-            Some(data) => data
-                .iter()
-                .map(|datum| (NoTrace(LocalName::from(&datum.name)), datum.clone()))
-                .collect::<Vec<(NoTrace<LocalName>, FormDatum)>>(),
-            None => Vec::new(),
-        };
-
         FormData {
             reflector_: Reflector::new(),
-            data: DomRefCell::new(data),
+            data: DomRefCell::new(
+                form_datums
+                    .into_iter()
+                    .flatten()
+                    .map(|datum| (NoTrace(LocalName::from(&datum.name)), datum.into()))
+                    .collect::<Vec<(NoTrace<LocalName>, FormDatumUnrooted)>>(),
+            ),
         }
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         form_datums: Option<Vec<FormDatum>>,
         global: &GlobalScope,
-        can_gc: CanGc,
     ) -> DomRoot<FormData> {
-        Self::new_with_proto(form_datums, global, None, can_gc)
+        Self::new_with_proto(cx, form_datums, global, None)
     }
 
     fn new_with_proto(
+        cx: &mut JSContext,
         form_datums: Option<Vec<FormDatum>>,
         global: &GlobalScope,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<FormData> {
         reflect_dom_object_with_proto(
+            cx,
             Box::new(FormData::new_inherited(form_datums)),
             global,
             proto,
-            can_gc,
         )
     }
 }
@@ -125,52 +122,50 @@ impl FormDataMethods<crate::DomTypeHolder> for FormData {
             // Step 1.2. Let list be the result of constructing the entry list for form and submitter.
             return match opt_form.get_form_dataset(cx, submitter_element, None) {
                 Some(form_datums) => Ok(FormData::new_with_proto(
+                    cx,
                     Some(form_datums),
                     global,
                     proto,
-                    CanGc::from_cx(cx),
                 )),
                 // Step 1.3. If list is null, then throw an "InvalidStateError" DOMException.
                 None => Err(Error::InvalidState(None)),
             };
         }
 
-        Ok(FormData::new_with_proto(
-            None,
-            global,
-            proto,
-            CanGc::from_cx(cx),
-        ))
+        Ok(FormData::new_with_proto(cx, None, global, proto))
     }
 
     /// <https://xhr.spec.whatwg.org/#dom-formdata-append>
-    fn Append(&self, name: USVString, str_value: USVString) {
-        let datum = FormDatum {
-            ty: DOMString::from("string"),
-            name: DOMString::from(name.0.clone()),
-            value: FormDatumValue::String(DOMString::from(str_value.0)),
-        };
-
-        self.data
-            .borrow_mut()
-            .push((NoTrace(LocalName::from(name.0)), datum));
+    // As [`Append_`] needs &mut JSContext, we also need to have it for [`Append`]
+    fn Append(&self, _cx: &mut JSContext, name: USVString, str_value: USVString) {
+        self.data.borrow_mut().push((
+            NoTrace(LocalName::from(name.0.clone())),
+            FormDatumUnrooted {
+                ty: DOMString::from_static("string"),
+                name: DOMString::from(name.0),
+                value: FormDatumValueUnrooted::String(DOMString::from(str_value.0)),
+            },
+        ));
     }
 
     /// <https://xhr.spec.whatwg.org/#dom-formdata-append>
-    fn Append_(&self, name: USVString, blob: &Blob, filename: Option<USVString>) {
-        let datum = FormDatum {
-            ty: DOMString::from("file"),
-            name: DOMString::from(name.0.clone()),
-            value: FormDatumValue::File(DomRoot::from_ref(&*self.create_an_entry(
-                blob,
-                filename,
-                CanGc::deprecated_note(),
-            ))),
-        };
+    fn Append_(
+        &self,
+        cx: &mut JSContext,
+        name: USVString,
+        blob: &Blob,
+        filename: Option<USVString>,
+    ) {
+        let file = self.create_an_entry(cx, blob, filename);
 
-        self.data
-            .borrow_mut()
-            .push((NoTrace(LocalName::from(name.0)), datum));
+        self.data.borrow_mut().push((
+            NoTrace(LocalName::from(name.0.clone())),
+            FormDatumUnrooted {
+                ty: DOMString::from_static("file"),
+                name: DOMString::from(name.0),
+                value: FormDatumValueUnrooted::File(file.as_traced()),
+            },
+        ));
     }
 
     /// <https://xhr.spec.whatwg.org/#dom-formdata-delete>
@@ -187,8 +182,10 @@ impl FormDataMethods<crate::DomTypeHolder> for FormData {
             .iter()
             .find(|(datum_name, _)| datum_name.0 == name.0)
             .map(|(_, datum)| match &datum.value {
-                FormDatumValue::String(s) => FileOrUSVString::USVString(USVString(s.to_string())),
-                FormDatumValue::File(b) => FileOrUSVString::File(DomRoot::from_ref(b)),
+                FormDatumValueUnrooted::String(s) => {
+                    FileOrUSVString::USVString(USVString(s.to_string()))
+                },
+                FormDatumValueUnrooted::File(b) => FileOrUSVString::File(DomRoot::from_ref(b)),
             })
     }
 
@@ -203,10 +200,10 @@ impl FormDataMethods<crate::DomTypeHolder> for FormData {
                 }
 
                 Some(match &datum.value {
-                    FormDatumValue::String(s) => {
+                    FormDatumValueUnrooted::String(s) => {
                         FileOrUSVString::USVString(USVString(s.to_string()))
                     },
-                    FormDatumValue::File(b) => FileOrUSVString::File(DomRoot::from_ref(b)),
+                    FormDatumValueUnrooted::File(b) => FileOrUSVString::File(DomRoot::from_ref(b)),
                 })
             })
             .collect()
@@ -221,7 +218,7 @@ impl FormDataMethods<crate::DomTypeHolder> for FormData {
     }
 
     /// <https://xhr.spec.whatwg.org/#dom-formdata-set>
-    fn Set(&self, name: USVString, str_value: USVString) {
+    fn Set(&self, _cx: &mut JSContext, name: USVString, str_value: USVString) {
         let mut data = self.data.borrow_mut();
         let local_name = LocalName::from(name.0.clone());
 
@@ -229,17 +226,17 @@ impl FormDataMethods<crate::DomTypeHolder> for FormData {
 
         data.push((
             NoTrace(local_name),
-            FormDatum {
-                ty: DOMString::from("string"),
+            FormDatumUnrooted {
+                ty: DOMString::from_static("string"),
                 name: DOMString::from(name.0),
-                value: FormDatumValue::String(DOMString::from(str_value.0)),
+                value: FormDatumValueUnrooted::String(DOMString::from(str_value.0)),
             },
         ));
     }
 
     /// <https://xhr.spec.whatwg.org/#dom-formdata-set>
-    fn Set_(&self, name: USVString, blob: &Blob, filename: Option<USVString>) {
-        let file = self.create_an_entry(blob, filename, CanGc::deprecated_note());
+    fn Set_(&self, cx: &mut JSContext, name: USVString, blob: &Blob, filename: Option<USVString>) {
+        let file = self.create_an_entry(cx, blob, filename);
 
         let mut data = self.data.borrow_mut();
         let local_name = LocalName::from(name.0.clone());
@@ -248,10 +245,10 @@ impl FormDataMethods<crate::DomTypeHolder> for FormData {
 
         data.push((
             NoTrace(LocalName::from(name.0.clone())),
-            FormDatum {
-                ty: DOMString::from("file"),
+            FormDatumUnrooted {
+                ty: DOMString::from_static("file"),
                 name: DOMString::from(name.0),
-                value: FormDatumValue::File(file),
+                value: FormDatumValueUnrooted::File(file.as_traced()),
             },
         ));
     }
@@ -261,15 +258,15 @@ impl FormData {
     /// <https://xhr.spec.whatwg.org/#create-an-entry>
     fn create_an_entry(
         &self,
+        cx: &mut JSContext,
         blob: &Blob,
         opt_filename: Option<USVString>,
-        can_gc: CanGc,
     ) -> DomRoot<File> {
         // Steps 3-4
         let name = match opt_filename {
             Some(filename) => DOMString::from(filename.0),
             None => match blob.downcast::<File>() {
-                None => DOMString::from("blob"),
+                None => DOMString::from_static("blob"),
                 // If it is already a file and no filename was given,
                 // then neither step 3 nor step 4 happens, so instead of
                 // creating a new File object we use the existing one.
@@ -283,11 +280,11 @@ impl FormData {
         let last_modified = blob.downcast::<File>().map(|file| file.get_modified());
 
         File::new(
+            cx,
             &self.global(),
             BlobImpl::new_from_bytes(bytes, blob.type_string()),
             name,
             last_modified,
-            can_gc,
         )
     }
 
@@ -295,7 +292,7 @@ impl FormData {
         self.data
             .borrow()
             .iter()
-            .map(|(_, datum)| datum.clone())
+            .map(|(_, datum)| datum.root())
             .collect()
     }
 }
@@ -304,22 +301,24 @@ impl Iterable for FormData {
     type Key = USVString;
     type Value = FileOrUSVString;
 
-    fn get_iterable_length(&self) -> u32 {
+    fn get_iterable_length(&self, _cx: &mut JSContext) -> u32 {
         self.data.borrow().len() as u32
     }
 
-    fn get_value_at_index(&self, n: u32) -> FileOrUSVString {
+    fn get_value_at_index(&self, _cx: &mut JSContext, index: u32) -> FileOrUSVString {
         let data = self.data.borrow();
-        let datum = &data.get(n as usize).unwrap().1;
+        let datum = &data.get(index as usize).unwrap().1;
         match &datum.value {
-            FormDatumValue::String(s) => FileOrUSVString::USVString(USVString(s.to_string())),
-            FormDatumValue::File(b) => FileOrUSVString::File(DomRoot::from_ref(b)),
+            FormDatumValueUnrooted::String(s) => {
+                FileOrUSVString::USVString(USVString(s.to_string()))
+            },
+            FormDatumValueUnrooted::File(b) => FileOrUSVString::File(DomRoot::from_ref(b)),
         }
     }
 
-    fn get_key_at_index(&self, n: u32) -> USVString {
+    fn get_key_at_index(&self, _cx: &mut JSContext, index: u32) -> USVString {
         let data = self.data.borrow();
-        let key = &data.get(n as usize).unwrap().0;
+        let key = &data.get(index as usize).unwrap().0;
         USVString(key.to_string())
     }
 }

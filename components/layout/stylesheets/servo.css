@@ -1,3 +1,7 @@
+html {
+  color: CanvasText;
+}
+
 input[type="hidden"] {
   display: none !important;
 }
@@ -5,9 +9,9 @@ input[type="hidden"] {
 /* Textual inputs */
 input:not([type="file"]),
 textarea {
-  background: white;
+  background-color: Field;
   border: solid grey 1px;
-  color: black;
+  color: FieldText;
 }
 
 input[type="radio"] {
@@ -118,7 +122,15 @@ input[type="file"]::file-selector-button {
   border-radius: 2px;
   border: 1px solid ButtonBorder;
   padding: 4px;
-  color: black;
+  color: ButtonText;
+}
+
+input[type="text"],
+input[type="email"],
+input[type="date"],
+input[type="password"],
+input[type="number"] {
+  color: FieldText;
 }
 
 button,
@@ -328,7 +340,7 @@ input[type="radio"] {
   display: inline-block;
 
   /* TODO: According to https://wpt.fyi/results/css/css-grid/stretch-grid-item-radio-input.html,
-     radio buttons should be able to grow / shrink depending of the width/height of the input 
+     radio buttons should be able to grow / shrink depending of the width/height of the input
      element. These values should probably be changed once `aspect-ratio` has been supported
      for non-replaced elements.
   */
@@ -343,7 +355,7 @@ input[type="radio"]::before {
   content: "";
   background: transparent;
 
-  /* TODO: The ring should be able to grow & shrink according to min(width, height). 
+  /* TODO: The ring should be able to grow & shrink according to min(width, height).
     However, this is currently not possible to be implemented as `aspect-ratio` hasn't
     been supported for non-replaced elements.
   */
@@ -364,7 +376,7 @@ input[type="radio"]::after {
   content: "";
   background: transparent;
 
-  /* TODO:  The bullet should be able to grow & shrink according to min(width, height). 
+  /* TODO:  The bullet should be able to grow & shrink according to min(width, height).
   However, this is currently not possible to be implemented as `aspect-ratio` hasn't been supported for non-replaced elements. */
   width: 8px;
   height: 8px;
@@ -538,8 +550,8 @@ progress {
   border-radius: 3px;
   border: 1px solid rgba(0, 0, 0, 0.5);
 }
-/* FIXME: This should use ::-moz-progress-bar */
-progress #-servo-progress-bar {
+
+progress::-moz-progress-bar {
   display: block;
   height: 100%;
   background-color: #7a3;
@@ -547,4 +559,8 @@ progress #-servo-progress-bar {
 
 slot {
   display: contents;
+}
+
+*::selection {
+  background: rgba(176, 214, 255, 1.0);
 }

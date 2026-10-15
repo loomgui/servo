@@ -17,7 +17,6 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::characterdata::CharacterData;
 use crate::dom::document::Document;
-use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmlslotelement::{HTMLSlotElement, Slottable};
 use crate::dom::node::Node;
 use crate::dom::window::Window;
@@ -74,37 +73,40 @@ impl TextMethods<crate::DomTypeHolder> for Text {
     /// <https://dom.spec.whatwg.org/#concept-text-split>
     fn SplitText(&self, cx: &mut JSContext, offset: u32) -> Fallible<DomRoot<Text>> {
         let cdata = self.upcast::<CharacterData>();
-        // Step 1.
+        // Step 1: Let length be node’s length.
         let length = cdata.Length();
+        // Step 2: If offset is greater than length, then throw an "IndexSizeError" DOMException.
         if offset > length {
-            // Step 2.
             return Err(Error::IndexSize(None));
         }
-        // Step 3.
+        // Step 3: Let count be length − offset.
         let count = length - offset;
-        // Step 4.
+        // Step 4: Let newData be the result of substringing data of node with offset and count.
         let new_data = cdata.SubstringData(offset, count).unwrap();
-        // Step 5.
+        // Step 5: Let newNode be the result of creating a text node given node’s node document and newData.
         let node = self.upcast::<Node>();
-        let owner_doc = node.owner_doc();
-        let new_node = owner_doc.CreateTextNode(cx, new_data);
-        // Step 6.
+        let document = node.owner_doc();
+        let new_text_node = document.CreateTextNode(cx, new_data);
+        // Step 6: Let parent be node’s parent.
         let parent = node.GetParentNode();
+        // Step 7: If parent is non-null:
         if let Some(ref parent) = parent {
-            // Step 7.1.
+            // Step 7.1: Insert newNode into parent before node’s next sibling.
+            let new_node = new_text_node.upcast();
             parent
-                .InsertBefore(cx, new_node.upcast(), node.GetNextSibling().as_deref())
+                .InsertBefore(cx, new_node, node.GetNextSibling().as_deref())
                 .unwrap();
-            // Steps 7.2-3.
-            node.ranges()
-                .move_to_following_text_sibling_above(node, offset, new_node.upcast());
-            // Steps 7.4-5.
-            parent.ranges().increment_at(parent, node.index() + 1);
+
+            // Steps 7.2-7.5: The live range update steps.
+            if let Some(selection) = document.selection() {
+                selection.text_split_steps(node, offset, parent, new_node);
+            }
+            document.live_range_text_split_steps(cx.no_gc(), parent, node, offset, new_node);
         }
         // Step 8.
         cdata.DeleteData(cx, offset, count).unwrap();
         // Step 9.
-        Ok(new_node)
+        Ok(new_text_node)
     }
 
     /// <https://dom.spec.whatwg.org/#dom-text-wholetext>
@@ -127,12 +129,10 @@ impl TextMethods<crate::DomTypeHolder> for Text {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-slotable-assignedslot>
-    fn GetAssignedSlot(&self) -> Option<DomRoot<HTMLSlotElement>> {
-        let cx = GlobalScope::get_cx();
-
+    fn GetAssignedSlot(&self, cx: &JSContext) -> Option<DomRoot<HTMLSlotElement>> {
         // > The assignedSlot getter steps are to return the result of
         // > find a slot given this and with the open flag set.
-        rooted!(in(*cx) let slottable = Slottable(Dom::from_ref(self.upcast::<Node>())));
-        slottable.find_a_slot(true)
+        rooted!(&in(cx) let slottable = Slottable(Dom::from_ref(self.upcast::<Node>())));
+        slottable.find_a_slot(cx.no_gc(), true)
     }
 }

@@ -6,7 +6,7 @@ use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::rust::HandleObject;
 use script_bindings::codegen::InheritTypes::{CharacterDataTypeId, NodeTypeId};
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto_and_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use xpath::{Expression, evaluate_parsed_xpath};
 
 use crate::dom::bindings::codegen::Bindings::XPathExpressionBinding::XPathExpressionMethods;
@@ -41,11 +41,11 @@ impl XPathExpression {
         proto: Option<HandleObject>,
         parsed_expression: Expression,
     ) -> DomRoot<XPathExpression> {
-        reflect_dom_object_with_proto_and_cx(
+        reflect_dom_object_with_proto(
+            cx,
             Box::new(XPathExpression::new_inherited(window, parsed_expression)),
             window,
             proto,
-            cx,
         )
     }
 
@@ -87,8 +87,8 @@ impl XPathExpression {
         // Cast the result to the type we wanted
         let result_value: Value = match result_type {
             XPathResultType::Boolean => result_value.convert_to_boolean().into(),
-            XPathResultType::Number => result_value.convert_to_number().into(),
-            XPathResultType::String => result_value.convert_to_string().into(),
+            XPathResultType::Number => result_value.convert_to_number(cx).into(),
+            XPathResultType::String => result_value.convert_to_string(cx).into(),
             _ => result_value,
         };
 
@@ -108,15 +108,14 @@ impl XPathExpression {
         if let Some(result) = result {
             // According to https://www.w3.org/TR/DOM-Level-3-XPath/xpath.html#XPathEvaluator-evaluate, reusing
             // the provided result object is optional. We choose to do it here because thats what other browsers do.
-            result.reinitialize_with(inferred_result_type, result_value.into());
+            result.reinitialize_with(cx.no_gc(), inferred_result_type, result_value);
             Ok(DomRoot::from_ref(result))
         } else {
             Ok(XPathResult::new(
                 cx,
                 window,
-                None,
                 inferred_result_type,
-                result_value.into(),
+                result_value,
             ))
         }
     }

@@ -17,14 +17,14 @@ use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue}
 use js::typedarray::{ArrayBufferView, ArrayBufferViewU8};
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{
-    Reflector, reflect_dom_object_with_cx, reflect_dom_object_with_proto_and_cx,
+    Reflector, reflect_dom_object_with_cx, reflect_dom_object_with_proto,
 };
 use script_bindings::root::Dom;
 
 use super::byteteereadintorequest::ByteTeeReadIntoRequest;
 use super::readablebytestreamcontroller::ReadableByteStreamController;
 use super::readablestreamgenericreader::ReadableStreamGenericReader;
-use crate::dom::bindings::buffer_source::{BufferSource, HeapBufferSource};
+use crate::dom::bindings::buffer_source::HeapBufferSource;
 use crate::dom::bindings::codegen::Bindings::ReadableStreamBYOBReaderBinding::{
     ReadableStreamBYOBReaderMethods, ReadableStreamBYOBReaderReadOptions,
 };
@@ -34,20 +34,23 @@ use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::promise::Promise;
+use crate::dom::promise::{Promise, RootedPromise, TracedPromise};
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
 use crate::dom::stream::readablestream::ReadableStream;
 use crate::realms::enter_auto_realm;
 
 /// <https://streams.spec.whatwg.org/#read-into-request>
 #[derive(Clone, JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub enum ReadIntoRequest {
     /// <https://streams.spec.whatwg.org/#byob-reader-read>
-    Read(#[conditional_malloc_size_of] Rc<Promise>),
+    Read(TracedPromise),
     ByteTee {
         byte_tee_read_into_request: Dom<ByteTeeReadIntoRequest>,
     },
 }
+
+impl js::gc::Rootable for ReadIntoRequest {}
 
 impl ReadIntoRequest {
     /// <https://streams.spec.whatwg.org/#ref-for-read-into-request-chunk-steps%E2%91%A0>
@@ -66,11 +69,15 @@ impl ReadIntoRequest {
             },
             ReadIntoRequest::ByteTee {
                 byte_tee_read_into_request,
-            } => byte_tee_read_into_request.enqueue_chunk_steps(RootedTraceableBox::new(
-                HeapBufferSource::<ArrayBufferViewU8>::new(BufferSource::ArrayBufferView(
-                    Heap::boxed(chunk.get().to_object()),
-                )),
-            )),
+            } => {
+                rooted!(&in(cx) let chunk_object = chunk.get().to_object());
+                byte_tee_read_into_request.enqueue_chunk_steps(
+                    cx,
+                    RootedTraceableBox::new(HeapBufferSource::<ArrayBufferViewU8>::new(
+                        chunk_object.handle(),
+                    )),
+                )
+            },
         }
     }
 
@@ -102,16 +109,17 @@ impl ReadIntoRequest {
             ReadIntoRequest::ByteTee {
                 byte_tee_read_into_request,
             } => match chunk {
-                Some(chunk) => byte_tee_read_into_request
-                    .close_steps(
-                        cx,
-                        Some(RootedTraceableBox::new(
-                            HeapBufferSource::<ArrayBufferViewU8>::new(
-                                BufferSource::ArrayBufferView(Heap::boxed(chunk.get().to_object())),
-                            ),
-                        )),
-                    )
-                    .expect("close steps should not fail"),
+                Some(chunk) => {
+                    rooted!(&in(cx) let chunk_object = chunk.get().to_object());
+                    byte_tee_read_into_request
+                        .close_steps(
+                            cx,
+                            Some(RootedTraceableBox::new(
+                                HeapBufferSource::<ArrayBufferViewU8>::new(chunk_object.handle()),
+                            )),
+                        )
+                        .expect("close steps should not fail")
+                },
                 None => byte_tee_read_into_request
                     .close_steps(cx, None)
                     .expect("close steps should not fail"),
@@ -147,8 +155,7 @@ struct ByteTeeClosedPromiseRejectionHandler {
     canceled_1: Rc<Cell<bool>>,
     #[conditional_malloc_size_of]
     canceled_2: Rc<Cell<bool>>,
-    #[conditional_malloc_size_of]
-    cancel_promise: Rc<Promise>,
+    cancel_promise: TracedPromise,
     #[conditional_malloc_size_of]
     reader_version: Rc<Cell<u64>>,
     expected_version: u64,
@@ -187,8 +194,7 @@ pub(crate) struct ReadableStreamBYOBReader {
     read_into_requests: DomRefCell<VecDeque<ReadIntoRequest>>,
 
     /// <https://streams.spec.whatwg.org/#readablestreamgenericreader-closedpromise>
-    #[conditional_malloc_size_of]
-    closed_promise: DomRefCell<Rc<Promise>>,
+    closed_promise: DomRefCell<TracedPromise>,
 }
 
 impl ReadableStreamBYOBReader {
@@ -197,20 +203,21 @@ impl ReadableStreamBYOBReader {
         global: &GlobalScope,
         proto: Option<SafeHandleObject>,
     ) -> DomRoot<ReadableStreamBYOBReader> {
-        reflect_dom_object_with_proto_and_cx(
-            Box::new(ReadableStreamBYOBReader::new_inherited(cx, global)),
+        let closed_promise = Promise::new(cx, global);
+        reflect_dom_object_with_proto(
+            cx,
+            Box::new(ReadableStreamBYOBReader::new_inherited(&closed_promise)),
             global,
             proto,
-            cx,
         )
     }
 
-    fn new_inherited(cx: &mut JSContext, global: &GlobalScope) -> ReadableStreamBYOBReader {
+    fn new_inherited(promise: &RootedPromise) -> ReadableStreamBYOBReader {
         ReadableStreamBYOBReader {
             reflector_: Reflector::new(),
             stream: MutNullableDom::new(None),
             read_into_requests: DomRefCell::new(Default::default()),
-            closed_promise: DomRefCell::new(Promise::new(cx, global)),
+            closed_promise: DomRefCell::new(promise.to_traced()),
         }
     }
 
@@ -218,7 +225,8 @@ impl ReadableStreamBYOBReader {
         cx: &mut JSContext,
         global: &GlobalScope,
     ) -> DomRoot<ReadableStreamBYOBReader> {
-        reflect_dom_object_with_cx(Box::new(Self::new_inherited(cx, global)), global, cx)
+        let closed_promise = Promise::new(cx, global);
+        reflect_dom_object_with_cx(Box::new(Self::new_inherited(&closed_promise)), global, cx)
     }
 
     /// <https://streams.spec.whatwg.org/#set-up-readable-stream-byob-reader>
@@ -275,10 +283,10 @@ impl ReadableStreamBYOBReader {
         self.closed_promise.borrow().set_promise_is_handled(cx);
 
         // Let readRequests be reader.[[readRequests]].
-        let mut read_into_requests = self.take_read_into_requests();
+        rooted!(&in(cx) let read_into_requests = self.take_read_into_requests());
 
         // Set reader.[[readIntoRequests]] to a new empty list.
-        for request in read_into_requests.drain(0..) {
+        for request in read_into_requests.iter() {
             // Perform readIntoRequest’s error steps, given e.
             request.error_steps(cx, e);
         }
@@ -299,10 +307,10 @@ impl ReadableStreamBYOBReader {
     pub(crate) fn cancel(&self, cx: &mut JSContext) {
         // If reader is not undefined and reader implements ReadableStreamBYOBReader,
         // Let readIntoRequests be reader.[[readIntoRequests]].
-        let mut read_into_requests = self.take_read_into_requests();
+        rooted!(&in(cx) let read_into_requests = self.take_read_into_requests());
         // Set reader.[[readIntoRequests]] to an empty list.
         // Perform readIntoRequest’s close steps, given undefined.
-        for request in read_into_requests.drain(0..) {
+        for request in read_into_requests.iter() {
             // Perform readIntoRequest’s close steps, given undefined.
             request.close_steps(cx, None);
         }
@@ -362,7 +370,7 @@ impl ReadableStreamBYOBReader {
         branch_2: &ReadableStream,
         canceled_1: Rc<Cell<bool>>,
         canceled_2: Rc<Cell<bool>>,
-        cancel_promise: Rc<Promise>,
+        cancel_promise: &RootedPromise,
         reader_version: Rc<Cell<u64>>,
         expected_version: u64,
     ) {
@@ -380,7 +388,7 @@ impl ReadableStreamBYOBReader {
                 branch_2_controller: Dom::from_ref(&branch_2_controller),
                 canceled_1,
                 canceled_2,
-                cancel_promise,
+                cancel_promise: cancel_promise.to_traced(),
                 reader_version,
                 expected_version,
             })),
@@ -417,8 +425,8 @@ impl ReadableStreamBYOBReaderMethods<crate::DomTypeHolder> for ReadableStreamBYO
         cx: &mut JSContext,
         view: CustomAutoRooterGuard<ArrayBufferView>,
         options: &ReadableStreamBYOBReaderReadOptions,
-    ) -> Rc<Promise> {
-        let view = HeapBufferSource::<ArrayBufferViewU8>::from_view(view);
+    ) -> RootedPromise {
+        let view = HeapBufferSource::<ArrayBufferViewU8>::from_view(cx, view);
         let min = options.min;
         // Let promise be a new promise.
         let promise = Promise::new(cx, &self.global());
@@ -430,7 +438,7 @@ impl ReadableStreamBYOBReaderMethods<crate::DomTypeHolder> for ReadableStreamBYO
         }
         // If view.[[ViewedArrayBuffer]].[[ArrayBufferByteLength]] is 0,
         // return a promise rejected with a TypeError exception.
-        if view.viewed_buffer_array_byte_length(cx.into()) == 0 {
+        if view.viewed_buffer_array_byte_length(cx) == 0 {
             promise.reject_error(
                 cx,
                 Error::Type(c"viewed buffer byte length is 0".to_owned()),
@@ -440,7 +448,7 @@ impl ReadableStreamBYOBReaderMethods<crate::DomTypeHolder> for ReadableStreamBYO
 
         // If ! IsDetachedBuffer(view.[[ViewedArrayBuffer]]) is true,
         // return a promise rejected with a TypeError exception.
-        if view.is_detached_buffer(cx.into()) {
+        if view.is_detached_buffer(cx) {
             promise.reject_error(cx, Error::Type(c"view is detached".to_owned()));
             return promise;
         }
@@ -492,7 +500,7 @@ impl ReadableStreamBYOBReaderMethods<crate::DomTypeHolder> for ReadableStreamBYO
         //
         // error steps, given e
         // Reject promise with e
-        let read_into_request = ReadIntoRequest::Read(promise.clone());
+        rooted!(&in(cx) let read_into_request = ReadIntoRequest::Read(promise.to_traced()));
 
         // Perform ! ReadableStreamBYOBReaderRead(this, view, options["min"], readIntoRequest).
         self.read(cx, &view, min, &read_into_request);
@@ -513,23 +521,23 @@ impl ReadableStreamBYOBReaderMethods<crate::DomTypeHolder> for ReadableStreamBYO
     }
 
     /// <https://streams.spec.whatwg.org/#generic-reader-closed>
-    fn Closed(&self) -> Rc<Promise> {
-        self.closed()
+    fn Closed(&self, cx: &JSContext) -> RootedPromise {
+        self.closed(cx)
     }
 
     /// <https://streams.spec.whatwg.org/#generic-reader-cancel>
-    fn Cancel(&self, cx: &mut JSContext, reason: SafeHandleValue) -> Rc<Promise> {
+    fn Cancel(&self, cx: &mut JSContext, reason: SafeHandleValue) -> RootedPromise {
         self.generic_cancel(cx, &self.global(), reason)
     }
 }
 
 impl ReadableStreamGenericReader for ReadableStreamBYOBReader {
-    fn get_closed_promise(&self) -> Rc<Promise> {
-        self.closed_promise.borrow().clone()
+    fn get_closed_promise(&self, cx: &JSContext) -> RootedPromise {
+        self.closed_promise.borrow().root(cx)
     }
 
-    fn set_closed_promise(&self, promise: Rc<Promise>) {
-        *self.closed_promise.borrow_mut() = promise;
+    fn set_closed_promise(&self, promise: &RootedPromise) {
+        *self.closed_promise.borrow_mut() = promise.to_traced();
     }
 
     fn set_stream(&self, stream: Option<&ReadableStream>) {

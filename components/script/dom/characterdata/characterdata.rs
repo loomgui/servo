@@ -5,11 +5,13 @@
 //! DOM bindings for `CharacterData`.
 use std::cell::LazyCell;
 
+use atomic_refcell::{AtomicRef, AtomicRefCell};
 use dom_struct::dom_struct;
 use js::context::JSContext;
-use script_bindings::cell::{DomRefCell, Ref};
 use script_bindings::codegen::InheritTypes::{CharacterDataTypeId, NodeTypeId, TextTypeId};
+use servo_base::text::{AssumeUnder4GB, RangeAny, Utf16CodeUnits, Utf32CodeUnits};
 
+use crate::dom::bindings::cell::AtomicSafeBorrowMut;
 use crate::dom::bindings::codegen::Bindings::CharacterDataBinding::CharacterDataMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::Node_Binding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::ProcessingInstructionBinding::ProcessingInstructionMethods;
@@ -32,14 +34,15 @@ use crate::dom::text::Text;
 #[dom_struct]
 pub(crate) struct CharacterData {
     node: Node,
-    data: DomRefCell<String>,
+    #[no_trace]
+    data: AtomicRefCell<String>,
 }
 
 impl CharacterData {
     pub(crate) fn new_inherited(data: DOMString, document: &Document) -> CharacterData {
         CharacterData {
             node: Node::new_inherited(document),
-            data: DomRefCell::new(String::from(data)),
+            data: AtomicRefCell::new(String::from(data)),
         }
     }
 
@@ -68,20 +71,20 @@ impl CharacterData {
     }
 
     #[inline]
-    pub(crate) fn data(&self) -> Ref<'_, String> {
+    pub(crate) fn data(&self) -> AtomicRef<'_, String> {
         self.data.borrow()
     }
 
     #[inline]
     pub(crate) fn append_data(&self, cx: &mut JSContext, data: &str) {
-        self.queue_mutation_record();
-        self.data.borrow_mut().push_str(data);
+        self.queue_mutation_record(cx);
+        self.data.safe_borrow_mut(cx.no_gc()).push_str(data);
         self.content_changed(cx);
     }
 
     fn content_changed(&self, cx: &mut JSContext) {
         let node = self.upcast::<Node>();
-        node.dirty(NodeDamage::Other);
+        node.dirty(cx.no_gc(), NodeDamage::Other);
 
         // If this is a Text node, we might need to re-parse (say, if our parent
         // is a <style> element.) We don't need to if this is a Comment or
@@ -95,11 +98,32 @@ impl CharacterData {
     }
 
     // Queue a MutationObserver record before changing the content.
-    fn queue_mutation_record(&self) {
+    fn queue_mutation_record(&self, cx: &mut JSContext) {
         let mutation = LazyCell::new(|| Mutation::CharacterData {
             old_value: self.data.borrow().clone(),
         });
-        MutationObserver::queue_a_mutation_record(self.upcast::<Node>(), mutation);
+        MutationObserver::queue_a_mutation_record(cx, self.upcast::<Node>(), mutation);
+    }
+
+    /// Returns whether `new_range` was successfully set on an existing text run
+    pub(crate) fn set_text_run_selection(
+        &self,
+        new_range: Option<RangeAny<Utf32CodeUnits>>,
+    ) -> bool {
+        self.upcast::<Node>()
+            .layout_data()
+            .borrow()
+            .as_ref()
+            .is_some_and(|layout_data| layout_data.set_text_run_selection(new_range))
+    }
+
+    /// Returns the rendered text for this [`CharacterData`].
+    pub(crate) fn rendered_text(&self, range: RangeAny<Utf32CodeUnits>) -> Option<String> {
+        self.upcast::<Node>()
+            .layout_data()
+            .borrow()
+            .as_ref()
+            .and_then(|layout_data| layout_data.rendered_text(range))
     }
 }
 
@@ -111,19 +135,30 @@ impl CharacterDataMethods<crate::DomTypeHolder> for CharacterData {
 
     /// <https://dom.spec.whatwg.org/#dom-characterdata-data>
     fn SetData(&self, cx: &mut JSContext, data: DOMString) {
-        self.queue_mutation_record();
+        self.queue_mutation_record(cx);
         let old_length = self.Length();
-        let new_length = data.str().encode_utf16().count() as u32;
-        *self.data.borrow_mut() = String::from(data.str());
+        *self.data.safe_borrow_mut(cx.no_gc()) = String::from(data.str());
         self.content_changed(cx);
-        let node = self.upcast::<Node>();
-        node.ranges()
-            .replace_code_units(node, 0, old_length, new_length);
+
+        let mut utf16_length = None;
+        // TODO: ensure that DOMString’s are under 4 GiB?
+        let mut lazy_length = move || {
+            *utf16_length
+                .get_or_insert_with(|| Utf16CodeUnits::length_of(AssumeUnder4GB, &data.str()).0)
+        };
+
+        let node: &Node = self.upcast();
+        let document = node.owner_doc_unrooted(cx.no_gc());
+        if let Some(selection) = document.selection() {
+            selection.replace_data_steps(node, 0, old_length, &mut lazy_length);
+        }
+        document.live_range_replace_data_steps(cx.no_gc(), node, 0, old_length, &mut lazy_length);
     }
 
     /// <https://dom.spec.whatwg.org/#dom-characterdata-length>
     fn Length(&self) -> u32 {
-        self.data.borrow().encode_utf16().count() as u32
+        // TODO: ensure that DOMString’s are under 4 GiB?
+        Utf16CodeUnits::length_of(AssumeUnder4GB, &self.data.borrow()).0
     }
 
     /// <https://dom.spec.whatwg.org/#dom-characterdata-substringdata>
@@ -224,13 +259,13 @@ impl CharacterDataMethods<crate::DomTypeHolder> for CharacterData {
                 },
             };
             // Step 4: Mutation observers.
-            self.queue_mutation_record();
+            self.queue_mutation_record(cx);
 
             // Step 5 to 7.
             new_data = String::with_capacity(
                 prefix.len() +
                     replacement_before.len() +
-                    arg.len() +
+                    usize::from(arg.len_utf8()) +
                     replacement_after.len() +
                     suffix.len(),
             );
@@ -240,16 +275,32 @@ impl CharacterDataMethods<crate::DomTypeHolder> for CharacterData {
             new_data.push_str(replacement_after);
             new_data.push_str(suffix);
         }
-        *self.data.borrow_mut() = new_data;
+        *self.data.safe_borrow_mut(cx.no_gc()) = new_data;
         self.content_changed(cx);
-        // Steps 8-11.
+
         let node = self.upcast::<Node>();
-        node.ranges().replace_code_units(
-            node,
-            offset,
-            count,
-            arg.str().encode_utf16().count() as u32,
-        );
+
+        let mut utf16_length = None;
+        // TODO: ensure that DOMString’s are under 4 GiB?
+        let mut lazy_length = move || {
+            *utf16_length
+                .get_or_insert_with(|| Utf16CodeUnits::length_of(AssumeUnder4GB, &arg.str()).0)
+        };
+
+        let document = node.owner_doc_unrooted(cx.no_gc());
+        if let Some(selection) = document.selection() {
+            selection.replace_data_steps(node, offset, count, &mut lazy_length);
+        }
+        document.live_range_replace_data_steps(cx.no_gc(), node, offset, count, &mut lazy_length);
+
+        // Step 12: If node is a ProcessingInstruction node and piAttributesAlreadyUpdated
+        // is false, then update attributes from data given node.
+        // TODO: Implement this.
+
+        // Step 13: If node’s parent is non-null, then run the children changed steps for
+        // node’s parent.
+        // TODO: This is handled above, but it should be handled here.
+
         Ok(())
     }
 
@@ -289,10 +340,9 @@ impl CharacterDataMethods<crate::DomTypeHolder> for CharacterData {
 }
 
 impl<'dom> LayoutDom<'dom, CharacterData> {
-    #[expect(unsafe_code)]
     #[inline]
-    pub(crate) fn data_for_layout(self) -> &'dom str {
-        unsafe { self.unsafe_get().data.borrow_for_layout() }
+    pub(crate) fn data_for_layout(self) -> AtomicRef<'dom, str> {
+        AtomicRef::map(self.unsafe_get().data.borrow(), |data| &**data)
     }
 }
 

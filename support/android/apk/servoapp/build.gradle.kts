@@ -1,8 +1,8 @@
 import java.util.regex.Pattern
 
 plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.plugin.compose")
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.compose)
 }
 
 android {
@@ -13,15 +13,15 @@ android {
 
     defaultConfig {
         applicationId = "org.servo.servoshell"
-        minSdk = 30
+        minSdk = libs.versions.android.sdk.min.get().toInt()
         targetSdk = 34
         versionCode = generatedVersionCode
-        versionName = "0.3.0"
+        versionName = "0.7.0"
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
     }
 
     val signingKeyInfo = getSigningKeyInfo()
@@ -38,8 +38,7 @@ android {
     }
 
     buildTypes {
-        debug {
-        }
+        debug {}
 
         release {
             signingConfig =
@@ -53,54 +52,37 @@ android {
         val debug = getByName("debug")
         val release = getByName("release")
 
-
         register("armv7Debug") {
             initWith(debug)
-            ndk {
-                abiFilters.add(getNDKAbi("armv7"))
-            }
+            ndk { abiFilters.add(getNDKAbi("armv7")) }
         }
         register("armv7Release") {
             initWith(release)
-            ndk {
-                abiFilters.add(getNDKAbi("armv7"))
-            }
+            ndk { abiFilters.add(getNDKAbi("armv7")) }
         }
         register("arm64Debug") {
             initWith(debug)
-            ndk {
-                abiFilters.add(getNDKAbi("arm64"))
-            }
+            ndk { abiFilters.add(getNDKAbi("arm64")) }
         }
         register("arm64Release") {
             initWith(release)
-            ndk {
-                abiFilters.add(getNDKAbi("arm64"))
-            }
+            ndk { abiFilters.add(getNDKAbi("arm64")) }
         }
         register("x86Debug") {
             initWith(debug)
-            ndk {
-                abiFilters.add(getNDKAbi("x86"))
-            }
+            ndk { abiFilters.add(getNDKAbi("x86")) }
         }
         register("x86Release") {
             initWith(release)
-            ndk {
-                abiFilters.add(getNDKAbi("x86"))
-            }
+            ndk { abiFilters.add(getNDKAbi("x86")) }
         }
         register("x64Debug") {
             initWith(debug)
-            ndk {
-                abiFilters.add(getNDKAbi("x64"))
-            }
+            ndk { abiFilters.add(getNDKAbi("x64")) }
         }
         register("x64Release") {
             initWith(release)
-            ndk {
-                abiFilters.add(getNDKAbi("x64"))
-            }
+            ndk { abiFilters.add(getNDKAbi("x64")) }
         }
     }
 }
@@ -144,9 +126,8 @@ dependencies {
     } else {
         implementation(project(":servoview"))
     }
-    implementation("androidx.appcompat:appcompat:1.6.1")
-    implementation("com.google.android.material:material:1.13.0")
-    implementation("androidx.compose.material3:material3:1.4.0")
-    implementation("androidx.constraintlayout:constraintlayout:2.1.3")
-    implementation("androidx.preference:preference-ktx:1.2.0")
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.material3.compose)
+    implementation(libs.androidx.material3.compose.adaptive)
+    implementation(libs.androidx.preference)
 }

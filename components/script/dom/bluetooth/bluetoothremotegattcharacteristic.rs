@@ -2,17 +2,16 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::rc::Rc;
-
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::realm::CurrentRealm;
 use script_bindings::cell::DomRefCell;
-use script_bindings::reflector::reflect_dom_object_with_cx;
+use script_bindings::reflector::reflect_dom_object;
 use servo_base::generic_channel::GenericSender;
 use servo_bluetooth_traits::blocklist::{Blocklist, uuid_is_blocklisted};
 use servo_bluetooth_traits::{BluetoothRequest, BluetoothResponse, GATTType};
 
+use crate::dom::bindings::buffer_source::get_buffer_source_copy;
 use crate::dom::bindings::codegen::Bindings::BluetoothCharacteristicPropertiesBinding::BluetoothCharacteristicPropertiesMethods;
 use crate::dom::bindings::codegen::Bindings::BluetoothRemoteGATTCharacteristicBinding::BluetoothRemoteGATTCharacteristicMethods;
 use crate::dom::bindings::codegen::Bindings::BluetoothRemoteGATTServerBinding::BluetoothRemoteGATTServerMethods;
@@ -31,7 +30,7 @@ use crate::dom::bluetoothremotegattservice::BluetoothRemoteGATTService;
 use crate::dom::bluetoothuuid::{BluetoothDescriptorUUID, BluetoothUUID};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::promise::Promise;
+use crate::dom::promise::{Promise, RootedPromise};
 
 // Maximum length of an attribute value.
 // https://www.bluetooth.org/DocMan/handlers/DownloadDoc.ashx?doc_id=286439 (Vol. 3, page 2169)
@@ -73,7 +72,8 @@ impl BluetoothRemoteGATTCharacteristic {
         properties: &BluetoothCharacteristicProperties,
         instance_id: String,
     ) -> DomRoot<BluetoothRemoteGATTCharacteristic> {
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(BluetoothRemoteGATTCharacteristic::new_inherited(
                 service,
                 uuid,
@@ -81,7 +81,6 @@ impl BluetoothRemoteGATTCharacteristic {
                 instance_id,
             )),
             global,
-            cx,
         )
     }
 
@@ -117,7 +116,7 @@ impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
         &self,
         cx: &mut CurrentRealm,
         descriptor: BluetoothDescriptorUUID,
-    ) -> Rc<Promise> {
+    ) -> RootedPromise {
         let is_connected = self.Service().Device().get_gatt(cx).Connected();
         get_gatt_children(
             cx,
@@ -136,7 +135,7 @@ impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
         &self,
         cx: &mut CurrentRealm,
         descriptor: Option<BluetoothDescriptorUUID>,
-    ) -> Rc<Promise> {
+    ) -> RootedPromise {
         let is_connected = self.Service().Device().get_gatt(cx).Connected();
         get_gatt_children(
             cx,
@@ -156,7 +155,7 @@ impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
     }
 
     /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-readvalue>
-    fn ReadValue(&self, cx: &mut CurrentRealm) -> Rc<Promise> {
+    fn ReadValue(&self, cx: &mut CurrentRealm) -> RootedPromise {
         let p = Promise::new_in_realm(cx);
 
         // Step 1.
@@ -193,7 +192,7 @@ impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
         &self,
         cx: &mut CurrentRealm,
         value: ArrayBufferViewOrArrayBuffer,
-    ) -> Rc<Promise> {
+    ) -> RootedPromise {
         let p = Promise::new_in_realm(cx);
 
         // Step 1.
@@ -203,10 +202,7 @@ impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
         }
 
         // Step 2 - 3.
-        let vec = match value {
-            ArrayBufferViewOrArrayBuffer::ArrayBufferView(avb) => avb.to_vec(),
-            ArrayBufferViewOrArrayBuffer::ArrayBuffer(ab) => ab.to_vec(),
-        };
+        let vec = get_buffer_source_copy((&value).into());
 
         if vec.len() > MAXIMUM_ATTRIBUTE_LENGTH {
             p.reject_error(cx, InvalidModification(None));
@@ -244,7 +240,7 @@ impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
     }
 
     /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-startnotifications>
-    fn StartNotifications(&self, cx: &mut CurrentRealm) -> Rc<Promise> {
+    fn StartNotifications(&self, cx: &mut CurrentRealm) -> RootedPromise {
         let p = Promise::new_in_realm(cx);
 
         // Step 1.
@@ -281,7 +277,7 @@ impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
     }
 
     /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-stopnotifications>
-    fn StopNotifications(&self, cx: &mut CurrentRealm) -> Rc<Promise> {
+    fn StopNotifications(&self, cx: &mut CurrentRealm) -> RootedPromise {
         let p = Promise::new_in_realm(cx);
         let sender = response_async(&p, self);
 
@@ -312,7 +308,7 @@ impl AsyncBluetoothListener for BluetoothRemoteGATTCharacteristic {
         &self,
         cx: &mut JSContext,
         response: BluetoothResponse,
-        promise: &Rc<Promise>,
+        promise: &RootedPromise,
     ) {
         let device = self.Service().Device();
         match response {
@@ -338,7 +334,7 @@ impl AsyncBluetoothListener for BluetoothRemoteGATTCharacteristic {
                 // Step 5.5.2.
                 // TODO(#5014): Replace ByteString with ArrayBuffer when it is implemented.
                 let value = ByteString::new(result);
-                *self.value.borrow_mut() = Some(value.clone());
+                *self.value.safe_borrow_mut(cx.no_gc()) = Some(value.clone());
 
                 // Step 5.5.3.
                 self.upcast::<EventTarget>()
@@ -353,7 +349,7 @@ impl AsyncBluetoothListener for BluetoothRemoteGATTCharacteristic {
 
                 // Step 7.5.2.
                 // TODO(#5014): Replace ByteString with an ArrayBuffer wrapped in a DataView.
-                *self.value.borrow_mut() = Some(ByteString::new(result));
+                *self.value.safe_borrow_mut(cx.no_gc()) = Some(ByteString::new(result));
 
                 // Step 7.5.3.
                 promise.resolve_native(cx, &());

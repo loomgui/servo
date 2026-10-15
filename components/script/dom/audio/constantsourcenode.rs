@@ -2,14 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::f32;
-
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::rust::HandleObject;
-use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
+use script_bindings::reflector::reflect_dom_object_with_proto;
+use servo_media::audio::audio_node::{AudioNodeInit, AudioNodeType};
 use servo_media::audio::constant_source_node::ConstantSourceNodeOptions as ServoMediaConstantSourceOptions;
-use servo_media::audio::node::{AudioNodeInit, AudioNodeType};
 use servo_media::audio::param::ParamType;
 
 use crate::conversions::Convert;
@@ -49,6 +47,7 @@ impl ConstantSourceNode {
             1,            /* outputs */
         )?;
         let node_id = source_node.node().node_id();
+        // <https://webaudio.github.io/web-audio-api/#dom-constantsourcenode-offset>
         let offset = AudioParam::new(
             cx,
             window,
@@ -86,11 +85,11 @@ impl ConstantSourceNode {
         options: &ConstantSourceOptions,
     ) -> Fallible<DomRoot<ConstantSourceNode>> {
         let node = ConstantSourceNode::new_inherited(cx, window, context, options)?;
-        Ok(reflect_dom_object_with_proto_and_cx(
+        Ok(reflect_dom_object_with_proto(
+            cx,
             Box::new(node),
             window,
             proto,
-            cx,
         ))
     }
 }

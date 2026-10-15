@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#![cfg_attr(crown, allow(crown::jscontext_first_arg))]
+
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -11,19 +13,19 @@ use js::jsapi::Heap;
 use js::jsval::{JSVal, UndefinedValue};
 use js::typedarray::ArrayBufferViewU8;
 use script_bindings::error::Fallible;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use super::byteteeunderlyingsource::ByteTeePullAlgorithm;
-use crate::dom::bindings::buffer_source::{BufferSource, HeapBufferSource};
+use crate::dom::bindings::buffer_source::HeapBufferSource;
 use crate::dom::bindings::error::{Error, ErrorToJsval};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::promise::Promise;
+use crate::dom::promise::{RootedPromise, TracedPromise};
 use crate::dom::stream::byteteeunderlyingsource::ByteTeeUnderlyingSource;
 use crate::dom::stream::readablestream::ReadableStream;
-use crate::microtask::Microtask;
+use crate::runtime::job_queue::MicrotaskRunnable;
 
 #[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, expect(crown::unrooted_must_root))]
@@ -33,8 +35,8 @@ pub(crate) struct ByteTeeReadRequestMicrotask {
     tee_read_request: Dom<ByteTeeReadRequest>,
 }
 
-impl ByteTeeReadRequestMicrotask {
-    pub(crate) fn microtask_chunk_steps(&self, cx: &mut JSContext) {
+impl MicrotaskRunnable for ByteTeeReadRequestMicrotask {
+    fn handler(&self, cx: &mut JSContext) {
         self.tee_read_request
             .chunk_steps(&self.chunk, cx)
             .expect("ByteTeeReadRequestMicrotask::microtask_chunk_steps failed");
@@ -58,8 +60,7 @@ pub(crate) struct ByteTeeReadRequest {
     canceled_1: Rc<Cell<bool>>,
     #[conditional_malloc_size_of]
     canceled_2: Rc<Cell<bool>>,
-    #[conditional_malloc_size_of]
-    cancel_promise: Rc<Promise>,
+    cancel_promise: TracedPromise,
     tee_underlying_source: Dom<ByteTeeUnderlyingSource>,
 }
 impl ByteTeeReadRequest {
@@ -74,11 +75,12 @@ impl ByteTeeReadRequest {
         reading: Rc<Cell<bool>>,
         canceled_1: Rc<Cell<bool>>,
         canceled_2: Rc<Cell<bool>>,
-        cancel_promise: Rc<Promise>,
+        cancel_promise: &RootedPromise,
         tee_underlying_source: &ByteTeeUnderlyingSource,
         global: &GlobalScope,
     ) -> DomRoot<Self> {
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(ByteTeeReadRequest {
                 reflector_: Reflector::new(),
                 branch_1: Dom::from_ref(branch_1),
@@ -89,11 +91,10 @@ impl ByteTeeReadRequest {
                 reading,
                 canceled_1,
                 canceled_2,
-                cancel_promise,
+                cancel_promise: cancel_promise.to_traced(),
                 tee_underlying_source: Dom::from_ref(tee_underlying_source),
             }),
             global,
-            cx,
         )
     }
 
@@ -101,6 +102,7 @@ impl ByteTeeReadRequest {
     /// <https://streams.spec.whatwg.org/#ref-for-read-request-chunk-steps%E2%91%A2>
     pub(crate) fn enqueue_chunk_steps(
         &self,
+        cx: &mut JSContext,
         global: &GlobalScope,
         chunk: RootedTraceableBox<Heap<JSVal>>,
     ) {
@@ -109,9 +111,7 @@ impl ByteTeeReadRequest {
             chunk: Heap::boxed(*chunk.handle()),
             tee_read_request: Dom::from_ref(self),
         };
-        global.enqueue_microtask(Microtask::ReadableStreamByteTeeReadRequest(
-            byte_tee_read_request_chunk,
-        ));
+        global.enqueue_microtask(cx, Box::new(byte_tee_read_request_chunk));
     }
 
     /// <https://streams.spec.whatwg.org/#ref-for-read-request-chunk-steps%E2%91%A3>
@@ -124,8 +124,7 @@ impl ByteTeeReadRequest {
         self.read_again_for_branch_2.set(false);
 
         // Let chunk1 and chunk2 be chunk.
-        let chunk1 = chunk;
-        let chunk2 = chunk;
+        rooted!(&in(cx) let chunk_object = chunk.get().to_object());
 
         // Helper to surface clone failures exactly once
         let handle_clone_error = |cx: &mut JSContext, error: Error| {
@@ -147,9 +146,7 @@ impl ByteTeeReadRequest {
         // Prepare per branch chunks ahead of the spec enqueue steps.
         let chunk1_view = if !self.canceled_1.get() {
             Some(RootedTraceableBox::new(
-                HeapBufferSource::<ArrayBufferViewU8>::new(BufferSource::ArrayBufferView(
-                    Heap::boxed(chunk1.get().to_object()),
-                )),
+                HeapBufferSource::<ArrayBufferViewU8>::new(chunk_object.handle()),
             ))
         } else {
             None
@@ -160,10 +157,9 @@ impl ByteTeeReadRequest {
         // If canceled1 is false and canceled2 is false,
         if !self.canceled_1.get() && !self.canceled_2.get() {
             // Let cloneResult be CloneAsUint8Array(chunk).
-            let chunk2_source =
-                RootedTraceableBox::new(HeapBufferSource::<ArrayBufferViewU8>::new(
-                    BufferSource::ArrayBufferView(Heap::boxed(chunk2.get().to_object())),
-                ));
+            let chunk2_source = RootedTraceableBox::new(
+                HeapBufferSource::<ArrayBufferViewU8>::new(chunk_object.handle()),
+            );
             let clone_result = chunk2_source.clone_as_uint8_array(cx);
 
             // If cloneResult is an abrupt completion,
@@ -176,10 +172,9 @@ impl ByteTeeReadRequest {
             }
         } else if !self.canceled_2.get() {
             // Only branch2 needs data; clone once for it.
-            let chunk2_source =
-                RootedTraceableBox::new(HeapBufferSource::<ArrayBufferViewU8>::new(
-                    BufferSource::ArrayBufferView(Heap::boxed(chunk2.get().to_object())),
-                ));
+            let chunk2_source = RootedTraceableBox::new(
+                HeapBufferSource::<ArrayBufferViewU8>::new(chunk_object.handle()),
+            );
             match chunk2_source.clone_as_uint8_array(cx) {
                 Ok(clone) => chunk2_view = Some(clone),
                 Err(error) => {

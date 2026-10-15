@@ -8,11 +8,11 @@ use std::convert::TryInto;
 use std::ops::Deref;
 use std::sync::LazyLock;
 
+use bytes::Bytes;
 use dom_struct::dom_struct;
 use embedder_traits::{EmbedderMsg, ProtocolHandlerUpdateRegistration, RegisterOrUnregister};
 use headers::HeaderMap;
 use http::header::{self, HeaderValue};
-#[cfg(feature = "webgpu")]
 use js::context::JSContext;
 use js::rust::MutableHandleValue;
 use net_traits::blob_url_store::UrlWithBlobClaim;
@@ -24,12 +24,11 @@ use net_traits::{FetchMetadata, NetworkError, ResourceFetchTiming};
 use regex::Regex;
 #[cfg(feature = "gamepad")]
 use script_bindings::cell::DomRefCell;
-use script_bindings::reflector::{Reflector, reflect_dom_object};
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
 use servo_base::generic_channel;
 use servo_config::pref;
 use servo_url::ServoUrl;
 
-use crate::body::Extractable;
 use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorMethods;
 #[cfg(feature = "gamepad")]
 use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::PermissionName;
@@ -67,9 +66,11 @@ use crate::dom::webgpu::gpu::GPU;
 use crate::dom::window::Window;
 #[cfg(feature = "webxr")]
 use crate::dom::xrsystem::XRSystem;
-use crate::fetch::RequestWithGlobalScope;
-use crate::network_listener::{FetchResponseListener, ResourceTimingListener, submit_timing};
-use crate::script_runtime::CanGc;
+use crate::fetch::body::Extractable;
+use crate::fetch::fetch::RequestWithGlobalScope;
+use crate::fetch::network_listener::{
+    FetchResponseListener, ResourceTimingListener, submit_timing,
+};
 
 pub(crate) fn hardware_concurrency() -> u64 {
     static CPUS: LazyLock<u64> = LazyLock::new(|| num_cpus::get().try_into().unwrap_or(1));
@@ -171,8 +172,8 @@ impl Navigator {
         }
     }
 
-    pub(crate) fn new(window: &Window, can_gc: CanGc) -> DomRoot<Navigator> {
-        reflect_dom_object(Box::new(Navigator::new_inherited()), window, can_gc)
+    pub(crate) fn new(cx: &mut JSContext, window: &Window) -> DomRoot<Navigator> {
+        reflect_dom_object_with_cx(Box::new(Navigator::new_inherited()), window, cx)
     }
 
     #[cfg(feature = "webxr")]
@@ -356,9 +357,9 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
     }
 
     /// <https://www.w3.org/TR/credential-management-1/#framework-credential-management>
-    fn Credentials(&self) -> DomRoot<CredentialsContainer> {
+    fn Credentials(&self, cx: &mut js::context::JSContext) -> DomRoot<CredentialsContainer> {
         self.credentials
-            .or_init(|| CredentialsContainer::new(&self.global(), CanGc::deprecated_note()))
+            .or_init(|| CredentialsContainer::new(cx, &self.global()))
     }
 
     /// <https://www.w3.org/TR/geolocation/#navigator_interface>
@@ -371,7 +372,7 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
         navigatorinfo::Language()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-navigator-languages
+    /// <https://html.spec.whatwg.org/multipage/#dom-navigator-languages>
     fn Languages(&self, cx: &mut js::context::JSContext, retval: MutableHandleValue) {
         to_frozen_array(cx, &[self.Language()], retval)
     }
@@ -382,15 +383,15 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-navigator-plugins>
-    fn Plugins(&self) -> DomRoot<PluginArray> {
+    fn Plugins(&self, cx: &mut JSContext) -> DomRoot<PluginArray> {
         self.plugins
-            .or_init(|| PluginArray::new(&self.global(), CanGc::deprecated_note()))
+            .or_init(|| PluginArray::new(cx, &self.global()))
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-navigator-mimetypes>
-    fn MimeTypes(&self) -> DomRoot<MimeTypeArray> {
+    fn MimeTypes(&self, cx: &mut JSContext) -> DomRoot<MimeTypeArray> {
         self.mime_types
-            .or_init(|| MimeTypeArray::new(&self.global(), CanGc::deprecated_note()))
+            .or_init(|| MimeTypeArray::new(cx, &self.global()))
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-navigator-javaenabled>
@@ -416,7 +417,7 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
 
     /// <https://www.w3.org/TR/gamepad/#dom-navigator-getgamepads>
     #[cfg(feature = "gamepad")]
-    fn GetGamepads(&self) -> Fallible<Vec<Option<DomRoot<Gamepad>>>> {
+    fn GetGamepads(&self, cx: &mut JSContext) -> Fallible<Vec<Option<DomRoot<Gamepad>>>> {
         use script_bindings::codegen::GenericBindings::PerformanceBinding::PerformanceMethods;
 
         // Step 1. Let doc be the current global object's associated Document.
@@ -443,7 +444,7 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
         }
 
         // Step 5. Let now be the current high resolution time given the current global object.
-        let now = *window.Performance().Now();
+        let now = *window.Performance(cx).Now();
 
         // Step 6. Let gamepads be an empty list.
         // Step 7. For each gamepad of this.[[gamepads]]:
@@ -466,9 +467,9 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
         // Step 8. Return gamepads.
     }
     /// <https://w3c.github.io/permissions/#navigator-and-workernavigator-extension>
-    fn Permissions(&self) -> DomRoot<Permissions> {
+    fn Permissions(&self, cx: &mut JSContext) -> DomRoot<Permissions> {
         self.permissions
-            .or_init(|| Permissions::new(&self.global(), CanGc::deprecated_note()))
+            .or_init(|| Permissions::new(cx, &self.global()))
     }
 
     /// <https://immersive-web.github.io/webxr/#dom-navigator-xr>
@@ -479,13 +480,13 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
     }
 
     /// <https://w3c.github.io/mediacapture-main/#dom-navigator-mediadevices>
-    fn MediaDevices(&self) -> DomRoot<MediaDevices> {
+    fn MediaDevices(&self, cx: &mut JSContext) -> DomRoot<MediaDevices> {
         self.mediadevices
-            .or_init(|| MediaDevices::new(&self.global(), CanGc::deprecated_note()))
+            .or_init(|| MediaDevices::new(cx, &self.global()))
     }
 
     /// <https://w3c.github.io/mediasession/#dom-navigator-mediasession>
-    fn MediaSession(&self) -> DomRoot<MediaSession> {
+    fn MediaSession(&self, cx: &mut JSContext) -> DomRoot<MediaSession> {
         self.mediasession.or_init(|| {
             // There is a single MediaSession instance per Pipeline
             // and only one active MediaSession globally.
@@ -496,7 +497,7 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
             // - If a media instance (HTMLMediaElement so far) starts playing media.
             let global = self.global();
             let window = global.as_window();
-            MediaSession::new(window, CanGc::deprecated_note())
+            MediaSession::new(cx, window)
         })
     }
 
@@ -520,7 +521,7 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
     /// <https://storage.spec.whatwg.org/#api>
     fn Storage(&self, cx: &mut js::context::JSContext) -> DomRoot<StorageManager> {
         self.storage
-            .or_init(|| StorageManager::new(&self.global(), CanGc::from_cx(cx)))
+            .or_init(|| StorageManager::new(cx, &self.global()))
     }
 
     /// <https://w3c.github.io/beacon/#sec-processing-model>
@@ -535,7 +536,7 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
         let base = global.api_base_url();
         // Step 2. Set origin to this's relevant settings object's origin.
         //
-        // Handled in `crate::fetch::RequestWithGlobalScope::with_global_scope`
+        // Handled in `crate::fetch::fetch::RequestWithGlobalScope::with_global_scope`
 
         // Step 3. Set parsedUrl to the result of the URL parser steps with url and base.
         // If the algorithm returns an error, or if parsedUrl's scheme is not "http" or "https",
@@ -579,12 +580,11 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
                 //
                 // We cannot use typed header insertion with `mime::Mime` parsing here,
                 // since it lowercases `charset=UTF-8`: https://github.com/hyperium/mime/issues/116
-                headers.insert(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_str(&content_type.str()).unwrap(),
-                );
+                if let Ok(content_type_header_value) = HeaderValue::from_str(&content_type.str()) {
+                    headers.insert(header::CONTENT_TYPE, content_type_header_value);
+                }
             }
-            request_body = Some(extracted_body.into_net_request_body().0);
+            request_body = Some(extracted_body.into_net_request_body(cx).0);
         }
         // Step 7.1. Let req be a new request, initialized as follows:
         let request = RequestBuilder::new(
@@ -615,9 +615,9 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
     }
 
     /// <https://servo.org/internal-no-spec>
-    fn Servo(&self) -> DomRoot<ServoInternals> {
+    fn Servo(&self, cx: &mut js::context::JSContext) -> DomRoot<ServoInternals> {
         self.servo_internals
-            .or_init(|| ServoInternals::new(&self.global(), CanGc::deprecated_note()))
+            .or_init(|| ServoInternals::new(cx, &self.global()))
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-navigator-registerprotocolhandler>
@@ -693,7 +693,7 @@ impl FetchResponseListener for BeaconFetchListener {
         &mut self,
         _: &mut js::context::JSContext,
         _: RequestId,
-        chunk: Vec<u8>,
+        chunk: Bytes,
     ) {
         _ = chunk;
     }
@@ -708,9 +708,14 @@ impl FetchResponseListener for BeaconFetchListener {
         submit_timing(cx, &self, &response, &timing);
     }
 
-    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
+    fn process_csp_violations(
+        &mut self,
+        cx: &mut js::context::JSContext,
+        _request_id: RequestId,
+        violations: Vec<Violation>,
+    ) {
         let global = self.resource_timing_global();
-        global.report_csp_violations(violations, None, None);
+        global.report_csp_violations(cx, violations, None, None);
     }
 }
 

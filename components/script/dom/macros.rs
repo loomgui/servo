@@ -102,25 +102,14 @@ macro_rules! make_url_getter(
     );
 );
 
-macro_rules! make_url_setter_inner(
-    ( $self:ident, $value:ident, $htmlname:tt, $cx:expr ) => (
-        use $crate::dom::bindings::inheritance::Castable;
-        use $crate::dom::element::Element;
-        let element = $self.upcast::<Element>();
-        element.set_url_attribute($cx, &html5ever::local_name!($htmlname), $value)
-    );
-);
-
 #[macro_export]
 macro_rules! make_url_setter(
     ( $attr:ident, $htmlname:tt ) => (
         fn $attr(&self, cx: &mut js::context::JSContext, value: USVString) {
-            make_url_setter_inner!(self, value, $htmlname, cx);
-        }
-    );
-    ( $cx:ident, $attr:ident, $htmlname:tt ) => (
-        fn $attr(&self, $cx: &mut js::context::JSContext, value: USVString) {
-            make_url_setter_inner!(self, value, $htmlname, $cx);
+            use $crate::dom::bindings::inheritance::Castable;
+            use $crate::dom::element::Element;
+            let element = self.upcast::<Element>();
+            element.set_url_attribute(cx, &html5ever::local_name!($htmlname), value)
         }
     );
 );
@@ -149,13 +138,13 @@ macro_rules! make_form_action_getter(
 #[macro_export]
 macro_rules! make_labels_getter(
     ( $attr:ident, $memo:ident ) => (
-        fn $attr(&self) -> DomRoot<NodeList> {
+        fn $attr(&self, cx: &mut js::context::JSContext) -> DomRoot<NodeList> {
             use $crate::dom::html::htmlelement::HTMLElement;
             use $crate::dom::nodelist::NodeList;
             self.$memo.or_init(|| NodeList::new_labels_list(
+                cx,
                 self.upcast::<Node>().owner_doc().window(),
-                self.upcast::<HTMLElement>(),
-                CanGc::deprecated_note()
+                self.upcast::<HTMLElement>()
                 )
             )
         }
@@ -184,7 +173,7 @@ macro_rules! make_enumerated_getter(
                     // Step 1.1. If the attribute has a missing value default state defined, then return that
                     // missing value default state.
                     // Step 1.2 Otherwise, return no state.
-                    return DOMString::from($missing);
+                    return DOMString::from_static($missing);
                 },
                 Some(value) => {
                     // Step 2. If the attribute's value is an ASCII case-insensitive match for one of the keywords
@@ -200,13 +189,13 @@ macro_rules! make_enumerated_getter(
                     // Step 3. If the attribute has an empty value default state defined and the attribute's value
                     // is the empty string, then return that empty value default state.
                     if value.is_empty() {
-                        return DOMString::from($empty)
+                        return DOMString::from_static($empty)
                     }
 
                     // Step 4. If the attribute has an invalid value default state defined, then return that invalid
                     // value default state.
                     // Step 5. Return no state.
-                    return DOMString::from($invalid);
+                    return DOMString::from_static($invalid);
                 }
             }
         }
@@ -269,37 +258,17 @@ macro_rules! make_enumerated_getter(
     );
 );
 
-macro_rules! make_setter_inner(
-    ( $self:ident, $value:ident, $htmlname:tt, $cx:expr ) => (
-        use $crate::dom::bindings::inheritance::Castable;
-        use $crate::dom::element::Element;
-        let element = $self.upcast::<Element>();
-        element.set_string_attribute($cx, &html5ever::local_name!($htmlname), $value)
-    );
-);
-
 // concat_idents! doesn't work for function name positions, so
 // we have to specify both the content name and the HTML name here
 #[macro_export]
 macro_rules! make_setter(
     ( $attr:ident, $htmlname:tt ) => (
         fn $attr(&self, cx: &mut js::context::JSContext, value: DOMString) {
-            make_setter_inner!(self, value, $htmlname, cx);
+            use $crate::dom::bindings::inheritance::Castable;
+            use $crate::dom::element::Element;
+            let element = self.upcast::<Element>();
+            element.set_string_attribute(cx, &html5ever::local_name!($htmlname), value)
         }
-    );
-    ( $cx:ident, $attr:ident, $htmlname:tt ) => (
-        fn $attr(&self, $cx: &mut js::context::JSContext, value: DOMString) {
-            make_setter_inner!(self, value, $htmlname, $cx);
-        }
-    );
-);
-
-macro_rules! make_bool_setter_inner(
-    ( $self:ident, $value:ident, $htmlname:tt, $cx:expr ) => (
-        use $crate::dom::bindings::inheritance::Castable;
-        use $crate::dom::element::Element;
-        let element = $self.upcast::<Element>();
-        element.set_bool_attribute($cx, &html5ever::local_name!($htmlname), $value)
     );
 );
 
@@ -307,12 +276,10 @@ macro_rules! make_bool_setter_inner(
 macro_rules! make_bool_setter(
     ( $attr:ident, $htmlname:tt ) => (
         fn $attr(&self, cx: &mut js::context::JSContext, value: bool) {
-            make_bool_setter_inner!(self, value, $htmlname, cx);
-        }
-    );
-    ( $cx:ident, $attr:ident, $htmlname:tt ) => (
-        fn $attr(&self, $cx: &mut js::context::JSContext, value: bool) {
-            make_bool_setter_inner!(self, value, $htmlname, $cx);
+            use $crate::dom::bindings::inheritance::Castable;
+            use $crate::dom::element::Element;
+            let element = self.upcast::<Element>();
+            element.set_bool_attribute(cx, &html5ever::local_name!($htmlname), value)
         }
     );
 );
@@ -378,25 +345,14 @@ macro_rules! make_limited_uint_setter(
     );
 );
 
-macro_rules! make_atomic_setter_inner(
-    ( $self:ident, $value:ident, $htmlname:tt, $cx:expr ) => (
-        use $crate::dom::bindings::inheritance::Castable;
-        use $crate::dom::element::Element;
-        let element = $self.upcast::<Element>();
-        element.set_atomic_attribute($cx, &html5ever::local_name!($htmlname), $value)
-    );
-);
-
 #[macro_export]
 macro_rules! make_atomic_setter(
     ( $attr:ident, $htmlname:tt ) => (
         fn $attr(&self, cx: &mut js::context::JSContext, value: DOMString) {
-            make_atomic_setter_inner!(self, value, $htmlname, cx);
-        }
-    );
-    ( $cx:ident, $attr:ident, $htmlname:tt ) => (
-        fn $attr(&self, $cx: &mut js::context::JSContext, value: DOMString) {
-            make_atomic_setter_inner!(self, value, $htmlname, $cx);
+            use $crate::dom::bindings::inheritance::Castable;
+            use $crate::dom::element::Element;
+            let element = self.upcast::<Element>();
+            element.set_atomic_attribute(cx, &html5ever::local_name!($htmlname), value)
         }
     );
 );
@@ -509,14 +465,14 @@ macro_rules! unsafe_no_jsmanaged_fields(
 /// These are used to generate a event handler which has no special case.
 macro_rules! define_event_handler(
     ($handler: ty, $event_type: ident, $getter: ident, $setter: ident, $setter_fn: ident) => (
-        fn $getter(&self, cx: &mut js::context::JSContext) -> Option<::std::rc::Rc<$handler>> {
+        fn $getter(&self, cx: &mut js::context::JSContext) -> Option<script_bindings::callback::RootedCallback<$handler>> {
             use crate::dom::bindings::inheritance::Castable;
             use crate::dom::eventtarget::EventTarget;
             let eventtarget = self.upcast::<EventTarget>();
             eventtarget.get_event_handler_common(cx, stringify!($event_type))
         }
 
-        fn $setter(&self, cx: &mut js::context::JSContext, listener: Option<::std::rc::Rc<$handler>>) {
+        fn $setter(&self, cx: &mut js::context::JSContext, listener: Option<script_bindings::callback::RootedCallback<$handler>>) {
             use crate::dom::bindings::inheritance::Castable;
             use crate::dom::eventtarget::EventTarget;
             let eventtarget = self.upcast::<EventTarget>();
@@ -527,7 +483,7 @@ macro_rules! define_event_handler(
 
 macro_rules! define_window_owned_event_handler(
     ($handler: ty, $event_type: ident, $getter: ident, $setter: ident) => (
-        fn $getter(&self, cx: &mut js::context::JSContext) -> Option<::std::rc::Rc<$handler>> {
+        fn $getter(&self, cx: &mut js::context::JSContext) -> Option<script_bindings::callback::RootedCallback<$handler>> {
             let document = self.owner_document();
             if document.has_browsing_context() {
                 document.window().$getter(cx)
@@ -536,7 +492,7 @@ macro_rules! define_window_owned_event_handler(
             }
         }
 
-        fn $setter(&self, cx: &mut js::context::JSContext, listener: Option<::std::rc::Rc<$handler>>) {
+        fn $setter(&self, cx: &mut js::context::JSContext, listener: Option<script_bindings::callback::RootedCallback<$handler>>) {
             let document = self.owner_document();
             if document.has_browsing_context() {
                 document.window().$setter(cx, listener)
@@ -563,7 +519,7 @@ macro_rules! event_handler(
 /// only to interested pipelines.
 macro_rules! registered_event_handler(
     ($interest:expr, $event_type: ident, $getter: ident, $setter: ident) => (
-        fn $getter(&self, cx: &mut js::context::JSContext) -> Option<::std::rc::Rc<
+        fn $getter(&self, cx: &mut js::context::JSContext) -> Option<script_bindings::callback::RootedCallback<
             crate::dom::bindings::codegen::Bindings::EventHandlerBinding::EventHandlerNonNull,
         >> {
             use crate::dom::bindings::inheritance::Castable;
@@ -572,7 +528,7 @@ macro_rules! registered_event_handler(
             eventtarget.get_event_handler_common(cx, stringify!($event_type))
         }
 
-        fn $setter(&self, cx: &mut js::context::JSContext, listener: Option<::std::rc::Rc<
+        fn $setter(&self, cx: &mut js::context::JSContext, listener: Option<script_bindings::callback::RootedCallback<
             crate::dom::bindings::codegen::Bindings::EventHandlerBinding::EventHandlerNonNull,
         >>) {
             use crate::dom::bindings::inheritance::Castable;
@@ -817,6 +773,7 @@ macro_rules! window_event_handlers(
     );
 );
 
+#[cfg(feature = "webgl")]
 macro_rules! handle_potential_webgl_error {
     ($context:expr, $call:expr, $return_on_error:expr) => {
         match $call {

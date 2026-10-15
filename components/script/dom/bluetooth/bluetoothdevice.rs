@@ -4,14 +4,13 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::realm::CurrentRealm;
 use profile_traits::generic_channel;
 use script_bindings::cell::DomRefCell;
-use script_bindings::reflector::reflect_dom_object_with_cx;
+use script_bindings::reflector::reflect_dom_object;
 use servo_base::generic_channel::GenericSender;
 use servo_bluetooth_traits::{
     BluetoothCharacteristicMsg, BluetoothDescriptorMsg, BluetoothRequest, BluetoothResponse,
@@ -34,7 +33,7 @@ use crate::dom::bluetoothremotegattserver::BluetoothRemoteGATTServer;
 use crate::dom::bluetoothremotegattservice::BluetoothRemoteGATTService;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::promise::Promise;
+use crate::dom::promise::{Promise, RootedPromise};
 
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 #[derive(JSTraceable, MallocSizeOf)]
@@ -84,10 +83,10 @@ impl BluetoothDevice {
         name: Option<DOMString>,
         context: &Bluetooth,
     ) -> DomRoot<BluetoothDevice> {
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(BluetoothDevice::new_inherited(id, name, context)),
             global,
-            cx,
         )
     }
 
@@ -107,9 +106,11 @@ impl BluetoothDevice {
         server: &BluetoothRemoteGATTServer,
     ) -> DomRoot<BluetoothRemoteGATTService> {
         let service_map_ref = &self.attribute_instance_map.service_map;
-        let mut service_map = service_map_ref.borrow_mut();
-        if let Some(existing_service) = service_map.get(&service.instance_id) {
-            return DomRoot::from_ref(existing_service);
+        {
+            let service_map = service_map_ref.borrow();
+            if let Some(existing_service) = service_map.get(&service.instance_id) {
+                return DomRoot::from_ref(existing_service);
+            }
         }
         let bt_service = BluetoothRemoteGATTService::new(
             cx,
@@ -119,7 +120,9 @@ impl BluetoothDevice {
             service.is_primary,
             service.instance_id.clone(),
         );
-        service_map.insert(service.instance_id.clone(), Dom::from_ref(&bt_service));
+        service_map_ref
+            .safe_borrow_mut(cx.no_gc())
+            .insert(service.instance_id.clone(), Dom::from_ref(&bt_service));
         bt_service
     }
 
@@ -130,9 +133,13 @@ impl BluetoothDevice {
         service: &BluetoothRemoteGATTService,
     ) -> DomRoot<BluetoothRemoteGATTCharacteristic> {
         let characteristic_map_ref = &self.attribute_instance_map.characteristic_map;
-        let mut characteristic_map = characteristic_map_ref.borrow_mut();
-        if let Some(existing_characteristic) = characteristic_map.get(&characteristic.instance_id) {
-            return DomRoot::from_ref(existing_characteristic);
+        {
+            let characteristic_map = characteristic_map_ref.borrow();
+            if let Some(existing_characteristic) =
+                characteristic_map.get(&characteristic.instance_id)
+            {
+                return DomRoot::from_ref(existing_characteristic);
+            }
         }
         let properties = BluetoothCharacteristicProperties::new(
             cx,
@@ -155,7 +162,7 @@ impl BluetoothDevice {
             &properties,
             characteristic.instance_id.clone(),
         );
-        characteristic_map.insert(
+        characteristic_map_ref.safe_borrow_mut(cx.no_gc()).insert(
             characteristic.instance_id.clone(),
             Dom::from_ref(&bt_characteristic),
         );
@@ -181,9 +188,11 @@ impl BluetoothDevice {
         characteristic: &BluetoothRemoteGATTCharacteristic,
     ) -> DomRoot<BluetoothRemoteGATTDescriptor> {
         let descriptor_map_ref = &self.attribute_instance_map.descriptor_map;
-        let mut descriptor_map = descriptor_map_ref.borrow_mut();
-        if let Some(existing_descriptor) = descriptor_map.get(&descriptor.instance_id) {
-            return DomRoot::from_ref(existing_descriptor);
+        {
+            let descriptor_map = descriptor_map_ref.borrow();
+            if let Some(existing_descriptor) = descriptor_map.get(&descriptor.instance_id) {
+                return DomRoot::from_ref(existing_descriptor);
+            }
         }
         let bt_descriptor = BluetoothRemoteGATTDescriptor::new(
             cx,
@@ -192,7 +201,7 @@ impl BluetoothDevice {
             DOMString::from(descriptor.uuid.clone()),
             descriptor.instance_id.clone(),
         );
-        descriptor_map.insert(
+        descriptor_map_ref.safe_borrow_mut(cx.no_gc()).insert(
             descriptor.instance_id.clone(),
             Dom::from_ref(&bt_descriptor),
         );
@@ -214,14 +223,29 @@ impl BluetoothDevice {
         // https://github.com/WebBluetoothCG/web-bluetooth/issues/330
 
         // Step 4.
-        let mut service_map = self.attribute_instance_map.service_map.borrow_mut();
-        let service_ids = service_map.drain().map(|(id, _)| id).collect();
+        let service_ids = {
+            let mut service_map = self
+                .attribute_instance_map
+                .service_map
+                .safe_borrow_mut(cx.no_gc());
+            service_map.drain().map(|(id, _)| id).collect()
+        };
 
-        let mut characteristic_map = self.attribute_instance_map.characteristic_map.borrow_mut();
-        let characteristic_ids = characteristic_map.drain().map(|(id, _)| id).collect();
+        let characteristic_ids = {
+            let mut characteristic_map = self
+                .attribute_instance_map
+                .characteristic_map
+                .safe_borrow_mut(cx.no_gc());
+            characteristic_map.drain().map(|(id, _)| id).collect()
+        };
 
-        let mut descriptor_map = self.attribute_instance_map.descriptor_map.borrow_mut();
-        let descriptor_ids = descriptor_map.drain().map(|(id, _)| id).collect();
+        let descriptor_ids = {
+            let mut descriptor_map = self
+                .attribute_instance_map
+                .descriptor_map
+                .safe_borrow_mut(cx.no_gc());
+            descriptor_map.drain().map(|(id, _)| id).collect()
+        };
 
         // Step 5, 6.4, 7.
         // TODO: Step 6: Implement `active notification context set` for BluetoothRemoteGATTCharacteristic.
@@ -292,7 +316,7 @@ impl BluetoothDeviceMethods<crate::DomTypeHolder> for BluetoothDevice {
     }
 
     /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothdevice-watchadvertisements>
-    fn WatchAdvertisements(&self, cx: &mut CurrentRealm) -> Rc<Promise> {
+    fn WatchAdvertisements(&self, cx: &mut CurrentRealm) -> RootedPromise {
         let p = Promise::new_in_realm(cx);
         let sender = response_async(&p, self);
         // TODO: Step 1.
@@ -332,7 +356,7 @@ impl AsyncBluetoothListener for BluetoothDevice {
         &self,
         cx: &mut JSContext,
         response: BluetoothResponse,
-        promise: &Rc<Promise>,
+        promise: &RootedPromise,
     ) {
         match response {
             // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothdevice-unwatchadvertisements

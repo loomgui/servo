@@ -2,18 +2,16 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use script_bindings::realms::InRealm;
 use script_bindings::reflector::DomGlobalGeneric;
 use script_bindings::root::DomRoot;
 
 use crate::DomTypeHolder;
 use crate::dom::types::GlobalScope;
-use crate::realms::enter_realm;
 
 pub(crate) trait DomGlobal {
     /// Returns the [relevant global] in the same realm as the callee object.
-    /// If you know the callee's realm is already the current realm, it is
-    /// more efficient to call [DomGlobal::global_] instead.
+    /// Will enter the realm of the global to ensure the global is only
+    /// accessed from the correct realm.
     ///
     /// [relevant global]: https://html.spec.whatwg.org/multipage/#concept-relevant-global
     fn global(&self) -> DomRoot<GlobalScope>;
@@ -21,10 +19,6 @@ pub(crate) trait DomGlobal {
 
 impl<T: DomGlobalGeneric<DomTypeHolder>> DomGlobal for T {
     fn global(&self) -> DomRoot<GlobalScope> {
-        let realm = enter_realm(self);
-        <Self as DomGlobalGeneric<DomTypeHolder>>::global_from_reflector(
-            self,
-            InRealm::entered(&realm),
-        )
+        <Self as DomGlobalGeneric<DomTypeHolder>>::global_from_reflector(self)
     }
 }

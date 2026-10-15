@@ -23,7 +23,9 @@ use url::Url;
 use crate::egl::host_trait::HostTrait;
 use crate::prefs::ServoShellPreferences;
 use crate::running_app_state::{RunningAppState, UserInterfaceCommand};
-use crate::window::{PlatformWindow, ServoShellWindow, ServoShellWindowId};
+use crate::window::{
+    PlatformWindow, ServoShellWindow, ServoShellWindowId, TopLevelWebViewCreationRequest,
+};
 
 pub(crate) struct EmbeddedPlatformWindow {
     host: Rc<dyn HostTrait>,
@@ -310,10 +312,9 @@ impl App {
             .opts(init.opts)
             .preferences(init.preferences.clone())
             .event_loop_waker(init.event_loop_waker.clone());
-        #[cfg(feature = "webxr")]
-        let servo_builder = servo_builder
-            .webxr_registry(Box::new(XrDiscoveryWebXrRegistry::new(init.xr_discovery)));
         let servo = servo_builder.build();
+        #[cfg(feature = "webxr")]
+        servo.register_webxr_registry(Box::new(XrDiscoveryWebXrRegistry::new(init.xr_discovery)));
 
         let initial_url = init.initial_url.and_then(|string| Url::parse(&string).ok());
         let initial_url = initial_url
@@ -371,8 +372,10 @@ impl App {
             current_can_go_forward: Default::default(),
             current_load_status: Default::default(),
         });
-        self.state
-            .open_window(platform_window, self.initial_url.clone());
+        self.state.open_window(
+            platform_window,
+            TopLevelWebViewCreationRequest::WithUrl(self.initial_url.clone()),
+        );
     }
 
     pub(crate) fn servo(&self) -> &Servo {
@@ -398,13 +401,18 @@ impl App {
     }
 
     pub(crate) fn create_and_activate_toplevel_webview(self: &Rc<Self>, url: Url) -> WebView {
-        self.window()
-            .create_and_activate_toplevel_webview(self.state.clone(), url)
+        self.window().create_and_activate_toplevel_webview(
+            self.state.clone(),
+            TopLevelWebViewCreationRequest::WithUrl(url),
+        )
     }
 
     /// The active webview will be immediately valid via `active_or_newest_webview()`
     pub(crate) fn activate_webview(&self, id: WebViewId) {
-        self.state.window_for_webview_id(id).activate_webview(id);
+        let Some(webview) = self.state.webview_by_id(id) else {
+            return;
+        };
+        self.state.window_for_webview(&webview).activate_webview(id);
     }
 
     /// This is the Servo heartbeat. This needs to be called
@@ -611,6 +619,13 @@ impl App {
         }
     }
 
+    pub fn key_event(&self, event: keyboard_types::KeyboardEvent) {
+        if let Some(webview) = self.active_or_newest_webview() {
+            webview.notify_input_event(InputEvent::Keyboard(KeyboardEvent::new(event)));
+            self.spin_event_loop();
+        }
+    }
+
     pub fn ime_insert_text(&self, text: String) {
         // In OHOS, we get empty text after the intended text.
         if text.is_empty() {
@@ -643,18 +658,12 @@ impl App {
         }
     }
 
-    pub fn set_throttled(&self, throttled: bool) {
-        if let Some(webview) = self.active_or_newest_webview() {
-            webview.set_throttled(throttled);
-            self.spin_event_loop();
-        }
-    }
-
     pub fn ime_dismissed(&self) {
         if let Some(webview) = self.active_or_newest_webview() {
             webview.notify_input_event(InputEvent::Ime(ImeEvent::Dismissed));
-            self.spin_event_loop();
         }
+        self.host.on_ime_hide();
+        self.spin_event_loop();
     }
 
     pub fn notify_vsync(&self) {

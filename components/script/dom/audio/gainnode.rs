@@ -2,14 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::f32;
-
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::rust::HandleObject;
-use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
+use script_bindings::reflector::reflect_dom_object_with_proto;
+use servo_media::audio::audio_node::{AudioNodeInit, AudioNodeType};
 use servo_media::audio::gain_node::GainNodeOptions;
-use servo_media::audio::node::{AudioNodeInit, AudioNodeType};
 use servo_media::audio::param::ParamType;
 
 use crate::conversions::Convert;
@@ -52,6 +50,7 @@ impl GainNode {
             1, // inputs
             1, // outputs
         )?;
+        // <https://webaudio.github.io/web-audio-api/#dom-gainnode-gain>
         let gain = AudioParam::new(
             cx,
             window,
@@ -88,11 +87,11 @@ impl GainNode {
         options: &GainOptions,
     ) -> Fallible<DomRoot<GainNode>> {
         let node = GainNode::new_inherited(cx, window, context, options)?;
-        Ok(reflect_dom_object_with_proto_and_cx(
+        Ok(reflect_dom_object_with_proto(
+            cx,
             Box::new(node),
             window,
             proto,
-            cx,
         ))
     }
 }

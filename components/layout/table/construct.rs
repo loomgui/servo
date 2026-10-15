@@ -2,7 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::borrow::Cow;
 use std::iter::repeat_n;
 
 use atomic_refcell::AtomicRef;
@@ -21,7 +20,9 @@ use super::{
 use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
 use crate::dom::{BoxSlot, LayoutBox, NodeExt};
-use crate::dom_traversal::{Contents, NodeAndStyleInfo, NonReplacedContents, TraversalHandler};
+use crate::dom_traversal::{
+    BoxTreeString, Contents, NodeAndStyleInfo, NonReplacedContents, TraversalHandler,
+};
 use crate::flow::inline::SharedInlineStyles;
 use crate::flow::{BlockContainerBuilder, BlockFormattingContext};
 use crate::formatting_contexts::{
@@ -50,7 +51,7 @@ impl ResolvedSlotAndLocation<'_> {
 }
 
 pub(crate) enum AnonymousTableContent<'dom> {
-    Text(NodeAndStyleInfo<'dom>, Cow<'dom, str>),
+    Text(NodeAndStyleInfo<'dom>, BoxTreeString<'dom>),
     EnterDisplayContents(SharedInlineStyles),
     LeaveDisplayContents,
     Element {
@@ -295,8 +296,8 @@ impl TableBuilder {
     /// This matches WebKit, and some tests require it, but Gecko and Blink don't do it.
     fn adjust_table_geometry_for_columns_and_colgroups(&mut self) {
         if self.table.rows.is_empty() && self.table.row_groups.is_empty() {
-            self.table.columns.truncate(0);
-            self.table.column_groups.truncate(0);
+            self.table.columns.clear();
+            self.table.column_groups.clear();
         } else {
             self.table.size.width = self.table.size.width.max(self.table.columns.len());
         }
@@ -775,7 +776,7 @@ impl<'style, 'dom> TableBuilderTraversal<'style, 'dom> {
 }
 
 impl<'dom> TraversalHandler<'dom> for TableBuilderTraversal<'_, 'dom> {
-    fn handle_text(&mut self, info: &NodeAndStyleInfo<'dom>, text: Cow<'dom, str>) {
+    fn handle_text(&mut self, info: &NodeAndStyleInfo<'dom>, text: BoxTreeString<'dom>) {
         self.current_anonymous_row_content
             .push(AnonymousTableContent::Text(info.clone(), text));
     }
@@ -1061,7 +1062,7 @@ impl<'style, 'builder, 'dom, 'a> TableRowGroupBuilder<'style, 'builder, 'dom, 'a
 }
 
 impl<'dom> TraversalHandler<'dom> for TableRowGroupBuilder<'_, '_, 'dom, '_> {
-    fn handle_text(&mut self, info: &NodeAndStyleInfo<'dom>, text: Cow<'dom, str>) {
+    fn handle_text(&mut self, info: &NodeAndStyleInfo<'dom>, text: BoxTreeString<'dom>) {
         self.current_anonymous_row_content
             .push(AnonymousTableContent::Text(info.clone(), text));
     }
@@ -1219,7 +1220,7 @@ impl<'style, 'builder, 'dom, 'a> TableRowBuilder<'style, 'builder, 'dom, 'a> {
 }
 
 impl<'dom> TraversalHandler<'dom> for TableRowBuilder<'_, '_, 'dom, '_> {
-    fn handle_text(&mut self, info: &NodeAndStyleInfo<'dom>, text: Cow<'dom, str>) {
+    fn handle_text(&mut self, info: &NodeAndStyleInfo<'dom>, text: BoxTreeString<'dom>) {
         self.current_anonymous_cell_content
             .push(AnonymousTableContent::Text(info.clone(), text));
     }
@@ -1242,7 +1243,6 @@ impl<'dom> TraversalHandler<'dom> for TableRowBuilder<'_, '_, 'dom, '_> {
         contents: Contents,
         box_slot: BoxSlot<'dom>,
     ) {
-        #[allow(clippy::collapsible_match)] //// TODO: Remove once the other cases are handled
         match display {
             DisplayGeneratingBox::LayoutInternal(internal) => match internal {
                 DisplayLayoutInternal::TableCell => {
@@ -1329,7 +1329,7 @@ struct TableColumnGroupBuilder {
 }
 
 impl<'dom> TraversalHandler<'dom> for TableColumnGroupBuilder {
-    fn handle_text(&mut self, _info: &NodeAndStyleInfo<'dom>, _text: Cow<'dom, str>) {}
+    fn handle_text(&mut self, _info: &NodeAndStyleInfo<'dom>, _text: BoxTreeString<'dom>) {}
     fn enter_display_contents(&mut self, _: SharedInlineStyles) {}
     fn leave_display_contents(&mut self) {}
     fn handle_element(

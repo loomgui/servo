@@ -5,11 +5,11 @@
 use dom_struct::dom_struct;
 use embedder_traits::GamepadSupportedHapticEffects;
 use js::context::JSContext;
+use js::conversions::ToJSValConvertible;
 use js::jsapi::Heap;
 use js::jsval::{JSVal, UndefinedValue};
 use js::rust::MutableHandleValue;
-use script_bindings::conversions::SafeToJSValConvertible;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 use webxr_api::{Handedness, InputFrame, InputId, InputSource, TargetRayMode};
 
 use crate::dom::bindings::codegen::Bindings::XRInputSourceBinding::{
@@ -23,7 +23,6 @@ use crate::dom::xrhand::XRHand;
 use crate::dom::xrsession::XRSession;
 use crate::dom::xrspace::XRSpace;
 use crate::realms::enter_auto_realm;
-use crate::script_runtime::JSContext as SafeJSContext;
 
 #[dom_struct]
 pub(crate) struct XRInputSource {
@@ -36,31 +35,11 @@ pub(crate) struct XRInputSource {
     hand: MutNullableDom<XRHand>,
     #[ignore_malloc_size_of = "mozjs"]
     profiles: Heap<JSVal>,
-    gamepad: DomRoot<Gamepad>,
+    gamepad: Dom<Gamepad>,
 }
 
 impl XRInputSource {
-    pub(crate) fn new_inherited(
-        cx: &mut JSContext,
-        window: &Window,
-        session: &XRSession,
-        info: InputSource,
-    ) -> XRInputSource {
-        // <https://www.w3.org/TR/webxr-gamepads-module-1/#gamepad-differences>
-        let gamepad = Gamepad::new(
-            cx,
-            window,
-            0,
-            "".into(),
-            "xr-standard".into(),
-            (-1.0, 1.0),
-            (0.0, 1.0),
-            GamepadSupportedHapticEffects {
-                supports_dual_rumble: false,
-                supports_trigger_rumble: false,
-            },
-            true,
-        );
+    fn new_inherited(session: &XRSession, info: InputSource, gamepad: &Gamepad) -> XRInputSource {
         XRInputSource {
             reflector: Reflector::new(),
             session: Dom::from_ref(session),
@@ -69,7 +48,7 @@ impl XRInputSource {
             grip_space: Default::default(),
             hand: Default::default(),
             profiles: Heap::default(),
-            gamepad,
+            gamepad: Dom::from_ref(gamepad),
         }
     }
 
@@ -79,19 +58,32 @@ impl XRInputSource {
         session: &XRSession,
         info: InputSource,
     ) -> DomRoot<XRInputSource> {
-        let source = reflect_dom_object_with_cx(
-            Box::new(XRInputSource::new_inherited(cx, window, session, info)),
-            window,
+        // <https://www.w3.org/TR/webxr-gamepads-module-1/#gamepad-differences>
+        let gamepad = Gamepad::new(
             cx,
+            window,
+            0,
+            String::new(),
+            "xr-standard".into(),
+            (-1.0, 1.0),
+            (0.0, 1.0),
+            GamepadSupportedHapticEffects {
+                supports_dual_rumble: false,
+                supports_trigger_rumble: false,
+            },
+            true,
+        );
+
+        let source = reflect_dom_object(
+            cx,
+            Box::new(XRInputSource::new_inherited(session, info, &gamepad)),
+            window,
         );
 
         let mut realm = enter_auto_realm(cx, window);
         let cx = &mut realm.current_realm();
         rooted!(&in(cx) let mut profiles = UndefinedValue());
-        source
-            .info
-            .profiles
-            .safe_to_jsval(cx, profiles.handle_mut());
+        source.info.profiles.to_jsval(cx, profiles.handle_mut());
         source.profiles.set(profiles.get());
         source
     }
@@ -117,7 +109,7 @@ impl XRInputSource {
         });
     }
 
-    pub(crate) fn gamepad(&self) -> &DomRoot<Gamepad> {
+    pub(crate) fn gamepad(&self) -> &Gamepad {
         &self.gamepad
     }
 }
@@ -162,7 +154,7 @@ impl XRInputSourceMethods<crate::DomTypeHolder> for XRInputSource {
         }
     }
     /// <https://immersive-web.github.io/webxr/#dom-xrinputsource-profiles>
-    fn Profiles(&self, _cx: SafeJSContext, mut retval: MutableHandleValue) {
+    fn Profiles(&self, mut retval: MutableHandleValue) {
         retval.set(self.profiles.get())
     }
 

@@ -205,6 +205,7 @@
 #[macro_use]
 pub(crate) mod macros;
 
+#[expect(unused)]
 pub(crate) mod types {
     include!(concat!(env!("OUT_DIR"), "/InterfaceTypes.rs"));
 }
@@ -214,6 +215,8 @@ pub(crate) use self::abort::*;
 pub(crate) mod activation;
 pub(crate) mod animations;
 pub(crate) use self::animations::*;
+pub(crate) mod attributes;
+pub(crate) use self::attributes::*;
 pub(crate) mod audio;
 pub(crate) use self::audio::*;
 pub(crate) mod bindings;
@@ -221,7 +224,6 @@ pub(crate) mod bindings;
 pub(crate) mod bluetooth;
 #[cfg(feature = "bluetooth")]
 pub(crate) use self::bluetooth::*;
-pub(crate) mod broadcastchannel;
 mod canvas;
 pub(crate) use self::canvas::*;
 pub(crate) mod characterdata;
@@ -230,28 +232,20 @@ pub(crate) mod clipboard;
 pub(crate) use self::clipboard::*;
 pub(crate) mod console;
 pub(crate) mod cookiestore;
+pub(crate) use self::cookiestore::*;
 pub(crate) mod credentialmanagement;
 pub(crate) use self::credentialmanagement::*;
 pub(crate) mod css;
 pub(crate) use self::css::*;
-pub(crate) mod customelementregistry;
-pub(crate) mod customstateset;
 pub(crate) mod datatransfer;
 pub(crate) use self::datatransfer::*;
 pub(crate) mod debugger;
 pub(crate) use self::debugger::*;
-#[expect(dead_code)]
 pub(crate) mod document;
 pub(crate) use self::document::*;
 pub(crate) mod domexception;
-pub(crate) mod domimplementation;
-pub(crate) mod domparser;
-pub(crate) mod domstringlist;
-pub(crate) mod domstringmap;
-pub(crate) mod domtokenlist;
 pub(crate) mod element;
 pub(crate) use self::element::*;
-pub(crate) mod elementinternals;
 pub(crate) mod encoding;
 pub(crate) use self::encoding::*;
 pub(crate) mod event;
@@ -262,6 +256,8 @@ pub(crate) mod fetch;
 pub(crate) use self::fetch::*;
 pub(crate) mod file;
 pub(crate) use self::file::*;
+pub(crate) mod filesystem;
+pub(crate) use self::filesystem::*;
 pub(crate) mod form;
 pub(crate) use self::form::*;
 pub(crate) mod fullscreen;
@@ -289,15 +285,12 @@ pub(crate) mod mutationobserver;
 pub(crate) use self::mutationobserver::*;
 pub(crate) mod navigator;
 pub(crate) use self::navigator::*;
-#[expect(dead_code)]
 pub(crate) mod node;
 pub(crate) use self::node::*;
-pub(crate) mod notification;
 pub(crate) mod performance;
 pub(crate) use self::performance::*;
 pub(crate) mod permission;
 pub(crate) use self::permission::*;
-pub(crate) mod processingoptions;
 pub(crate) mod promise;
 pub(crate) use self::promise::*;
 pub(crate) mod quotaexceedederror;
@@ -308,17 +301,16 @@ pub(crate) mod reporting;
 pub(crate) use self::reporting::*;
 pub(crate) mod resizeobserver;
 pub(crate) use self::resizeobserver::*;
-pub(crate) mod screen;
-mod scrolling_box;
 pub(crate) mod security;
 pub(crate) use self::security::*;
 pub(crate) mod selection;
+pub(crate) mod selection_range;
 pub(crate) mod serviceworker;
 pub(crate) use self::serviceworker::*;
 pub(crate) mod servointernals;
-#[expect(dead_code)]
 pub(crate) mod servoparser;
 pub(crate) mod shadowroot;
+pub(crate) mod srcset;
 pub(crate) mod storage;
 pub(crate) use self::storage::*;
 pub(crate) mod stream;
@@ -329,7 +321,6 @@ pub(crate) use self::svg::*;
 mod testing;
 #[cfg(feature = "testbinding")]
 pub(crate) use self::testing::*;
-pub(crate) mod textcontrol;
 pub(crate) mod timeranges;
 pub(crate) mod touch;
 pub(crate) use self::touch::*;
@@ -337,16 +328,17 @@ pub(crate) mod trustedtypes;
 pub(crate) use self::trustedtypes::*;
 pub(crate) mod url;
 pub(crate) use self::url::*;
-pub(crate) mod useractivation;
 pub(crate) mod userscripts;
 pub(crate) mod values;
 pub(crate) mod visualviewport;
 pub(crate) mod wakelock;
 pub(crate) use self::wakelock::*;
+#[cfg(feature = "webgl")]
 pub(crate) mod webgl;
+#[cfg(feature = "webgl")]
 pub(crate) use self::webgl::extensions::ext::*;
+#[cfg(feature = "webgl")]
 pub(crate) use self::webgl::*;
-pub(crate) mod websocket;
 #[cfg(feature = "webxr")]
 mod webxr;
 #[cfg(feature = "webxr")]
@@ -357,7 +349,9 @@ pub(crate) mod webgpu;
 pub(crate) use self::webgpu::*;
 #[cfg(not(feature = "webgpu"))]
 pub(crate) mod gpucanvascontext;
+#[cfg(feature = "webcrypto")]
 pub(crate) mod webcrypto;
+#[cfg(feature = "webcrypto")]
 pub(crate) use self::webcrypto::*;
 pub(crate) mod webrtc;
 pub(crate) use self::webrtc::*;
@@ -369,9 +363,9 @@ pub(crate) mod workers;
 pub(crate) use self::workers::*;
 pub(crate) mod worklet;
 pub(crate) use self::worklet::*;
-pub(crate) mod xmldocument;
+pub(crate) mod xml;
+pub(crate) use self::xml::*;
 pub(crate) mod xmlhttprequest;
 pub(crate) use self::xmlhttprequest::*;
-pub(crate) mod xmlserializer;
 pub(crate) mod xpath;
 pub(crate) use self::xpath::*;

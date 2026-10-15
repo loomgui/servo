@@ -2,30 +2,31 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::Cell;
 use std::str::FromStr;
 
 use dom_struct::dom_struct;
+use itertools::Itertools;
+use js::context::NoGC;
+use js::conversions::ToJSValConvertible;
 use js::jsapi::{Heap, JSObject, Value};
 use js::rust::MutableHandleObject;
 use malloc_size_of::MallocSizeOf;
 use rustc_hash::FxHashMap;
-use script_bindings::cell::{DomRefCell, Ref};
-use script_bindings::conversions::SafeToJSValConvertible;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_base::id::{CryptoKeyId, CryptoKeyIndex};
 use servo_constellation_traits::{SerializableCryptoKey, SerializableCryptoKeyHandle};
+use strum::VariantArray;
 use zeroize::Zeroizing;
 
 use crate::dom::bindings::codegen::Bindings::CryptoKeyBinding::{
     CryptoKeyMethods, CryptoKeyPair, KeyType, KeyUsage,
 };
+use crate::dom::bindings::error::{Error, ErrorResult};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::serializable::Serializable;
 use crate::dom::bindings::structuredclone::StructuredData;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::subtlecrypto::KeyAlgorithmAndDerivatives;
-use crate::script_runtime::JSContext;
 
 pub(crate) enum CryptoKeyOrCryptoKeyPair {
     CryptoKey(DomRoot<CryptoKey>),
@@ -50,6 +51,10 @@ pub(crate) enum Handle {
     Ed25519PublicKey(ed25519_dalek::VerifyingKey),
     X25519PrivateKey(x25519_dalek::StaticSecret),
     X25519PublicKey(x25519_dalek::PublicKey),
+    Ed448PrivateKey(ed448_goldilocks::SigningKey),
+    Ed448PublicKey(ed448_goldilocks::VerifyingKey),
+    X448PrivateKey(x448::StaticSecret),
+    X448PublicKey(x448::PublicKey),
     Aes128Key(aes::cipher::common::Key<aes::Aes128>),
     Aes192Key(aes::cipher::common::Key<aes::Aes192>),
     Aes256Key(aes::cipher::common::Key<aes::Aes256>),
@@ -62,6 +67,8 @@ pub(crate) enum Handle {
     MlKem512PublicKey(ml_kem::EncapsulationKey<ml_kem::MlKem512>),
     MlKem768PublicKey(ml_kem::EncapsulationKey<ml_kem::MlKem768>),
     MlKem1024PublicKey(ml_kem::EncapsulationKey<ml_kem::MlKem1024>),
+    MlKem768X25519PrivateKey(x_wing::DecapsulationKey),
+    MlKem768X25519PublicKey(x_wing::EncapsulationKey),
     MlDsa44PrivateKey(ml_dsa::SigningKey<ml_dsa::MlDsa44>),
     MlDsa65PrivateKey(ml_dsa::SigningKey<ml_dsa::MlDsa65>),
     MlDsa87PrivateKey(ml_dsa::SigningKey<ml_dsa::MlDsa87>),
@@ -69,6 +76,7 @@ pub(crate) enum Handle {
     MlDsa65PublicKey(ml_dsa::VerifyingKey<ml_dsa::MlDsa65>),
     MlDsa87PublicKey(ml_dsa::VerifyingKey<ml_dsa::MlDsa87>),
     ChaCha20Poly1305Key(chacha20poly1305::Key),
+    KmacKey(Zeroizing<Vec<u8>>),
     Argon2Password(Zeroizing<Vec<u8>>),
 }
 
@@ -81,7 +89,7 @@ pub(crate) struct CryptoKey {
     key_type: KeyType,
 
     /// <https://w3c.github.io/webcrypto/#dfn-CryptoKey-slot-extractable>
-    extractable: Cell<bool>,
+    extractable: bool,
 
     /// <https://w3c.github.io/webcrypto/#dfn-CryptoKey-slot-algorithm>
     ///
@@ -97,7 +105,7 @@ pub(crate) struct CryptoKey {
     /// <https://w3c.github.io/webcrypto/#dfn-CryptoKey-slot-usages>
     ///
     /// The contents of the [[usages]] internal slot shall be of type Sequence<KeyUsage>.
-    usages: DomRefCell<Vec<KeyUsage>>,
+    usages: Vec<KeyUsage>,
 
     /// <https://w3c.github.io/webcrypto/#dfn-CryptoKey-slot-usages_cached>
     #[ignore_malloc_size_of = "Defined in mozjs"]
@@ -119,10 +127,10 @@ impl CryptoKey {
         CryptoKey {
             reflector_: Reflector::new(),
             key_type,
-            extractable: Cell::new(extractable),
+            extractable,
             algorithm,
             algorithm_cached: Heap::default(),
-            usages: DomRefCell::new(usages),
+            usages,
             usages_cached: Heap::default(),
             handle,
         }
@@ -137,7 +145,8 @@ impl CryptoKey {
         usages: Vec<KeyUsage>,
         handle: Handle,
     ) -> DomRoot<CryptoKey> {
-        let crypto_key = reflect_dom_object_with_cx(
+        let crypto_key = reflect_dom_object(
+            cx,
             Box::new(CryptoKey::new_inherited(
                 key_type,
                 extractable,
@@ -146,19 +155,18 @@ impl CryptoKey {
                 handle,
             )),
             global,
-            cx,
         );
 
         // Create and store a cached object of algorithm
         rooted!(&in(cx) let mut algorithm_object_value: Value);
-        algorithm.safe_to_jsval(cx, algorithm_object_value.handle_mut());
+        algorithm.to_jsval(cx, algorithm_object_value.handle_mut());
         crypto_key
             .algorithm_cached
             .set(algorithm_object_value.to_object());
 
         // Create and store a cached object of usages
         rooted!(&in(cx) let mut usages_object_value: Value);
-        usages.safe_to_jsval(cx, usages_object_value.handle_mut());
+        usages.to_jsval(cx, usages_object_value.handle_mut());
         crypto_key
             .usages_cached
             .set(usages_object_value.to_object());
@@ -170,25 +178,26 @@ impl CryptoKey {
         &self.algorithm
     }
 
-    pub(crate) fn usages(&self) -> Ref<'_, Vec<KeyUsage>> {
-        self.usages.borrow()
+    pub(crate) fn usages(&self) -> &[KeyUsage] {
+        &self.usages
     }
 
     pub(crate) fn handle(&self) -> &Handle {
         &self.handle
     }
 
-    pub(crate) fn set_extractable(&self, extractable: bool) {
-        self.extractable.set(extractable);
-    }
-
-    pub(crate) fn set_usages(&self, cx: &mut js::context::JSContext, usages: &[KeyUsage]) {
-        *self.usages.borrow_mut() = usages.to_owned();
-
-        // Create and store a cached object of usages
-        rooted!(&in(cx) let mut usages_object_value: Value);
-        usages.safe_to_jsval(cx, usages_object_value.handle_mut());
-        self.usages_cached.set(usages_object_value.to_object());
+    /// Ensure that the [[type]] internal slot of key is same as `expected`. If the [[type]]
+    /// internal slot of key is not same as `expected`, then throw an InvalidAccessError.
+    pub(crate) fn ensure_type(&self, expected: KeyType) -> ErrorResult {
+        if self.key_type == expected {
+            Ok(())
+        } else {
+            Err(Error::InvalidAccess(Some(match expected {
+                KeyType::Public => "The key is not a public key".into(),
+                KeyType::Private => "The key is not a private key".into(),
+                KeyType::Secret => "The key is not a secret key".into(),
+            })))
+        }
     }
 }
 
@@ -203,17 +212,17 @@ impl CryptoKeyMethods<crate::DomTypeHolder> for CryptoKey {
     fn Extractable(&self) -> bool {
         // Reflects the [[extractable]] internal slot, which indicates whether or not the raw
         // keying material may be exported by the application.
-        self.extractable.get()
+        self.extractable
     }
 
     /// <https://w3c.github.io/webcrypto/#dom-cryptokey-algorithm>
-    fn Algorithm(&self, _cx: JSContext, mut return_value: MutableHandleObject) {
+    fn Algorithm(&self, mut return_value: MutableHandleObject) {
         // Returns the cached ECMAScript object associated with the [[algorithm]] internal slot.
         return_value.set(self.algorithm_cached.get())
     }
 
     /// <https://w3c.github.io/webcrypto/#dom-cryptokey-usages>
-    fn Usages(&self, _cx: JSContext, mut return_value: MutableHandleObject) {
+    fn Usages(&self, mut return_value: MutableHandleObject) {
         // Returns the cached ECMAScript object associated with the [[usages]] internal slot, which
         // indicates which cryptographic operations are permissible to be used with this key.
         return_value.set(self.usages_cached.get())
@@ -225,7 +234,7 @@ impl Serializable for CryptoKey {
     type Data = SerializableCryptoKey;
 
     /// <https://w3c.github.io/webcrypto/#cryptokey-interface-serializable>
-    fn serialize(&self) -> Result<(CryptoKeyId, Self::Data), ()> {
+    fn serialize(&self, _no_gc: &NoGC) -> Result<(CryptoKeyId, Self::Data), ()> {
         // Step 1. Set serialized.[[Type]] to the [[type]] internal slot of value.
         // Step 2. Set serialized.[[Extractable]] to the [[extractable]] internal slot of value.
         // Step 3. Set serialized.[[Algorithm]] to the sub-serialization of the [[algorithm]]
@@ -235,11 +244,10 @@ impl Serializable for CryptoKey {
         // Step 5. Set serialized.[[Handle]] to the [[handle]] internal slot of value.
         let serialized = SerializableCryptoKey {
             key_type: self.key_type.as_str().into(),
-            extractable: self.extractable.get(),
+            extractable: self.extractable,
             algorithm: (&self.algorithm).into(),
             usages: self
                 .usages
-                .borrow()
                 .iter()
                 .map(|usage| usage.as_str().into())
                 .collect(),
@@ -312,6 +320,10 @@ impl MallocSizeOf for Handle {
             Handle::Ed25519PublicKey(bytes) => bytes.size_of(ops),
             Handle::X25519PrivateKey(private_key) => private_key.size_of(ops),
             Handle::X25519PublicKey(public_key) => public_key.size_of(ops),
+            Handle::Ed448PrivateKey(private_key) => private_key.size_of(ops),
+            Handle::Ed448PublicKey(public_key) => public_key.size_of(ops),
+            Handle::X448PrivateKey(private_key) => private_key.size_of(ops),
+            Handle::X448PublicKey(public_key) => public_key.size_of(ops),
             Handle::Aes128Key(key) => key.size_of(ops),
             Handle::Aes192Key(key) => key.size_of(ops),
             Handle::Aes256Key(key) => key.size_of(ops),
@@ -324,6 +336,8 @@ impl MallocSizeOf for Handle {
             Handle::MlKem512PublicKey(public_key) => public_key.size_of(ops),
             Handle::MlKem768PublicKey(public_key) => public_key.size_of(ops),
             Handle::MlKem1024PublicKey(public_key) => public_key.size_of(ops),
+            Handle::MlKem768X25519PrivateKey(private_key) => private_key.size_of(ops),
+            Handle::MlKem768X25519PublicKey(public_key) => public_key.size_of(ops),
             Handle::MlDsa44PrivateKey(private_key) => private_key.size_of(ops),
             Handle::MlDsa65PrivateKey(private_key) => private_key.size_of(ops),
             Handle::MlDsa87PrivateKey(private_key) => private_key.size_of(ops),
@@ -331,6 +345,7 @@ impl MallocSizeOf for Handle {
             Handle::MlDsa65PublicKey(public_key) => public_key.size_of(ops),
             Handle::MlDsa87PublicKey(public_key) => public_key.size_of(ops),
             Handle::ChaCha20Poly1305Key(key) => key.size_of(ops),
+            Handle::KmacKey(key) => key.size_of(ops),
             Handle::Argon2Password(password) => password.size_of(ops),
         }
     }
@@ -380,6 +395,25 @@ impl TryFrom<SerializableCryptoKeyHandle> for Handle {
             SerializableCryptoKeyHandle::X25519PublicKey(public_key) => {
                 Ok(Handle::X25519PublicKey((*public_key).into()))
             },
+            SerializableCryptoKeyHandle::Ed448PrivateKey(private_key) => {
+                Ok(Handle::Ed448PrivateKey(
+                    ed448_goldilocks::SigningKey::try_from(private_key).map_err(|_| ())?,
+                ))
+            },
+            SerializableCryptoKeyHandle::Ed448PublicKey(public_key) => Ok(Handle::Ed448PublicKey(
+                ed448_goldilocks::VerifyingKey::from_bytes(
+                    public_key.as_slice().try_into().map_err(|_| ())?,
+                )
+                .map_err(|_| ())?,
+            )),
+            SerializableCryptoKeyHandle::X448PrivateKey(private_key) => {
+                Ok(Handle::X448PrivateKey(x448::StaticSecret::from(
+                    <[u8; 56]>::try_from(private_key.as_slice()).map_err(|_| ())?,
+                )))
+            },
+            SerializableCryptoKeyHandle::X448PublicKey(public_key) => Ok(Handle::X448PublicKey(
+                x448::PublicKey::from_bytes_unchecked(public_key).ok_or(())?,
+            )),
             SerializableCryptoKeyHandle::Aes128Key(key) => Ok(Handle::Aes128Key(
                 aes::cipher::common::Key::<aes::Aes128>::try_from(key).map_err(|_| ())?,
             )),
@@ -424,6 +458,16 @@ impl TryFrom<SerializableCryptoKeyHandle> for Handle {
                     ml_kem::TryKeyInit::new_from_slice(public_key).map_err(|_| ())?,
                 ))
             },
+            SerializableCryptoKeyHandle::MlKem768X25519PrivateKey(private_key) => {
+                Ok(Handle::MlKem768X25519PrivateKey(
+                    x_wing::KeyInit::new_from_slice(private_key).map_err(|_| ())?,
+                ))
+            },
+            SerializableCryptoKeyHandle::MlKem768X25519PublicKey(public_key) => {
+                Ok(Handle::MlKem768X25519PublicKey(
+                    x_wing::TryKeyInit::new_from_slice(public_key).map_err(|_| ())?,
+                ))
+            },
             SerializableCryptoKeyHandle::MlDsa44PrivateKey(private_key) => {
                 Ok(Handle::MlDsa44PrivateKey(
                     ml_dsa::KeyInit::new_from_slice(private_key).map_err(|_| ())?,
@@ -457,6 +501,7 @@ impl TryFrom<SerializableCryptoKeyHandle> for Handle {
             SerializableCryptoKeyHandle::ChaCha20Poly1305Key(key) => Ok(
                 Handle::ChaCha20Poly1305Key(chacha20poly1305::Key::try_from(key).map_err(|_| ())?),
             ),
+            SerializableCryptoKeyHandle::KmacKey(key) => Ok(Handle::KmacKey(key.clone().into())),
             SerializableCryptoKeyHandle::Argon2Password(password) => {
                 Ok(Handle::Argon2Password(password.clone().into()))
             },
@@ -515,6 +560,18 @@ impl TryFrom<&Handle> for SerializableCryptoKeyHandle {
             Handle::X25519PublicKey(public_key) => Ok(
                 SerializableCryptoKeyHandle::X25519PublicKey(public_key.to_bytes()),
             ),
+            Handle::Ed448PrivateKey(private_key) => Ok(
+                SerializableCryptoKeyHandle::Ed448PrivateKey(private_key.as_bytes().to_vec()),
+            ),
+            Handle::Ed448PublicKey(public_key) => Ok(SerializableCryptoKeyHandle::Ed448PublicKey(
+                public_key.as_bytes().to_vec(),
+            )),
+            Handle::X448PrivateKey(private_key) => Ok(SerializableCryptoKeyHandle::X448PrivateKey(
+                private_key.as_bytes().to_vec(),
+            )),
+            Handle::X448PublicKey(public_key) => Ok(SerializableCryptoKeyHandle::X448PublicKey(
+                public_key.as_bytes().to_vec(),
+            )),
             Handle::Aes128Key(key) => Ok(SerializableCryptoKeyHandle::Aes128Key(key.to_vec())),
             Handle::Aes192Key(key) => Ok(SerializableCryptoKeyHandle::Aes192Key(key.to_vec())),
             Handle::Aes256Key(key) => Ok(SerializableCryptoKeyHandle::Aes256Key(key.to_vec())),
@@ -565,6 +622,16 @@ impl TryFrom<&Handle> for SerializableCryptoKeyHandle {
                     ml_kem::KeyExport::to_bytes(public_key).as_slice().to_vec(),
                 ))
             },
+            Handle::MlKem768X25519PrivateKey(private_key) => {
+                Ok(SerializableCryptoKeyHandle::MlKem768X25519PrivateKey(
+                    private_key.as_bytes().to_vec(),
+                ))
+            },
+            Handle::MlKem768X25519PublicKey(public_key) => {
+                Ok(SerializableCryptoKeyHandle::MlKem768X25519PublicKey(
+                    x_wing::KeyExport::to_bytes(public_key).to_vec(),
+                ))
+            },
             Handle::MlDsa44PrivateKey(private_key) => {
                 Ok(SerializableCryptoKeyHandle::MlDsa44PrivateKey(
                     private_key.as_seed().as_slice().to_vec(),
@@ -598,9 +665,65 @@ impl TryFrom<&Handle> for SerializableCryptoKeyHandle {
             Handle::ChaCha20Poly1305Key(key) => Ok(
                 SerializableCryptoKeyHandle::ChaCha20Poly1305Key(key.as_slice().to_vec()),
             ),
+            Handle::KmacKey(key) => Ok(SerializableCryptoKeyHandle::KmacKey(key.to_vec())),
             Handle::Argon2Password(password) => Ok(SerializableCryptoKeyHandle::Argon2Password(
                 password.to_vec(),
             )),
+        }
+    }
+}
+
+/// The trait providing helper functions for `&[KeyUsage]`
+pub(crate) trait KeyUsageSliceHelper {
+    /// <https://w3c.github.io/webcrypto/#concept-usage-intersection>
+    fn usage_intersection(&self, other: &[KeyUsage]) -> Vec<KeyUsage>;
+
+    /// <https://w3c.github.io/webcrypto/#concept-normalized-usages>
+    fn normalized_value(&self) -> Vec<KeyUsage>;
+
+    /// Ensure that the key usage list only contains entries which are in `allowed`. If the key
+    /// usage list contains an entry which is not in `allowed`, then throw a SyntaxError. Note that,
+    /// if `allowed` is set to empty, it throws a SyntaxError when the key usage list is not empty.
+    fn ensure_only_contain_entries_from(&self, allowed: &[KeyUsage]) -> ErrorResult;
+}
+
+impl KeyUsageSliceHelper for [KeyUsage] {
+    fn usage_intersection(&self, other: &[KeyUsage]) -> Vec<KeyUsage> {
+        // When this specification says to calculate the usage intersection of two sequences, a and
+        // b the result shall be a sequence containing each recognized key usage value that appears
+        // in both a and b, in the order listed in the list of recognized key usage values, where a
+        // value is said to appear in a sequence if an element of the sequence exists that is a
+        // case-sensitive string match for that value.
+        let mut intersection = self
+            .iter()
+            .filter(|usage| other.contains(usage))
+            .cloned()
+            .collect::<Vec<KeyUsage>>();
+        intersection.sort();
+        intersection.dedup();
+
+        intersection
+    }
+
+    fn normalized_value(&self) -> Vec<KeyUsage> {
+        // When this specification says to calculate the normalized value of a usages list, usages
+        // the result shall be the usage intersection of usages and a sequence containing all
+        // recognized key usage values.
+        self.usage_intersection(KeyUsage::VARIANTS)
+    }
+
+    fn ensure_only_contain_entries_from(&self, allowed: &[KeyUsage]) -> ErrorResult {
+        if self.iter().all(|usage| allowed.contains(usage)) {
+            Ok(())
+        } else {
+            Err(Error::Syntax(Some(if allowed.is_empty() {
+                "Usages is not empty".into()
+            } else {
+                format!(
+                    "Usages contains an entry which is not {}",
+                    allowed.iter().map(|usage| usage.as_ref()).join(" or "),
+                )
+            })))
         }
     }
 }

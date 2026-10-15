@@ -124,8 +124,15 @@ impl IndependentFormattingContext {
             Display::None | Display::Contents => {
                 unreachable!("Should never try to rebuild IndependentFormattingContext with no box")
             },
-            Display::GeneratingBox(display) => display.used_value_for_contents(&contents),
+            Display::GeneratingBox(display) => {
+                display.used_value_for_contents(&contents, node_and_style_info)
+            },
         };
+
+        // This ensures that the `FragmentFlags` of this `BaseFragmentInfo` reflect the
+        // current layout and not the set that was calculated during previous layouts.
+        self.base.base_fragment_info = node_and_style_info.into();
+
         self.contents = Self::construct_contents(
             layout_context,
             node_and_style_info,
@@ -182,9 +189,10 @@ impl IndependentFormattingContext {
 
                 // Some replaced elements can have inner widgets, e.g. `<video controls>`.
                 let node = node_and_style_info.node;
-                let widget = (node.pseudo_element_chain().is_empty() &&
-                    node.is_root_of_user_agent_widget())
-                .then(|| {
+                let should_make_widget = node.pseudo_element_chain().is_empty() &&
+                    node.is_root_of_user_agent_widget() &&
+                    !contents.is_content_replacement;
+                let widget = should_make_widget.then(|| {
                     let widget_info = node_and_style_info
                         .with_pseudo_element(context, PseudoElement::ServoAnonymousBox)
                         .expect("Should always be able to construct info for anonymous boxes.");
@@ -368,7 +376,9 @@ impl IndependentFormattingContext {
     ) {
         self.base.repair_style(new_style);
         match &mut self.contents {
-            IndependentFormattingContextContents::Replaced(_, widget) => {
+            IndependentFormattingContextContents::Replaced(replaced, widget) => {
+                *replaced.selected_style.borrow_mut() = node.selected_style(context);
+
                 if let Some(widget) = widget {
                     let node = node
                         .with_pseudo(PseudoElement::ServoAnonymousBox)
@@ -461,6 +471,8 @@ impl IndependentFormattingContext {
                 layout_context,
                 positioning_context,
                 containing_block_for_children,
+                lazy_block_size,
+                Some(&self.base),
             ),
             IndependentFormattingContextContents::Flex(fc) => fc.layout(
                 layout_context,
@@ -596,6 +608,17 @@ impl IndependentFormattingContext {
 
     pub(crate) fn subtree_size(&self) -> usize {
         self.base.subtree_size()
+    }
+
+    /// Set whether this [`IndependentFormattingContext`] is selected. Returns `true` if
+    /// anything changed.
+    pub(crate) fn set_selection(&self, selected: bool) -> bool {
+        match &self.contents {
+            IndependentFormattingContextContents::Replaced(replaced_contents, ..) => {
+                replaced_contents.set_selection(selected)
+            },
+            _ => false,
+        }
     }
 }
 

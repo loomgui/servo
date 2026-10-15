@@ -5,7 +5,7 @@
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::rust::{HandleObject, HandleValue};
-use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
+use script_bindings::reflector::reflect_dom_object_with_proto;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
@@ -18,7 +18,6 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::Event;
 use crate::dom::serviceworkerglobalscope::ServiceWorkerGlobalScope;
-use crate::script_runtime::JSContext as SafeJSContext;
 
 // https://w3c.github.io/ServiceWorker/#extendable-event
 #[dom_struct]
@@ -53,11 +52,11 @@ impl ExtendableEvent {
         bubbles: bool,
         cancelable: bool,
     ) -> DomRoot<ExtendableEvent> {
-        let ev = reflect_dom_object_with_proto_and_cx(
+        let ev = reflect_dom_object_with_proto(
+            cx,
             Box::new(ExtendableEvent::new_inherited()),
             worker,
             proto,
-            cx,
         );
         {
             let event = ev.upcast::<Event>();
@@ -87,7 +86,7 @@ impl ExtendableEventMethods<crate::DomTypeHolder> for ExtendableEvent {
     }
 
     /// <https://w3c.github.io/ServiceWorker/#wait-until-method>
-    fn WaitUntil(&self, _cx: SafeJSContext, _val: HandleValue) -> ErrorResult {
+    fn WaitUntil(&self, _val: HandleValue) -> ErrorResult {
         // Step 1
         if !self.extensions_allowed {
             return Err(Error::InvalidState(None));

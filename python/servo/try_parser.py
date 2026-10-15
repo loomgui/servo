@@ -23,6 +23,7 @@ from enum import Enum
 
 class Workflow(str, Enum):
     LINUX = "linux"
+    LINUX_ARM = "linux-arm64"
     MACOS = "macos"
     MACOS_ARM = "macos-arm64"
     WINDOWS = "windows"
@@ -71,6 +72,8 @@ class JobConfig(object):
     def update_name(self) -> None:
         if self.workflow is Workflow.LINUX:
             self.name = "Linux"
+        elif self.workflow is Workflow.LINUX_ARM:
+            self.name = "Linux Arm64"
         elif self.workflow is Workflow.MACOS:
             self.name = "MacOS"
         elif self.workflow is Workflow.MACOS_ARM:
@@ -84,6 +87,8 @@ class JobConfig(object):
         modifier = []
         if self.profile != "checked-release":
             modifier.append(self.profile.title())
+        if "--debug-mozjs" in self.build_args:
+            modifier.append("Debug Mozjs")
         if self.unit_tests:
             modifier.append("Unit Tests")
         if self.devtools_tests:
@@ -105,7 +110,9 @@ class JobConfig(object):
 def handle_preset(s: str) -> Optional[JobConfig]:
     s = s.lower()
 
-    if any(word in s for word in ["linux"]):
+    if any(word in s for word in ["linux-arm", "linux-arm64"]):
+        return JobConfig("Linux Arm64", Workflow.LINUX_ARM)
+    elif any(word in s for word in ["linux"]):
         return JobConfig("Linux", Workflow.LINUX)
     elif any(word in s for word in ["mac-arm", "macos-arm", "mac-arm64", "macos-arm64"]):
         return JobConfig("MacOS Arm64", Workflow.MACOS_ARM)
@@ -166,6 +173,11 @@ def handle_modifier(config: Optional[JobConfig], s: str) -> Optional[JobConfig]:
         config.devtools_tests = True
     if "build-libservo" in s:
         config.build_libservo = True
+    if "debugmozjs" in s:
+        # We need to remove the modifier here, so the profile check
+        # below doesn't match on `debug` and force the `dev` profile.
+        s = s.replace("debugmozjs", "")
+        config.build_args = f"{config.build_args} --debug-mozjs".strip()
     if "production" in s:
         config.profile = "production"
     elif "release" in s:
@@ -220,13 +232,12 @@ class Config(object):
                 words.extend(["linux-wpt", "linux-bencher"])
                 words.extend(["android", "ohos", "lint"])
                 words.extend(["linux-build-libservo", "windows-build-libservo"])
-                words.extend(["linux-capi", "windows-capi", "macos-arm-capi"])
+                words.extend(["linux-capi", "windows-capi"])
                 continue  # skip over keyword
             if word == "bencher":
                 words.extend(
                     [
                         "linux-bencher",
-                        "macos-bencher",
                         "macos-arm-bencher",
                         "windows-bencher",
                         "android-bencher",
@@ -238,7 +249,6 @@ class Config(object):
                 words.extend(
                     [
                         "linux-production-bencher",
-                        "macos-production-bencher",
                         "macos-arm-production-bencher",
                         "windows-production-bencher",
                         "ohos-production-bencher",
@@ -341,7 +351,7 @@ class TestParser(unittest.TestCase):
                         "number_of_wpt_chunks": 20,
                     },
                     {
-                        "name": "MacOS Arm64 (Unit Tests, C API)",
+                        "name": "MacOS Arm64 (Unit Tests)",
                         "workflow": "macos-arm64",
                         "wpt": False,
                         "profile": "checked-release",
@@ -350,7 +360,7 @@ class TestParser(unittest.TestCase):
                         "build_libservo": False,
                         "bencher": False,
                         "build_args": "",
-                        "capi": True,
+                        "capi": False,
                         "coverage": False,
                         "wpt_args": "",
                         "number_of_wpt_chunks": 20,
@@ -493,6 +503,21 @@ class TestParser(unittest.TestCase):
 
     def test_wpt_alias(self) -> None:
         self.assertDictEqual(json.loads(Config("wpt").to_json()), json.loads(Config("linux-wpt").to_json()))
+
+    def test_debugmozjs(self) -> None:
+        matrix_result = json.loads(Config("linux-debugmozjs").to_json())["matrix"][0]
+
+        self.assertEqual(matrix_result["name"], "Linux (Debug Mozjs)")
+        self.assertEqual(matrix_result["workflow"], "linux")
+        self.assertEqual(matrix_result["build_args"], "--debug-mozjs")
+        # `debugmozjs` should not force the `dev` profile.
+        self.assertEqual(matrix_result["profile"], "checked-release")
+
+        matrix_result = json.loads(Config("linux-debugmozjs-wpt").to_json())["matrix"][0]
+        self.assertEqual(matrix_result["name"], "Linux (Debug Mozjs, WPT)")
+        self.assertEqual(matrix_result["build_args"], "--debug-mozjs")
+        self.assertEqual(matrix_result["profile"], "checked-release")
+        self.assertTrue(matrix_result["wpt"])
 
     def test_devtools_tests(self) -> None:
         matrix_result = json.loads(Config("linux-devtools").to_json())["matrix"][0]

@@ -9,20 +9,20 @@ use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::jsapi::Heap;
 use js::jsval::{JSVal, UndefinedValue};
-use js::realm::AutoRealm;
 use js::rust::HandleValue as SafeHandleValue;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 
+use crate::dom::bindings::error::ErrorToJsval;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::structuredclone;
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::promise::Promise;
+use crate::dom::promise::{RootedPromise, TracedPromise};
 use crate::dom::stream::defaultteeunderlyingsource::DefaultTeeUnderlyingSource;
 use crate::dom::stream::readablestream::ReadableStream;
-use crate::microtask::{Microtask, MicrotaskRunnable};
 use crate::realms::enter_auto_realm;
+use crate::runtime::job_queue::MicrotaskRunnable;
 
 #[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, expect(crown::unrooted_must_root))]
@@ -34,11 +34,8 @@ pub(crate) struct DefaultTeeReadRequestMicrotask {
 
 impl MicrotaskRunnable for DefaultTeeReadRequestMicrotask {
     fn handler(&self, cx: &mut JSContext) {
-        self.tee_read_request.chunk_steps(cx, &self.chunk);
-    }
-
-    fn enter_realm<'cx>(&self, cx: &'cx mut js::context::JSContext) -> AutoRealm<'cx> {
-        enter_auto_realm(cx, &*self.tee_read_request)
+        let mut realm = enter_auto_realm(cx, &*self.tee_read_request);
+        self.tee_read_request.chunk_steps(&mut realm, &self.chunk);
     }
 }
 
@@ -59,8 +56,7 @@ pub(crate) struct DefaultTeeReadRequest {
     canceled_2: Rc<Cell<bool>>,
     #[conditional_malloc_size_of]
     clone_for_branch_2: Rc<Cell<bool>>,
-    #[conditional_malloc_size_of]
-    cancel_promise: Rc<Promise>,
+    cancel_promise: TracedPromise,
     tee_underlying_source: Dom<DefaultTeeUnderlyingSource>,
 }
 impl DefaultTeeReadRequest {
@@ -75,10 +71,11 @@ impl DefaultTeeReadRequest {
         canceled_1: Rc<Cell<bool>>,
         canceled_2: Rc<Cell<bool>>,
         clone_for_branch_2: Rc<Cell<bool>>,
-        cancel_promise: Rc<Promise>,
+        cancel_promise: &RootedPromise,
         tee_underlying_source: &DefaultTeeUnderlyingSource,
     ) -> DomRoot<Self> {
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(DefaultTeeReadRequest {
                 reflector_: Reflector::new(),
                 stream: Dom::from_ref(stream),
@@ -89,11 +86,10 @@ impl DefaultTeeReadRequest {
                 canceled_1,
                 canceled_2,
                 clone_for_branch_2,
-                cancel_promise,
+                cancel_promise: cancel_promise.to_traced(),
                 tee_underlying_source: Dom::from_ref(tee_underlying_source),
             }),
             &*stream.global(),
-            cx,
         )
     }
     /// Call into cancel of the stream,
@@ -108,7 +104,11 @@ impl DefaultTeeReadRequest {
     }
     /// Enqueue a microtask to perform the chunk steps
     /// <https://streams.spec.whatwg.org/#ref-for-read-request-chunk-steps%E2%91%A2>
-    pub(crate) fn enqueue_chunk_steps(&self, chunk: RootedTraceableBox<Heap<JSVal>>) {
+    pub(crate) fn enqueue_chunk_steps(
+        &self,
+        cx: &mut JSContext,
+        chunk: RootedTraceableBox<Heap<JSVal>>,
+    ) {
         // Queue a microtask to perform the following steps:
         let tee_read_request_chunk = DefaultTeeReadRequestMicrotask {
             chunk: Heap::boxed(*chunk.handle()),
@@ -116,9 +116,7 @@ impl DefaultTeeReadRequest {
         };
         self.stream
             .global()
-            .enqueue_microtask(Microtask::ReadableStreamTeeReadRequest(
-                tee_read_request_chunk,
-            ));
+            .enqueue_microtask(cx, Box::new(tee_read_request_chunk));
     }
     /// <https://streams.spec.whatwg.org/#ref-for-read-request-chunk-steps%E2%91%A2>
     #[expect(clippy::borrowed_box)]
@@ -127,38 +125,57 @@ impl DefaultTeeReadRequest {
         // Set readAgain to false.
         self.read_again.set(false);
         // Let chunk1 and chunk2 be chunk.
-        let chunk1 = chunk;
-        let chunk2 = chunk;
-
-        rooted!(&in(cx) let chunk1_value = chunk1.get());
-        rooted!(&in(cx) let chunk2_value = chunk2.get());
+        rooted!(&in(cx) let chunk1_value = chunk.get());
+        rooted!(&in(cx) let mut chunk2_value = chunk.get());
         // If canceled_2 is false and cloneForBranch2 is true,
         if !self.canceled_2.get() && self.clone_for_branch_2.get() {
             // Let cloneResult be StructuredClone(chunk2).
-            rooted!(&in(cx) let mut clone_result = UndefinedValue());
-            let data = structuredclone::write(cx, chunk2_value.handle(), None).unwrap();
+            let data = match structuredclone::write(cx, chunk2_value.handle(), None) {
+                Ok(data) => data,
+                Err(error) => {
+                    // If cloneResult is an abrupt completion,
+                    rooted!(&in(cx) let mut error_value = UndefinedValue());
+                    error.to_jsval(cx, global, error_value.handle_mut());
+                    // Perform ! ReadableStreamDefaultControllerError(branch_1.[[controller]], cloneResult.[[Value]]).
+                    self.readable_stream_default_controller_error(
+                        cx,
+                        &self.branch_1,
+                        error_value.handle(),
+                    );
+
+                    // Perform ! ReadableStreamDefaultControllerError(branch_2.[[controller]], cloneResult.[[Value]]).
+                    self.readable_stream_default_controller_error(
+                        cx,
+                        &self.branch_2,
+                        error_value.handle(),
+                    );
+                    // Resolve cancelPromise with ! ReadableStreamCancel(stream, cloneResult.[[Value]]).
+                    self.stream_cancel(cx, global, error_value.handle());
+                    // Return.
+                    return;
+                },
+            };
             // If cloneResult is an abrupt completion,
-            if structuredclone::read(cx, global, data, clone_result.handle_mut()).is_err() {
+            if let Err(error) = structuredclone::read(cx, global, data, chunk2_value.handle_mut()) {
+                rooted!(&in(cx) let mut error_value = UndefinedValue());
+                error.to_jsval(cx, global, error_value.handle_mut());
                 // Perform ! ReadableStreamDefaultControllerError(branch_1.[[controller]], cloneResult.[[Value]]).
                 self.readable_stream_default_controller_error(
                     cx,
                     &self.branch_1,
-                    clone_result.handle(),
+                    error_value.handle(),
                 );
 
                 // Perform ! ReadableStreamDefaultControllerError(branch_2.[[controller]], cloneResult.[[Value]]).
                 self.readable_stream_default_controller_error(
                     cx,
                     &self.branch_2,
-                    clone_result.handle(),
+                    error_value.handle(),
                 );
                 // Resolve cancelPromise with ! ReadableStreamCancel(stream, cloneResult.[[Value]]).
-                self.stream_cancel(cx, global, clone_result.handle());
+                self.stream_cancel(cx, global, error_value.handle());
                 // Return.
                 return;
-            } else {
-                // Otherwise, set chunk2 to cloneResult.[[Value]].
-                chunk2.set(*clone_result);
             }
         }
         // If canceled_1 is false, perform ! ReadableStreamDefaultControllerEnqueue(branch_1.[[controller]], chunk1).

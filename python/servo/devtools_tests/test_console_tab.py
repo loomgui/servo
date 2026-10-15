@@ -8,13 +8,14 @@
 # except according to those terms.
 
 from concurrent.futures import Future
+from queue import Queue
 
 import pytest
 from geckordp.actors.events import Events
 from geckordp.actors.resources import Resources
 from geckordp.actors.web_console import WebConsoleActor
 
-from .utils import Devtools
+from .utils import Devtools, attach_thread, set_breakpoint, wait_for_pause, wait_for_source
 
 
 def evaluate_and_capture_console_log_output(js: str, timeout: float = 1) -> dict:
@@ -154,6 +155,14 @@ class TestConsoleTab:
         result = evaluate_and_capture_console_log_output("log_sprintf();")
         assert result["arguments"] == ["String string Int 32 Int 46 Float 3.141592653589793"]
 
+    def test_console_unhandled_promise_rejection(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+
+        result = evaluate_and_capture_console_log_output("Promise.reject(5);")
+
+        assert result["level"] == "error"
+        assert result["arguments"] == ["Unhandled promise rejection: 5"]
+
     def test_console_actor_can_handle_self_referential_objects(self, run_servoshell, web_server_urls):
         run_servoshell(url="data:text/html,")
 
@@ -190,3 +199,153 @@ class TestConsoleTab:
             assert not result["result"]
             assert result["exception"]
             assert "Not enough arguments" in result["exceptionMessage"]
+
+    def test_eager_evaluation(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+
+        with Devtools.connect() as devtools:
+            console = WebConsoleActor(devtools.client, devtools.targets[0]["consoleActor"])
+            evaluation_result = Future()
+
+            def on_evaluation(data):
+                evaluation_result.set_result(data)
+
+            devtools.client.add_event_listener(console.actor_id, Events.WebConsole.EVALUATION_RESULT, on_evaluation)
+
+            console.evaluate_js_async("2 + 2", eager=True)
+            result = evaluation_result.result(1)
+
+            assert result["result"] == 4
+            assert not result["exception"]
+
+    def test_eager_evaluation_aborts_assignment(self, run_servoshell):
+        run_servoshell(url="data:text/html,<head><script>let value = 5;</script></head>")
+
+        with Devtools.connect() as devtools:
+            console = WebConsoleActor(devtools.client, devtools.targets[0]["consoleActor"])
+            queue = Queue()
+
+            def on_evaluation(data):
+                queue.put_nowait(data)
+
+            devtools.client.add_event_listener(console.actor_id, Events.WebConsole.EVALUATION_RESULT, on_evaluation)
+
+            console.evaluate_js_async("value = 4; value", eager=True)
+            result1 = queue.get(timeout=1)
+
+            console.evaluate_js_async("let newValue = 6; newValue", eager=True)
+            result2 = queue.get(timeout=1)
+
+            console.evaluate_js_async("document.head.append('boo!'); document.head.childNodes", eager=True)
+            result3 = queue.get(timeout=1)
+
+            assert result1["result"]["type"] == "undefined"
+            assert not result1["exception"]
+            assert result2["result"]["type"] == "undefined"
+            assert not result2["exception"]
+            assert result3["result"]["type"] == "undefined"
+            assert not result3["exception"]
+
+    def test_console_throw_primitives(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+        testCases = [
+            {"input": "throw 0;", "exceptionMessage": "Uncaught 0"},
+            {"input": 'throw "";', "exceptionMessage": "Uncaught "},
+            {"input": "throw {};", "exceptionMessage": "Uncaught [object Object]"},
+            {"input": "throw true;", "exceptionMessage": "Uncaught true"},
+            {"input": "const fn=()=>{};throw fn;", "exceptionMessage": "Uncaught [object Object]"},
+            {"input": "throw NaN;", "exceptionMessage": "Uncaught NaN"},
+            {"input": "throw Infinity;", "exceptionMessage": "Uncaught Infinity"},
+        ]
+        queue = Queue()
+
+        with Devtools.connect() as devtools:
+            console = WebConsoleActor(devtools.client, devtools.targets[0]["consoleActor"])
+
+            def on_evaluation(data):
+                queue.put_nowait(data)
+
+            devtools.client.add_event_listener(console.actor_id, Events.WebConsole.EVALUATION_RESULT, on_evaluation)
+            for testCase in testCases:
+                console.evaluate_js_async(testCase["input"])
+                data = queue.get(timeout=1)
+                assert not data["result"]
+                assert data["hasException"]
+                assert testCase["exceptionMessage"] in data["exceptionMessage"]
+
+    def test_global_autocomplete(self, run_servoshell):
+        script_tag = "<script>console_test_value = 5;</script>"
+        run_servoshell(url=f"data:text/html,{script_tag}")
+
+        with Devtools.connect() as devtools:
+            console = WebConsoleActor(devtools.client, devtools.targets[0]["consoleActor"])
+            prompt = "con"
+            result = console.autocomplete(text=prompt, frame_actor=None)
+
+            # TODO: These are not supported yet
+            # assert "console" in result["matches"]
+            # assert "const" in result["matches"]
+            # assert "continue" in result["matches"]
+
+            assert "console_test_value" in result["matches"]
+            assert result["matchProp"] == prompt
+
+    def test_frame_autocomplete(self, run_servoshell, web_server_urls):
+        run_servoshell(url=f"{web_server_urls[0]}/console/autocomplete_scoped.html")
+        with Devtools.connect() as devtools:
+            thread_actor = attach_thread(devtools)
+            source_actor = wait_for_source(devtools, "console/autocomplete_scoped.html")
+
+            # Get valid breakpoint position
+            positions = devtools.client.send_receive(
+                {"to": source_actor, "type": "getBreakpointPositionsCompressed"}
+            ).get("positions", {})
+
+            line_str = str(6)
+            line, column = int(line_str), positions[line_str][0]
+
+            def trigger():
+                set_breakpoint(devtools, f"{web_server_urls[0]}/console/autocomplete_scoped.html", line, column)
+
+            pause_data = wait_for_pause(devtools.client, thread_actor, trigger)
+            frame_actor = pause_data["frame"]["actor"]
+
+            prompt = "val"
+            console = WebConsoleActor(devtools.client, devtools.targets[0]["consoleActor"])
+            result = console.autocomplete(text=prompt, frame_actor=frame_actor)
+
+            assert "valInner" in result["matches"]
+            assert "valOuter" in result["matches"]
+            assert result["matchProp"] == prompt
+
+    # Console autocomplete is case-insensitive when the first character is lowercase
+    def test_console_case_sensitivity(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+        with Devtools.connect() as devtools:
+            console = WebConsoleActor(devtools.client, devtools.targets[0]["consoleActor"])
+            future = Future()
+
+            def on_evaluation(data):
+                future.set_result(data)
+
+            devtools.client.add_event_listener(console.actor_id, Events.WebConsole.EVALUATION_RESULT, on_evaluation)
+            console.evaluate_js_async("let case_; let CASE_;")
+            eval_result = future.result(1)
+            assert not eval_result["exception"]
+
+            result_uu = console.autocomplete(text="CA", frame_actor=None)
+            result_ul = console.autocomplete(text="Ca", frame_actor=None)
+            result_lu = console.autocomplete(text="cA", frame_actor=None)
+            result_ll = console.autocomplete(text="ca", frame_actor=None)
+
+            assert "case_" not in result_uu["matches"]
+            assert "CASE_" in result_uu["matches"]
+
+            assert "case_" not in result_ul["matches"]
+            assert "CASE_" not in result_ul["matches"]
+
+            assert "case_" in result_lu["matches"]
+            assert "CASE_" in result_lu["matches"]
+
+            assert "case_" in result_ll["matches"]
+            assert "CASE_" in result_ll["matches"]

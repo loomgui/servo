@@ -7,7 +7,7 @@ use js::context::JSContext;
 use js::jsapi::Heap;
 use js::jsval::JSVal;
 use js::rust::{HandleObject, HandleValue, MutableHandleValue};
-use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
+use script_bindings::reflector::reflect_dom_object_with_proto;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::CustomEventBinding;
@@ -16,10 +16,8 @@ use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
-use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::event::Event;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::JSContext as SafeJSContext;
 
 // https://dom.spec.whatwg.org/#interface-customevent
 #[dom_struct]
@@ -49,12 +47,7 @@ impl CustomEvent {
         global: &GlobalScope,
         proto: Option<HandleObject>,
     ) -> DomRoot<CustomEvent> {
-        reflect_dom_object_with_proto_and_cx(
-            Box::new(CustomEvent::new_inherited()),
-            global,
-            proto,
-            cx,
-        )
+        reflect_dom_object_with_proto(cx, Box::new(CustomEvent::new_inherited()), global, proto)
     }
 
     fn new(
@@ -95,7 +88,7 @@ impl CustomEventMethods<crate::DomTypeHolder> for CustomEvent {
         global: &GlobalScope,
         proto: Option<HandleObject>,
         type_: DOMString,
-        init: RootedTraceableBox<CustomEventBinding::CustomEventInit>,
+        init: &CustomEventBinding::CustomEventInit,
     ) -> DomRoot<CustomEvent> {
         let event = CustomEvent::new(
             cx,
@@ -111,14 +104,13 @@ impl CustomEventMethods<crate::DomTypeHolder> for CustomEvent {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-customevent-detail>
-    fn Detail(&self, _cx: SafeJSContext, mut retval: MutableHandleValue) {
+    fn Detail(&self, mut retval: MutableHandleValue) {
         retval.set(self.detail.get())
     }
 
     /// <https://dom.spec.whatwg.org/#dom-customevent-initcustomevent>
     fn InitCustomEvent(
         &self,
-        _cx: SafeJSContext,
         type_: DOMString,
         can_bubble: bool,
         cancelable: bool,

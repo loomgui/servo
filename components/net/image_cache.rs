@@ -2,22 +2,23 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::cmp::min;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::mem;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::{mem, thread_local};
 
 use imsz::imsz_from_reader;
-use log::{debug, warn};
+use log::{debug, error, warn};
 use malloc_size_of::{MallocConditionalSizeOf, MallocSizeOf as MallocSizeOfTrait, MallocSizeOfOps};
 use malloc_size_of_derive::MallocSizeOf;
 use mime::Mime;
 use net_traits::image_cache::{
-    Image, ImageCache, ImageCacheFactory, ImageCacheResponseCallback, ImageCacheResponseMessage,
-    ImageCacheResult, ImageLoadListener, ImageOrMetadataAvailable, ImageResponse, PendingImageId,
-    RasterizationCompleteResponse, VectorImage,
+    FontResolver, Image, ImageCache, ImageCacheFactory, ImageCacheResponseCallback,
+    ImageCacheResponseMessage, ImageCacheResult, ImageLoadListener, ImageOrMetadataAvailable,
+    ImageResponse, PendingImageId, RasterizationCompleteResponse, VectorImage,
 };
 use net_traits::request::CorsSettings;
 use net_traits::{FetchMetadata, FetchResponseMsg, FilteredMetadata, NetworkError};
@@ -35,11 +36,28 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::id::{PipelineId, WebViewId};
 use servo_base::threadpool::ThreadPool;
 use servo_url::{ImmutableOrigin, ServoUrl};
+use uuid::Uuid;
 use webrender_api::units::DeviceIntSize;
 use webrender_api::{
     ExternalImageData, ExternalImageType, ImageDescriptor, ImageDescriptorFlags, ImageFormat,
     ImageKey as WebRenderImageKey,
 };
+
+use crate::image_cache::KeyCacheState::PipelineClosed;
+
+thread_local! {
+    pub static SUPPRESS_ABORT_IN_PANIC_HOOK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Returns `true` if embedder's custom panic hook handler should *not* treat the panic
+/// as a fatal error that requires termination of the engine.
+///
+/// This is needed to catch and silence panics in `resvg` crate. `servoshell
+/// registers a custom panic hook that aborts the process in `hard_fail` mode
+/// even when using `catch_unwind`.
+pub fn should_panic_hook_suppress_termination() -> bool {
+    SUPPRESS_ABORT_IN_PANIC_HOOK.get()
+}
 
 // We bake in rippy.png as a fallback, in case the embedder does not provide a broken
 // image icon resource. This version is 229 bytes, so don't exchange it against
@@ -71,23 +89,9 @@ const MAX_SVG_PIXMAP_DIMENSION: u32 = 5000;
 
 fn parse_svg_document_in_memory(
     bytes: &[u8],
-    fontdb: Arc<fontdb::Database>,
+    usvg_options: Arc<usvg::Options>,
 ) -> Result<usvg::Tree, &'static str> {
-    let image_string_href_resolver = Box::new(move |_: &str, _: &usvg::Options| {
-        // Do not try to load `href` in <image> as local file path.
-        None
-    });
-
-    let opt = usvg::Options {
-        image_href_resolver: usvg::ImageHrefResolver {
-            resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
-            resolve_string: image_string_href_resolver,
-        },
-        fontdb,
-        ..usvg::Options::default()
-    };
-
-    usvg::Tree::from_data(bytes, &opt)
+    usvg::Tree::from_data(bytes, &usvg_options)
         .inspect_err(|error| {
             warn!("Error when parsing SVG data: {error}");
         })
@@ -99,7 +103,7 @@ fn decode_bytes_sync(
     bytes: &[u8],
     cors: CorsStatus,
     content_type: Option<Mime>,
-    fontdb: Arc<fontdb::Database>,
+    usvg_options: Arc<usvg::Options>,
 ) -> DecoderMsg {
     let is_svg_document = content_type.is_some_and(|content_type| {
         (
@@ -110,7 +114,7 @@ fn decode_bytes_sync(
     });
 
     let image = if is_svg_document {
-        parse_svg_document_in_memory(bytes, fontdb)
+        parse_svg_document_in_memory(bytes, usvg_options)
             .ok()
             .map(|svg_tree| {
                 DecodedImage::Vector(VectorImageData {
@@ -151,7 +155,7 @@ type ImageKey = (ServoUrl, ImmutableOrigin, Option<CorsSettings>);
 
 // Represents all the currently pending loads/decodings. For
 // performance reasons, loads are indexed by a dedicated load key.
-#[derive(MallocSizeOf)]
+#[derive(Default, MallocSizeOf)]
 struct AllPendingLoads {
     // The loads, indexed by a load key. Used during most operations,
     // for performance reasons.
@@ -285,13 +289,14 @@ impl ImageBytes {
     }
 
     fn mark_complete(&mut self) -> Arc<Vec<u8>> {
-        let bytes = {
+        let mut bytes = {
             let own_bytes = match *self {
                 ImageBytes::InProgress(ref mut bytes) => bytes,
                 ImageBytes::Complete(_) => panic!("attempted modification of complete image bytes"),
             };
             mem::take(own_bytes)
         };
+        bytes.shrink_to_fit();
         let bytes = Arc::new(bytes);
         *self = ImageBytes::Complete(bytes.clone());
         bytes
@@ -303,12 +308,19 @@ impl ImageBytes {
             ImageBytes::Complete(ref bytes) => bytes,
         }
     }
+
+    fn set_capacity(&mut self, size: usize) {
+        match self {
+            ImageBytes::InProgress(items) => items.reserve(size.saturating_sub(items.len())),
+            ImageBytes::Complete(_) => error!("Want to set capacity on already completed image."),
+        }
+    }
 }
 
 // A key used to communicate during loading.
 type LoadKey = PendingImageId;
 
-#[derive(MallocSizeOf)]
+#[derive(Default, MallocSizeOf)]
 struct LoadKeyGenerator {
     counter: u64,
 }
@@ -407,7 +419,7 @@ enum PendingKey {
 }
 
 /// The state of the `WebRenderImageKey`` cache
-#[derive(Debug, MallocSizeOf)]
+#[derive(Debug, Default, MallocSizeOf)]
 enum KeyCacheState {
     /// We already requested a batch of keys.
     PendingBatch,
@@ -415,12 +427,17 @@ enum KeyCacheState {
     Ready(Vec<WebRenderImageKey>),
     /// Currently filling images from the KeyCache. No new keys will be requested.
     Processing,
+    /// We will not process any images anymore because the pipeline is shut down.
+    #[default]
+    PipelineClosed,
 }
 
 impl KeyCacheState {
     fn size(&self) -> usize {
         match self {
-            KeyCacheState::PendingBatch | KeyCacheState::Processing => 0,
+            KeyCacheState::PendingBatch
+            | KeyCacheState::Processing
+            | KeyCacheState::PipelineClosed => 0,
             KeyCacheState::Ready(items) => items.len(),
         }
     }
@@ -429,7 +446,7 @@ impl KeyCacheState {
 /// As getting new keys takes a round trip over the constellation, we keep a small cache of them.
 /// Additionally, this cache will store image resources that do not have a key yet because those
 /// are needed to complete the load.
-#[derive(MallocSizeOf)]
+#[derive(Default, MallocSizeOf)]
 struct KeyCache {
     /// A cache of `WebRenderImageKey`.
     cache: KeyCacheState,
@@ -557,8 +574,9 @@ impl ImageCacheStore {
     /// If a key is available the image will be immediately loaded, otherwise it will load then the next batch of
     /// keys is received. Only call this if the image does not have a `LoadKey` yet.
     fn load_image_with_keycache(&mut self, pending_image: PendingKey) {
-        if let PendingKey::Svg((pending_id, ref _raster_image, requested_size)) = pending_image &&
-            self.key_cache
+        if let PendingKey::Svg((pending_id, ref _raster_image, requested_size)) = pending_image
+            && self
+                .key_cache
                 .evicted_images
                 .remove(&(pending_id, requested_size))
         {
@@ -579,6 +597,7 @@ impl ImageCacheStore {
                     self.fetch_more_image_keys();
                 },
             },
+            KeyCacheState::PipelineClosed => {},
         }
     }
 
@@ -600,29 +619,33 @@ impl ImageCacheStore {
 
     /// Insert received keys into the cache and complete the loading of images.
     fn insert_keys_and_load_images(&mut self, image_keys: Vec<WebRenderImageKey>) {
-        if let KeyCacheState::Processing = self.key_cache.cache {
-            // We can set this now to ready as we have the exclusive write access.
-            self.key_cache.cache = KeyCacheState::Ready(image_keys);
-            let len = min(
-                self.key_cache.cache.size(),
-                self.key_cache.images_pending_keys.len(),
-            );
-            let images = self
-                .key_cache
-                .images_pending_keys
-                .drain(0..len)
-                .collect::<Vec<PendingKey>>();
-            for key in images {
-                self.load_image_with_keycache(key);
-            }
-            // It is important to fetch new image keys as we might have missed previous returns.
-            if !self.key_cache.images_pending_keys.is_empty() {
-                self.paint_api
-                    .generate_image_key_async(self.webview_id, self.pipeline_id);
-                self.key_cache.cache = KeyCacheState::PendingBatch
-            }
-        } else {
-            unreachable!("A batch was received while we didn't request one")
+        match &mut self.key_cache.cache {
+            KeyCacheState::Processing => {
+                // We can set this now to ready as we have the exclusive write access.
+                self.key_cache.cache = KeyCacheState::Ready(image_keys);
+                let len = min(
+                    self.key_cache.cache.size(),
+                    self.key_cache.images_pending_keys.len(),
+                );
+                let images = self
+                    .key_cache
+                    .images_pending_keys
+                    .drain(0..len)
+                    .collect::<Vec<PendingKey>>();
+                for key in images {
+                    self.load_image_with_keycache(key);
+                }
+                // It is important to fetch new image keys as we might have missed previous returns.
+                if !self.key_cache.images_pending_keys.is_empty() {
+                    self.paint_api
+                        .generate_image_key_async(self.webview_id, self.pipeline_id);
+                    self.key_cache.cache = KeyCacheState::PendingBatch
+                }
+            },
+            KeyCacheState::PendingBatch | KeyCacheState::Ready(_) => {
+                unreachable!("A batch was received while we didn't request one")
+            },
+            PipelineClosed => {},
         }
     }
 
@@ -710,9 +733,9 @@ impl ImageCacheStore {
     ) {
         if let Some(loaded_image) =
             self.completed_loads
-                .remove(&(url.clone(), origin.clone(), *cors_setting)) &&
-            let ImageResponse::Loaded(Image::Raster(image), _) = loaded_image.image_response &&
-            let Some(id) = image.id
+                .remove(&(url.clone(), origin.clone(), *cors_setting))
+            && let ImageResponse::Loaded(Image::Raster(image), _) = loaded_image.image_response
+            && let Some(id) = image.id
         {
             self.paint_api.update_images(
                 self.webview_id.into(),
@@ -791,9 +814,6 @@ pub struct ImageCacheFactoryImpl {
     broken_image_icon_data: Arc<Vec<u8>>,
     /// Thread pool for image decoding
     thread_pool: Arc<ThreadPool>,
-    /// A shared font database to be used by system fonts accessed when rasterizing vector
-    /// images.
-    fontdb: Arc<fontdb::Database>,
     external_image_resolver: Option<Arc<dyn EmbedderExternalImageResolver>>,
 }
 
@@ -803,13 +823,10 @@ impl ImageCacheFactoryImpl {
         external_image_resolver: Option<Arc<dyn EmbedderExternalImageResolver>>,
     ) -> Self {
         debug!("Creating new ImageCacheFactoryImpl");
-        let mut fontdb = fontdb::Database::new();
-        fontdb.load_system_fonts();
 
         Self {
             broken_image_icon_data: Arc::new(broken_image_icon_data),
             thread_pool: ThreadPool::global(),
-            fontdb: Arc::new(fontdb),
             external_image_resolver,
         }
     }
@@ -821,7 +838,31 @@ impl ImageCacheFactory for ImageCacheFactoryImpl {
         webview_id: WebViewId,
         pipeline_id: PipelineId,
         paint_api: &CrossProcessPaintApi,
+        font_resolver: Arc<dyn FontResolver>,
     ) -> Arc<dyn ImageCache> {
+        let image_string_href_resolver = Box::new(move |_: &str, _: &usvg::Options| {
+            // Do not try to load `href` in <image> as local file path.
+            None
+        });
+        let font_resolver2 = font_resolver.clone();
+        let font_resolver3 = font_resolver.clone();
+        let usvg_font_resolver = usvg::FontResolver {
+            select_font: Box::new(move |font, database| font_resolver2.resolve(font, database)),
+            select_fallback: Box::new(move |char, ids, database| {
+                font_resolver3.resolve_fallback(char, ids, database)
+            }),
+        };
+
+        let opt = usvg::Options {
+            image_href_resolver: usvg::ImageHrefResolver {
+                resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+                resolve_string: image_string_href_resolver,
+            },
+            font_resolver: usvg_font_resolver,
+            fontdb: Arc::new(fontdb::Database::new()),
+            ..usvg::Options::default()
+        };
+
         Arc::new(ImageCacheImpl {
             store: Arc::new(Mutex::new(ImageCacheStore {
                 pending_loads: AllPendingLoads::new(),
@@ -839,7 +880,8 @@ impl ImageCacheFactory for ImageCacheFactoryImpl {
             svg_id_image_id_map: Arc::new(Mutex::new(FxHashMap::default())),
             broken_image_icon_data: self.broken_image_icon_data.clone(),
             thread_pool: self.thread_pool.clone(),
-            fontdb: self.fontdb.clone(),
+            usvg_options: Arc::new(opt),
+            usvg_font_resolver: font_resolver.clone(),
             external_image_resolver: self.external_image_resolver.clone(),
         })
     }
@@ -849,15 +891,18 @@ pub struct ImageCacheImpl {
     /// Per-[`ImageCache`] data.
     store: Arc<Mutex<ImageCacheStore>>,
     /// Maps an SVGElement uuid to a pending image id in the store
-    svg_id_image_id_map: Arc<Mutex<FxHashMap<String, PendingImageId>>>,
+    svg_id_image_id_map: Arc<Mutex<FxHashMap<Uuid, PendingImageId>>>,
     /// The data to use for the broken image icon used when images cannot load.
     broken_image_icon_data: Arc<Vec<u8>>,
     /// Thread pool for image decoding. This is shared with other [`ImageCache`]s in the
     /// same process.
     thread_pool: Arc<ThreadPool>,
-    /// A shared font database to be used by system fonts accessed when rasterizing vector
-    /// images. This is shared with other [`ImageCache`]s in the same process.
-    fontdb: Arc<fontdb::Database>,
+    /// The options for usvg. Contains a fontdb::Database and fontresolver.
+    usvg_options: Arc<usvg::Options<'static>>,
+    /// A font resolve used for resolving fonts when rasterizing SVGs.
+    ///
+    /// This is only used inside `usvg::Options` but is here so we can measure it.
+    usvg_font_resolver: Arc<dyn FontResolver>,
     external_image_resolver: Option<Arc<dyn EmbedderExternalImageResolver>>,
 }
 
@@ -965,15 +1010,33 @@ fn take_image_key(store: &mut ImageCacheStore) -> Option<WebRenderImageKey> {
 impl ImageCache for ImageCacheImpl {
     fn memory_reports(&self, prefix: &str, ops: &mut MallocSizeOfOps) -> Vec<Report> {
         let store_size = self.store.lock().size_of(ops);
-        let fontdb_size = self.fontdb.conditional_size_of(ops);
+        let fontdb_size = self.usvg_options.conditional_size_of(ops);
+        let broken_image_size = self.broken_image_icon_data.conditional_size_of(ops);
+        let svg_id_map = self.svg_id_image_id_map.conditional_size_of(ops);
+        let svg_font_resolver = self.usvg_font_resolver.size_of(ops);
         vec![
             Report {
-                path: path![prefix, "image-cache"],
+                path: path![prefix, "image-cache", "cache"],
                 kind: ReportKind::ExplicitSystemHeapSize,
                 size: store_size,
             },
             Report {
-                path: path![prefix, "image-cache", "fontdb"],
+                path: path![prefix, "image-cache", "svg_id_map"],
+                kind: ReportKind::ExplicitSystemHeapSize,
+                size: svg_id_map,
+            },
+            Report {
+                path: path![prefix, "image-cache", "broken_image_icon"],
+                kind: ReportKind::ExplicitSystemHeapSize,
+                size: broken_image_size,
+            },
+            Report {
+                path: path![prefix, "image-cache", "svg_font_resolver"],
+                kind: ReportKind::ExplicitSystemHeapSize,
+                size: svg_font_resolver,
+            },
+            Report {
+                path: path![prefix, "image-cache", "usvg_options"],
                 kind: ReportKind::ExplicitSystemHeapSize,
                 size: fontdb_size,
             },
@@ -1111,7 +1174,7 @@ impl ImageCache for ImageCacheImpl {
         &self,
         image_id: PendingImageId,
         requested_size: DeviceIntSize,
-        svg_id: Option<String>,
+        svg_id: Option<Uuid>,
     ) -> Option<RasterImage> {
         let mut store = self.store.lock();
         let Some(vector_image) = store.vector_images.get(&image_id).cloned() else {
@@ -1130,10 +1193,10 @@ impl ImageCache for ImageCacheImpl {
             return Some(result.clone());
         }
 
-        if let Some(svg_id) = svg_id &&
-            let Some(old_mapped_image_id) =
-                self.svg_id_image_id_map.lock().insert(svg_id, image_id) &&
-            old_mapped_image_id != image_id
+        if let Some(svg_id) = svg_id
+            && let Some(old_mapped_image_id) =
+                self.svg_id_image_id_map.lock().insert(svg_id, image_id)
+            && old_mapped_image_id != image_id
         {
             store.vector_images.remove(&old_mapped_image_id);
             store
@@ -1151,22 +1214,35 @@ impl ImageCache for ImageCacheImpl {
             return None;
         }
 
+        let natural_size = vector_image.svg_tree.size().to_int_size();
+        let tinyskia_requested_size = {
+            let width = requested_size
+                .width
+                .try_into()
+                .unwrap_or(0)
+                .min(MAX_SVG_PIXMAP_DIMENSION);
+            let height = requested_size
+                .height
+                .try_into()
+                .unwrap_or(0)
+                .min(MAX_SVG_PIXMAP_DIMENSION);
+            tiny_skia::IntSize::from_wh(width, height).unwrap_or(natural_size)
+        };
+
+        // Requirements from tiny_skia::Pixmap::new
+        if tinyskia_requested_size.width() == 0
+            || tinyskia_requested_size.width() > (i32::MAX / 4).try_into().unwrap()
+            || tinyskia_requested_size.height() == 0
+        {
+            debug!(
+                "Asked for requested size {:?} which has zero size. Not returning image",
+                requested_size
+            );
+            return None;
+        }
+
         let store = self.store.clone();
         self.thread_pool.spawn(move || {
-            let natural_size = vector_image.svg_tree.size().to_int_size();
-            let tinyskia_requested_size = {
-                let width = requested_size
-                    .width
-                    .try_into()
-                    .unwrap_or(0)
-                    .min(MAX_SVG_PIXMAP_DIMENSION);
-                let height = requested_size
-                    .height
-                    .try_into()
-                    .unwrap_or(0)
-                    .min(MAX_SVG_PIXMAP_DIMENSION);
-                tiny_skia::IntSize::from_wh(width, height).unwrap_or(natural_size)
-            };
             let transform = tiny_skia::Transform::from_scale(
                 tinyskia_requested_size.width() as f32 / natural_size.width() as f32,
                 tinyskia_requested_size.height() as f32 / natural_size.height() as f32,
@@ -1176,36 +1252,75 @@ impl ImageCache for ImageCacheImpl {
                 tinyskia_requested_size.height(),
             )
             .unwrap();
-            resvg::render(&vector_image.svg_tree, transform, &mut pixmap.as_mut());
 
-            let bytes = pixmap.take();
-            let frame = ImageFrame {
-                delay: None,
-                byte_range: 0..bytes.len(),
-                width: tinyskia_requested_size.width(),
-                height: tinyskia_requested_size.height(),
-            };
+            // Some SVG documents, primarily ones created by fuzzers, can cause resvg to fail
+            // assertions and panic. We catch any panics in `resvg::render` here so that we don't
+            // crash the whole engine for such cases. In case of a panic, the completion listeners
+            // added for this request will never get called.
+            //
+            // We also need to set `SUPPRESS_ABORT_IN_PANIC_HOOK` for the duration of the call
+            // because servoshell registers a custom hook that intercepts the panic and crashes
+            // the process when run in hard_fail mode.
+            //
+            // `AssertUnwindSafe` should be safe here since we will remove the `vector_image`
+            // from `store.vector_images` and won't use it again. This assumes `resvg::render`
+            // doesn't use internal global state that could become invalid after the panic.
+            SUPPRESS_ABORT_IN_PANIC_HOOK.set(true);
+            let resvg_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                resvg::render(&vector_image.svg_tree, transform, &mut pixmap.as_mut());
 
-            let rasterized_image = RasterImage {
-                metadata: ImageMetadata {
+                let bytes = pixmap.take();
+                let frame = ImageFrame {
+                    delay: None,
+                    byte_range: 0..bytes.len(),
                     width: tinyskia_requested_size.width(),
                     height: tinyskia_requested_size.height(),
-                },
-                format: PixelFormat::RGBA8,
-                frames: vec![frame],
-                bytes: Arc::new(bytes),
-                id: None,
-                cors_status: vector_image.cors_status,
-                is_opaque: false,
-                loop_count: None,
-            };
+                };
 
-            let mut store = store.lock();
-            store.load_image_with_keycache(PendingKey::Svg((
-                image_id,
-                rasterized_image,
-                requested_size,
-            )));
+                RasterImage {
+                    metadata: ImageMetadata {
+                        width: tinyskia_requested_size.width(),
+                        height: tinyskia_requested_size.height(),
+                    },
+                    format: PixelFormat::RGBA8,
+                    frames: vec![frame],
+                    bytes: Arc::new(bytes),
+                    id: None,
+                    cors_status: vector_image.cors_status,
+                    is_opaque: false,
+                    loop_count: None,
+                }
+            }));
+            SUPPRESS_ABORT_IN_PANIC_HOOK.set(false);
+
+            match resvg_result {
+                Ok(rasterized_image) => {
+                    let mut store = store.lock();
+                    store.load_image_with_keycache(PendingKey::Svg((
+                        image_id,
+                        rasterized_image,
+                        requested_size,
+                    )));
+                },
+                Err(_) => {
+                    warn!("resvg panicked while rasterizing SVG image {image_id:?} at {requested_size:?}");
+                    let mut store = store.lock();
+                    // Clean up data for this rasterization request.
+                    store
+                        .svg_rasterization_task_store
+                        .remove_being_rasterized(image_id, requested_size);
+                    store
+                        .rasterized_vector_images
+                        .remove(&(image_id, requested_size));
+
+                    // Remove the `image_id` from `vector_images` so the check at the top of this
+                    // method will fail for subsequent calls and won't trigger rasterization
+                    // again. Note, however, this means subsequent rasterization requests for
+                    // a different `requested_size` will also fail, but the panics in resvg so far
+                    // seem indepenent of the size, so this should be good enough.
+                    store.vector_images.remove(&image_id);
+                },
+            }
         });
         None
     }
@@ -1227,7 +1342,7 @@ impl ImageCache for ImageCacheImpl {
         store.remove_loaded_image(url, origin, cors_setting);
     }
 
-    fn evict_rasterized_image(&self, svg_id: &str) {
+    fn evict_rasterized_image(&self, svg_id: &Uuid) {
         let mut store = self.store.lock();
         if let Some(mapped_image_id) = self.svg_id_image_id_map.lock().remove(svg_id) {
             store.pending_loads.remove(&mapped_image_id);
@@ -1247,8 +1362,8 @@ impl ImageCache for ImageCacheImpl {
     /// Inform the image cache about a response for a pending request.
     fn notify_pending_response(&self, id: PendingImageId, action: FetchResponseMsg) {
         match (action, id) {
-            (FetchResponseMsg::ProcessRequestBody(..), _) |
-            (FetchResponseMsg::ProcessCspViolations(..), _) => (),
+            (FetchResponseMsg::ProcessRequestBody(..), _)
+            | (FetchResponseMsg::ProcessCspViolations(..), _) => (),
             (FetchResponseMsg::ProcessResponse(_, response), _) => {
                 debug!("Received {:?} for {:?}", response.as_ref().map(|_| ()), id);
                 let mut store = self.store.lock();
@@ -1261,8 +1376,8 @@ impl ImageCache for ImageCacheImpl {
                                     FilteredMetadata::Basic(_) | FilteredMetadata::Cors(_) => {
                                         CorsStatus::Safe
                                     },
-                                    FilteredMetadata::Opaque |
-                                    FilteredMetadata::OpaqueRedirect(_) => CorsStatus::Unsafe,
+                                    FilteredMetadata::Opaque
+                                    | FilteredMetadata::OpaqueRedirect(_) => CorsStatus::Unsafe,
                                 },
                                 Some(unsafe_),
                             ),
@@ -1325,10 +1440,15 @@ impl ImageCache for ImageCacheImpl {
                         };
 
                         let local_store = self.store.clone();
-                        let fontdb = self.fontdb.clone();
+                        let usvg_options = self.usvg_options.clone();
                         self.thread_pool.spawn(move || {
-                            let msg =
-                                decode_bytes_sync(key, &bytes, cors_status, content_type, fontdb);
+                            let msg = decode_bytes_sync(
+                                key,
+                                &bytes,
+                                cors_status,
+                                content_type,
+                                usvg_options,
+                            );
                             local_store.lock().handle_decoder(msg);
                         });
                     },
@@ -1337,6 +1457,12 @@ impl ImageCache for ImageCacheImpl {
                         let mut store = self.store.lock();
                         store.complete_load(id, LoadResult::FailedToLoadOrDecode)
                     },
+                }
+            },
+            (FetchResponseMsg::ProcessContentLength(_response_id, size), _key) => {
+                let mut store = self.store.lock();
+                if let Some(pending_load) = store.pending_loads.get_by_key_mut(&id) {
+                    pending_load.bytes.set_capacity(size);
                 }
             },
         }
@@ -1359,6 +1485,7 @@ impl ImageCache for ImageCacheImpl {
 
     fn clear(&self) {
         self.store.lock().clear();
+        *self.svg_id_image_id_map.lock() = Default::default();
     }
 
     fn get_broken_image_icon(&self) -> Option<Arc<RasterImage>> {
@@ -1381,6 +1508,7 @@ impl ImageCache for ImageCacheImpl {
 
 impl ImageCacheStore {
     /// Clear the image cache.
+    // Webrender currently does not care about keys that are loaded but do not have an image attached to it.
     fn clear(&mut self) {
         let deletions: smallvec::SmallVec<_> = self
             .completed_loads
@@ -1416,9 +1544,14 @@ impl ImageCacheStore {
         // Clear these fields, since `clear()` will be called multiple times,
         // explicitly on pipeline close, and again on Drop (as a safeguard,
         // since we could forget to explicitly clear).
-        self.completed_loads.clear();
-        self.external_images.clear();
-        self.rasterized_vector_images.clear();
+        self.completed_loads = Default::default();
+        self.external_images = Default::default();
+        self.vector_images = Default::default();
+        self.rasterized_vector_images = Default::default();
+        self.svg_rasterization_task_store = Default::default();
+        self.pending_loads = Default::default();
+        self.key_cache = Default::default();
+
         let _ = self.broken_image_icon_image.take();
     }
 }

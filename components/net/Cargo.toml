@@ -21,6 +21,7 @@ test-util = ["hyper-util/server-graceful", "dep:servo-default-resources", "net_t
 tracing = ["dep:tracing"]
 
 [dependencies]
+aws-lc-rs = { workspace = true }
 async-compression = { workspace = true, features = ["brotli", "gzip", "tokio", "zlib", "zstd"] }
 async-recursion = { workspace = true }
 async-tungstenite = { workspace = true }
@@ -34,6 +35,7 @@ data-url = { workspace = true }
 devtools_traits = { workspace = true }
 embedder_traits = { workspace = true }
 fst = { workspace = true }
+fonts = { workspace = true }
 futures = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
@@ -58,13 +60,16 @@ paint_api = { workspace = true }
 parking_lot = { workspace = true }
 pixels = { workspace = true }
 profile_traits = { workspace = true }
-quick_cache = { workspace = true, features = ["ahash"] }
+postcard = { workspace = true }
+quick_cache = { workspace = true }
+rand = { workspace = true }
 regex = { workspace = true }
 resvg = { workspace = true }
 rustc-hash = { workspace = true }
 rustls = { workspace = true, features = ["aws-lc-rs"] }
 rustls-pki-types = { workspace = true }
 rustls-platform-verifier = { workspace = true }
+rusqlite = { workspace = true }
 serde = { workspace = true }
 servo-base = { workspace = true }
 servo-config = { workspace = true }
@@ -72,8 +77,10 @@ servo-default-resources = { workspace = true, optional = true }
 servo-tracing = { workspace = true }
 servo-url = { workspace = true }
 servo_arc = { workspace = true }
-sha2 = { workspace = true }
+sea-query = { workspace = true }
+sea-query-rusqlite = { workspace = true }
 smallvec = { workspace = true }
+tempfile = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync"] }
 tokio-rustls = { workspace = true }
@@ -97,6 +104,9 @@ hyper-util = { workspace = true, features = ["server-graceful"] }
 net = { package = "servo-net", path = ".", features = ["test-util"] }
 rustls = { workspace = true, features = ["aws-lc-rs"] }
 servo-default-resources = { workspace = true }
+
+[lints]
+workspace = true
 
 [[test]]
 name = "main"

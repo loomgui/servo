@@ -2,11 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::rc::Rc;
-
 use dom_struct::dom_struct;
 use js::context::JSContext;
-use script_bindings::reflector::{Reflector, reflect_dom_object};
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
 
 use crate::dom::bindings::codegen::Bindings::RTCRtpSenderBinding::{
     RTCRtcpParameters, RTCRtpParameters, RTCRtpSendParameters, RTCRtpSenderMethods,
@@ -15,8 +13,7 @@ use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::promise::Promise;
-use crate::script_runtime::CanGc;
+use crate::dom::{Promise, RootedPromise};
 
 #[dom_struct]
 pub(crate) struct RTCRtpSender {
@@ -30,8 +27,8 @@ impl RTCRtpSender {
         }
     }
 
-    pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<Self> {
-        reflect_dom_object(Box::new(Self::new_inherited()), global, can_gc)
+    pub(crate) fn new(cx: &mut JSContext, global: &GlobalScope) -> DomRoot<Self> {
+        reflect_dom_object_with_cx(Box::new(Self::new_inherited()), global, cx)
     }
 }
 
@@ -53,7 +50,11 @@ impl RTCRtpSenderMethods<crate::DomTypeHolder> for RTCRtpSender {
     }
 
     /// <https://w3c.github.io/webrtc-pc/#dom-rtcrtpsender-setparameters>
-    fn SetParameters(&self, cx: &mut JSContext, _parameters: &RTCRtpSendParameters) -> Rc<Promise> {
+    fn SetParameters(
+        &self,
+        cx: &mut JSContext,
+        _parameters: &RTCRtpSendParameters,
+    ) -> RootedPromise {
         Promise::new_resolved(cx, &self.global(), ())
     }
 }

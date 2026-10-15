@@ -8,6 +8,7 @@
 
 #![deny(unsafe_code)]
 
+mod largest_contentful_paint_candidate;
 mod layout_damage;
 mod layout_dom;
 mod layout_element;
@@ -15,21 +16,21 @@ mod layout_node;
 mod pseudo_element_chain;
 
 use std::any::Any;
-use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicIsize;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use accesskit::{Action, ActionData, ActionRequest};
 use app_units::Au;
-use atomic_refcell::AtomicRefCell;
 use background_hang_monitor_api::BackgroundHangMonitorRegister;
 use bitflags::bitflags;
 use embedder_traits::{Cursor, ScriptToEmbedderChan, Theme, UntrustedNodeAddress, ViewportDetails};
 use euclid::{Point2D, Rect};
-use fonts::{FontContext, TextByteRange, WebFontDocumentContext};
-pub use layout_damage::LayoutDamage;
+use fonts::{FontContext, WebFontDocumentContext, WebFontSetDifference};
+pub use largest_contentful_paint_candidate::LCPCandidate;
+pub use layout_damage::{AccessibilityDamage, LayoutDamage};
 pub use layout_dom::{
     DangerousStyleElementOf, DangerousStyleNodeOf, LayoutDomTypeBundle, LayoutElementOf,
     LayoutNodeOf,
@@ -42,6 +43,7 @@ use malloc_size_of_derive::MallocSizeOf;
 use net_traits::image_cache::{ImageCache, ImageCacheFactory, PendingImageId};
 use net_traits::request::InternalRequest;
 use paint_api::CrossProcessPaintApi;
+use paint_api::display_list::PaintTimingInfo;
 use parking_lot::RwLock;
 use pixels::{RasterImage, Repeat};
 use profile_traits::mem::Report;
@@ -54,6 +56,7 @@ use servo_arc::Arc as ServoArc;
 use servo_base::Epoch;
 use servo_base::generic_channel::GenericSender;
 use servo_base::id::{BrowsingContextId, PipelineId, WebViewId};
+use servo_base::text::{RangeAny, Utf32CodeUnits, Utf32CodeUnitsOrNodeOffset};
 use servo_url::{ImmutableOrigin, ServoUrl};
 use style::Atom;
 use style::animation::DocumentAnimationSet;
@@ -73,11 +76,23 @@ use style::stylist::Stylist;
 use style::thread_state::{self, ThreadState};
 use style::values::computed::Overflow;
 use style_traits::CSSPixel;
+use uuid::Uuid;
 use webrender_api::units::{DeviceIntSize, LayoutPoint, LayoutVector2D};
 use webrender_api::{ExternalScrollId, ImageKey};
 
 pub trait GenericLayoutDataTrait: Any + MallocSizeOfTrait + Send + Sync + 'static {
     fn as_any(&self) -> &dyn Any;
+
+    /// Returns whether `new_range` was successfully set on an existing text run
+    fn set_text_run_selection(&self, new_range: Option<RangeAny<Utf32CodeUnits>>) -> bool;
+
+    /// Set whether or not this node is selected when it is an element. Returns `true`
+    /// if anything changed that requires a new display list.
+    fn set_element_selection(&self, selected: bool) -> bool;
+
+    /// Get the text rendered by this node, if it is a `CharacterData` node and produces
+    /// a `TextRun` in the box tree.
+    fn rendered_text(&self, range: RangeAny<Utf32CodeUnits>) -> Option<String>;
 }
 
 pub trait LayoutDataTrait: GenericLayoutDataTrait + Default {}
@@ -112,6 +127,7 @@ pub enum LayoutNodeType {
 pub enum LayoutElementType {
     Element,
     HTMLBodyElement,
+    HTMLButtonElement,
     HTMLBRElement,
     HTMLCanvasElement,
     HTMLHtmlElement,
@@ -135,21 +151,6 @@ pub enum LayoutElementType {
     SVGSVGElement,
 }
 
-/// A selection shared between script and layout. This selection is managed by the DOM
-/// node that maintains it, and can be modified from script. Once modified, layout is
-/// expected to reflect the new selection visual on the next display list update.
-#[derive(Clone, Debug, Default, MallocSizeOf, PartialEq)]
-pub struct ScriptSelection {
-    /// The range of this selection in the DOM node that manages it.
-    pub range: TextByteRange,
-    /// The character range of this selection in the DOM node that manages it.
-    pub character_range: Range<usize>,
-    /// Whether or not this selection is enabled. Selections may be disabled
-    /// when their node loses focus.
-    pub enabled: bool,
-}
-
-pub type SharedSelection = Arc<AtomicRefCell<ScriptSelection>>;
 pub struct HTMLCanvasData {
     pub image_key: Option<ImageKey>,
     pub width: u32,
@@ -161,7 +162,7 @@ pub struct SVGElementData<'dom> {
     pub source: Option<Result<ServoUrl, ()>>,
     pub width: Option<&'dom AttrValue>,
     pub height: Option<&'dom AttrValue>,
-    pub svg_id: String,
+    pub svg_id: Uuid,
     pub view_box: Option<&'dom AttrValue>,
 }
 
@@ -187,7 +188,7 @@ impl SVGElementData<'_> {
 }
 
 /// The address of a node known to be valid. These are sent from script to layout.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct TrustedNodeAddress(pub *const c_void);
 
 #[expect(unsafe_code)]
@@ -220,7 +221,7 @@ pub struct PendingImage {
     pub is_internal_request: InternalRequest,
 }
 
-/// A data structure to tarck vector image that are fully loaded (i.e has a parsed SVG
+/// A data structure to track vector image that are fully loaded (i.e has a parsed SVG
 /// tree) but not yet rasterized to the size needed by layout. The rasterization is
 /// happening in the image cache.
 #[derive(Debug)]
@@ -245,6 +246,14 @@ pub struct MediaMetadata {
 pub struct HTMLMediaData {
     pub current_frame: Option<MediaFrame>,
     pub metadata: Option<MediaMetadata>,
+    pub poster_url: Option<ServoUrl>,
+}
+
+#[derive(Debug)]
+pub struct AccessibilityActionRequest {
+    pub action: Action,
+    pub target: OpaqueNode,
+    pub data: Option<ActionData>,
 }
 
 pub struct LayoutConfig {
@@ -261,6 +270,14 @@ pub struct LayoutConfig {
     pub user_stylesheets: Rc<Vec<DocumentStyleSheet>>,
     pub theme: Theme,
     pub embedder_chan: ScriptToEmbedderChan,
+}
+
+bitflags! {
+    #[derive(Copy, Clone)]
+    pub struct HitTestFlags: u8 {
+        /// Whether to populate [`HitTestResult::dom_position_for_selection`]
+        const IncludeDomPosition = 0b0000_0001;
+    }
 }
 
 pub trait LayoutFactory: Send + Sync {
@@ -282,22 +299,14 @@ pub trait Layout {
     /// if the [`ViewportDetails`] actually changed or `false` otherwise.
     fn set_viewport_details(&mut self, viewport_details: ViewportDetails) -> bool;
 
-    /// Load all fonts from the given stylesheet, returning the number of fonts that
-    /// need to be loaded.
-    fn load_web_fonts_from_stylesheet(
-        &self,
-        stylesheet: &ServoArc<Stylesheet>,
-        font_context: &WebFontDocumentContext,
-    );
-
-    /// Add a stylesheet to this Layout. This will add it to the Layout's `Stylist` as well as
-    /// loading all web fonts defined in the stylesheet. The second stylesheet is the insertion
-    /// point (if it exists, the sheet needs to be inserted before it).
+    /// Add a stylesheet to this Layout's `Stylist`.
+    ///
+    /// The second stylesheet is the insertion point (if it exists, the sheet needs to be
+    /// inserted before it).
     fn add_stylesheet(
         &mut self,
         stylesheet: ServoArc<Stylesheet>,
-        before_stylsheet: Option<ServoArc<Stylesheet>>,
-        font_context: &WebFontDocumentContext,
+        before_stylesheet: Option<ServoArc<Stylesheet>>,
     );
 
     /// Inform the layout that its ScriptThread is about to exit.
@@ -396,13 +405,15 @@ pub trait Layout {
         animation_timeline_value: f64,
     ) -> Option<ServoArc<Font>>;
     fn query_scrolling_area(&self, node: Option<TrustedNodeAddress>) -> Rect<i32, CSSPixel>;
-    /// Find the character offset of the point in the given node, if it has text content.
+    /// Find the closest character offset of the point within descendants of the given
+    /// node, if it has text content. This works even if the point is outside of all of
+    /// the layout boxes of the node.
     fn query_text_index(
         &self,
         node: TrustedNodeAddress,
-        point: Point2D<Au, CSSPixel>,
-    ) -> Option<usize>;
-    fn query_elements_from_point(&self, point: LayoutPoint) -> Vec<ElementsFromPointResult>;
+        point_in_viewport: Point2D<Au, CSSPixel>,
+    ) -> Option<(OpaqueNode, Utf32CodeUnits)>;
+    fn hit_test(&self, flags: HitTestFlags, point: LayoutPoint) -> HitTestResult;
     fn query_effective_overflow(&self, node: TrustedNodeAddress) -> Option<AxesOverflow>;
     fn stylist_mut(&mut self) -> &mut Stylist;
 
@@ -413,12 +424,9 @@ pub trait Layout {
     /// Returns whether accessibility is active for this Layout.
     fn accessibility_active(&self) -> bool;
 
-    /// Whether the accessibility tree needs updating. This is set to true when
+    /// Whether the accessibility tree must be updated. This is set to true when
     /// - accessibility is activated; or
     /// - a page is loaded after accesibility is activated.
-    ///
-    /// In future, this should be set to true if DOM or style have changed in a way that
-    /// impacts the accessibility tree.
     ///
     /// Checked in can_skip_reflow_request_entirely(), as a dirty accessibility tree
     /// should force a reflow, and handle_reflow() to determine whether to update the
@@ -426,7 +434,12 @@ pub trait Layout {
     fn needs_accessibility_update(&self) -> bool;
 
     /// See [Self::needs_accessibility_update()].
-    fn set_needs_accessibility_update(&self);
+    fn set_force_accessibility_update(&self);
+
+    /// Handle an accessibility action.
+    fn handle_accessibility_action(&self, action_request: ActionRequest);
+
+    fn font_context(&self) -> &Arc<FontContext>;
 }
 
 /// This trait is part of `layout_api` because it depends on both `script_traits`
@@ -550,7 +563,9 @@ pub enum QueryMsg {
     OffsetParentQuery,
     ScrollParentQuery,
     ResolvedFontStyleQuery,
-    ResolvedStyleQuery,
+    /// A style query, with an optional [`PropertyId`], used to limit the phases
+    /// of layout run before the query.
+    ResolvedStyleQuery(PropertyId),
     ScrollingAreaOrOffsetQuery,
     StyleQuery,
     TextIndexQuery,
@@ -612,7 +627,7 @@ impl RestyleReason {
 }
 
 /// Information derived from a layout pass that needs to be returned to the script thread.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ReflowResult {
     /// The phases that were run during this reflow.
     pub reflow_phases_run: ReflowPhasesRun,
@@ -631,6 +646,12 @@ pub struct ReflowResult {
     /// finished before reaching this stage of the layout. I.e., no update
     /// required.
     pub iframe_sizes: Option<IFrameSizes>,
+    /// Enumerates web fonts that were added or removed as part of restyling.
+    pub changed_web_fonts: WebFontSetDifference,
+    /// The LCP candidate during this layout pass, if any.
+    pub lcp_candidate: Option<LCPCandidate>,
+    /// Actions which have been requested by assistive technology, if any.
+    pub pending_accessibility_actions: Vec<AccessibilityActionRequest>,
 }
 
 bitflags! {
@@ -666,6 +687,17 @@ pub struct ReflowStatistics {
     /// A count of the number of fragments that are reused, but may have had some descendant
     /// fragment change.
     pub only_descendants_changed_count: u32,
+    /// A count of the number of accessibility nodes which were checked for changes based on their
+    /// corresponding DOM nodes (whether the check resulted in changes or not).
+    pub nodes_updated_from_dom: u32,
+    /// A count of the number of accessibility nodes which were checked for changes based on data
+    /// already in the accessibility tree (whether the check resulted in changes or not).
+    pub nodes_updated_from_tree: u32,
+    /// A count of the number of accessibility nodes which had their bounds recomputed from layout
+    /// geometry (whether the recomputation resulted in changes or not).
+    pub nodes_updated_bounds: u32,
+    /// A count of the number of accessibility nodes actually serialized to the TreeUpdate.
+    pub nodes_in_tree_update: u32,
 }
 
 /// Information needed for a script-initiated reflow that requires a restyle
@@ -705,8 +737,23 @@ pub struct ReflowRequest {
     pub animating_images: Arc<RwLock<AnimatingImages>>,
     /// The node highlighted by the devtools, if any
     pub highlighted_dom_node: Option<OpaqueNode>,
+    /// Whether or not this document has system focus and is the focused frame
+    /// in the frame tree.
+    pub frame_focused: bool,
+    /// Whether LCP computation should be halted for this reflow.
+    /// From <https://www.w3.org/TR/largest-contentful-paint/#limitations>:
+    /// > The LargestContentfulPaint ... algorithm halts ... inputs.
+    pub halt_lcp: bool,
+    /// Whether the document's browsing context is paint-timing eligible.
+    /// <https://www.w3.org/TR/paint-timing/#paint-timing-eligible>
+    pub paint_timing_eligible: bool,
+    /// The [`PaintTimingInfo`] for this reflow.
+    /// <https://www.w3.org/TR/paint-timing/#paint-timing-info>
+    pub paint_timing_info: PaintTimingInfo,
     /// The current font context.
     pub document_context: WebFontDocumentContext,
+    /// Damage to the accessibility tree from DOM mutations.
+    pub accessibility_damage: Option<Vec<(TrustedNodeAddress, AccessibilityDamage)>>,
     /// Nodes which were removed from the DOM tree since the last reflow, which were rooted in
     /// [`AccessibilityData`]. Only set if [`pref::expensive_accessibility_test_assertions_enabled`]
     /// is set.
@@ -892,9 +939,16 @@ impl ImageAnimationState {
     }
 }
 
+/// The result of a hit test query.
+#[derive(Debug, Default)]
+pub struct HitTestResult {
+    pub items: Vec<HitTestResultItem>,
+    pub dom_position_for_selection: Option<(OpaqueNode, Utf32CodeUnitsOrNodeOffset)>,
+}
+
 /// Describe an item that matched a hit-test query.
 #[derive(Debug)]
-pub struct ElementsFromPointResult {
+pub struct HitTestResultItem {
     /// An [`OpaqueNode`] that contains a pointer to the node hit by
     /// this hit test result.
     pub node: OpaqueNode,

@@ -8,13 +8,14 @@ use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
+use js::conversions::ToJSValConvertible;
 use js::jsapi::{Heap, JSObject};
 use js::jsval::UndefinedValue;
 use js::rust::wrappers2::JS_NewObject;
-use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleValue};
+use js::rust::{CustomAutoRooterGuard, HandleValue};
 use rustc_hash::FxHashMap;
-use script_bindings::conversions::SafeToJSValConvertible;
-use script_bindings::reflector::{reflect_dom_object, reflect_dom_object_with_cx};
+use script_bindings::callback::RootedCallback;
+use script_bindings::reflector::reflect_weak_referenceable_dom_object;
 use servo_base::id::{MessagePortId, MessagePortIndex};
 use servo_constellation_traits::{MessagePortImpl, PortMessageTask};
 
@@ -33,7 +34,6 @@ use crate::dom::bindings::transferable::Transferable;
 use crate::dom::bindings::utils::set_dictionary_property;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 /// The MessagePort used in the DOM.
@@ -59,25 +59,29 @@ impl MessagePort {
     /// <https://html.spec.whatwg.org/multipage/#create-a-new-messageport-object>
     pub(crate) fn new(cx: &mut JSContext, owner: &GlobalScope) -> DomRoot<MessagePort> {
         let port_id = MessagePortId::new();
-        reflect_dom_object_with_cx(Box::new(MessagePort::new_inherited(port_id)), owner, cx)
+        reflect_weak_referenceable_dom_object(
+            cx,
+            Rc::new(MessagePort::new_inherited(port_id)),
+            owner,
+        )
     }
 
     /// Create a new port for an incoming transfer-received one.
     pub(crate) fn new_transferred(
+        cx: &mut JSContext,
         owner: &GlobalScope,
         transferred_port: MessagePortId,
         entangled_port: Option<MessagePortId>,
-        can_gc: CanGc,
     ) -> DomRoot<MessagePort> {
-        reflect_dom_object(
-            Box::new(MessagePort {
+        reflect_weak_referenceable_dom_object(
+            cx,
+            Rc::new(MessagePort {
                 message_port_id: transferred_port,
                 eventtarget: EventTarget::new_inherited(),
                 detached: Cell::new(false),
                 entangled_port: RefCell::new(entangled_port),
             }),
             owner,
-            can_gc,
         )
     }
 
@@ -105,7 +109,11 @@ impl MessagePort {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessage>
-    fn set_onmessage(&self, cx: &mut JSContext, listener: Option<Rc<EventHandlerNonNull>>) {
+    fn set_onmessage(
+        &self,
+        cx: &mut JSContext,
+        listener: Option<RootedCallback<EventHandlerNonNull>>,
+    ) {
         let eventtarget = self.upcast::<EventTarget>();
         eventtarget.set_event_handler_common(cx, "message", listener);
     }
@@ -131,7 +139,7 @@ impl MessagePort {
 
         let ports = transfer
             .iter()
-            .filter_map(|&obj| unsafe { root_from_object::<MessagePort>(obj, cx.raw_cx()).ok() });
+            .filter_map(|&obj| unsafe { root_from_object::<MessagePort>(cx, obj).ok() });
         for port in ports {
             // Step 2
             if port.message_port_id() == self.message_port_id() {
@@ -214,26 +222,25 @@ impl MessagePort {
         // Let message be OrdinaryObjectCreate(null).
         rooted!(&in(cx) let mut message = unsafe { JS_NewObject(cx, ptr::null()) });
         rooted!(&in(cx) let mut type_string = UndefinedValue());
-        type_.safe_to_jsval(cx, type_string.handle_mut());
+        type_.to_jsval(cx, type_string.handle_mut());
 
         // Perform ! CreateDataProperty(message, "type", type).
-        set_dictionary_property(cx.into(), message.handle(), c"type", type_string.handle())
+        set_dictionary_property(cx, message.handle(), c"type", type_string.handle())
             .expect("Setting the message type should not fail.");
 
         // Perform ! CreateDataProperty(message, "value", value).
-        set_dictionary_property(cx.into(), message.handle(), c"value", value)
+        set_dictionary_property(cx, message.handle(), c"value", value)
             .expect("Setting the message value should not fail.");
 
         // Let targetPort be the port with which port is entangled, if any; otherwise let it be null.
         // Done in `global.post_messageport_msg`.
 
         // Let options be «[ "transfer" → « » ]».
-        let mut rooted = CustomAutoRooter::new(vec![]);
-        let transfer = unsafe { CustomAutoRooterGuard::new(cx.raw_cx(), &mut rooted) };
+        auto_root!(&in(cx) let transfer = Vec::<*mut JSObject>::new());
 
         // Run the message port post message steps providing targetPort, message, and options.
         rooted!(&in(cx) let mut message_val = UndefinedValue());
-        message.safe_to_jsval(cx, message_val.handle_mut());
+        message.to_jsval(cx, message_val.handle_mut());
         self.post_message_impl(cx, message_val.handle(), transfer)
     }
 }
@@ -271,12 +278,8 @@ impl Transferable for MessagePort {
         id: MessagePortId,
         port_impl: MessagePortImpl,
     ) -> Result<DomRoot<Self>, ()> {
-        let transferred_port = MessagePort::new_transferred(
-            owner,
-            id,
-            port_impl.entangled_port_id(),
-            CanGc::from_cx(cx),
-        );
+        let transferred_port =
+            MessagePort::new_transferred(cx, owner, id, port_impl.entangled_port_id());
         owner.track_message_port(&transferred_port, Some(port_impl));
         Ok(transferred_port)
     }
@@ -310,20 +313,17 @@ impl MessagePortMethods<crate::DomTypeHolder> for MessagePort {
         &self,
         cx: &mut JSContext,
         message: HandleValue,
-        options: RootedTraceableBox<StructuredSerializeOptions>,
+        options: &StructuredSerializeOptions,
     ) -> ErrorResult {
         if self.detached.get() {
             return Ok(());
         }
-        let mut rooted = CustomAutoRooter::new(
+        auto_root!(&in(cx) let guard =
             options
                 .transfer
                 .iter()
                 .map(|js: &RootedTraceableBox<Heap<*mut JSObject>>| js.get())
-                .collect(),
-        );
-        #[expect(unsafe_code)]
-        let guard = unsafe { CustomAutoRooterGuard::new(cx.raw_cx(), &mut rooted) };
+                .collect::<Vec<_>>());
         self.post_message_impl(cx, message, guard)
     }
 
@@ -348,7 +348,7 @@ impl MessagePortMethods<crate::DomTypeHolder> for MessagePort {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessage>
-    fn GetOnmessage(&self, cx: &mut JSContext) -> Option<Rc<EventHandlerNonNull>> {
+    fn GetOnmessage(&self, cx: &mut JSContext) -> Option<RootedCallback<EventHandlerNonNull>> {
         if self.detached.get() {
             return None;
         }
@@ -357,7 +357,11 @@ impl MessagePortMethods<crate::DomTypeHolder> for MessagePort {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessage>
-    fn SetOnmessage(&self, cx: &mut JSContext, listener: Option<Rc<EventHandlerNonNull>>) {
+    fn SetOnmessage(
+        &self,
+        cx: &mut JSContext,
+        listener: Option<RootedCallback<EventHandlerNonNull>>,
+    ) {
         if self.detached.get() {
             return;
         }

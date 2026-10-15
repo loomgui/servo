@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::mem;
 use std::panic::Location;
 
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 
 use super::{GenericSender, SendResult};
@@ -18,12 +19,14 @@ use super::{GenericSender, SendResult};
 /// [`send_immediate`](GenericBufferedSender::send_immediate)
 /// combines the current buffer contents with the new message into a single
 /// packed message, ensuring ordering without an extra flush step.
+#[derive(MallocSizeOf)]
 pub struct GenericBufferedSender<T, U>
 where
     T: Serialize,
 {
     sender: GenericSender<T>,
     buffer: RefCell<Vec<U>>,
+    #[ignore_malloc_size_of = "dyn are difficult to measure"]
     buffering: Box<dyn Fn(Vec<U>) -> T>,
     max_buffer: usize,
 }
@@ -55,11 +58,6 @@ impl<T: Serialize, U> GenericBufferedSender<T, U> {
     /// Returns the number of pending messages in the buffer.
     pub fn len(&self) -> usize {
         self.buffer.borrow().len()
-    }
-
-    /// Change the auto-flush threshold.
-    pub fn set_max_buffer(&mut self, max: usize) {
-        self.max_buffer = max;
     }
 
     /// Buffer a message for later batched delivery.
@@ -135,6 +133,11 @@ impl<T: Serialize, U> GenericBufferedSender<T, U> {
             let location = Location::caller();
             log::warn!("Failed to flush buffered messages due to `{error}` at {location:?}");
         }
+    }
+
+    /// Discard all buffered messages without sending them.
+    pub fn discard(&self) {
+        self.buffer.borrow_mut().clear();
     }
 }
 

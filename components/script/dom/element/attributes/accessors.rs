@@ -10,8 +10,8 @@ use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::UnionTypes::{TrustedHTMLOrString, TrustedScriptURLOrUSVString};
 use crate::dom::bindings::str::{DOMString, USVString};
+use crate::dom::element::Element;
 use crate::dom::element::attributes::storage::AttrRef;
-use crate::dom::element::{AttributeMutationReason, Element};
 use crate::dom::node::NodeTraits;
 
 impl Element {
@@ -157,6 +157,35 @@ impl Element {
         }
     }
 
+    pub(crate) fn set_nullable_tokenlist_attribute(
+        &self,
+        cx: &mut JSContext,
+        local_name: &LocalName,
+        value: Option<DOMString>,
+    ) {
+        match value {
+            Some(string_value) => {
+                self.set_tokenlist_attribute(cx, local_name, string_value);
+            },
+            None => {
+                self.remove_attribute(cx, &ns!(), local_name);
+            },
+        }
+    }
+
+    /// Returns true if any attribute in the tokenlist fulfill `f`. Equivalent to
+    /// `get_tokenlist_attribute(name).iter().any(f)`.
+    pub(crate) fn any_tokenlist_attribute(
+        &self,
+        local_name: &LocalName,
+        f: impl Fn(&Atom) -> bool,
+    ) -> bool {
+        self.with_attribute(&ns!(), local_name, |attribute| {
+            attribute.value().as_tokens().iter().any(f)
+        })
+        .unwrap_or(false)
+    }
+
     pub(crate) fn get_tokenlist_attribute(&self, local_name: &LocalName) -> Vec<Atom> {
         self.with_attribute(&ns!(), local_name, |attribute| {
             attribute.value().as_tokens().to_vec()
@@ -238,6 +267,8 @@ impl Element {
         target_element: &Element,
     ) {
         // Step 2.5. For each attribute of node’s attribute list:
+        let attribute_count = self.attrs().borrow().len();
+        target_element.attrs().reserve_exact(attribute_count);
         for attr in self.attrs().borrow().iter() {
             // Step 2.5.1. Let copyAttribute be the result of cloning a single node given attribute, document, and null.
             let new_value = self.compute_attribute_value_with_style_fast_path(attr);
@@ -249,7 +280,6 @@ impl Element {
                 attr.name().clone(),
                 attr.namespace().clone(),
                 attr.prefix().cloned(),
-                AttributeMutationReason::ByCloning,
             );
         }
     }

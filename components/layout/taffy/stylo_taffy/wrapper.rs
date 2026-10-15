@@ -13,7 +13,7 @@ use style::values::specified::position::NamedArea;
 use style::{Atom, OwnedSlice};
 use taffy::prelude::TaffyAuto;
 
-use super::{convert, stylo};
+use super::{as_clamped_i16, convert, stylo};
 
 /// A wrapper struct for anything that Deref's to a [`ComputedValues`], which
 /// implements Taffy's layout traits and can used with Taffy's layout algorithms.
@@ -112,20 +112,20 @@ impl<T: Deref<Target = ComputedValues>> taffy::CoreStyle for TaffyStyloStyle<T> 
     }
 
     #[inline]
-    fn min_size(&self) -> taffy::Size<taffy::Dimension> {
+    fn min_size(&self) -> taffy::Size<taffy::LengthPercentageAuto> {
         let position_styles = self.style.get_position();
         taffy::Size {
-            width: convert::dimension(&position_styles.min_width),
-            height: convert::dimension(&position_styles.min_height),
+            width: convert::min_size(&position_styles.min_width),
+            height: convert::min_size(&position_styles.min_height),
         }
     }
 
     #[inline]
-    fn max_size(&self) -> taffy::Size<taffy::Dimension> {
+    fn max_size(&self) -> taffy::Size<taffy::LengthPercentageAuto> {
         let position_styles = self.style.get_position();
         taffy::Size {
-            width: convert::max_size_dimension(&position_styles.max_width),
-            height: convert::max_size_dimension(&position_styles.max_height),
+            width: convert::max_size(&position_styles.max_width),
+            height: convert::max_size(&position_styles.max_height),
         }
     }
 
@@ -343,6 +343,20 @@ impl<T: Deref<Target = ComputedValues>> taffy::GridContainerStyle for TaffyStylo
                 }))
             },
             GridTemplateAreas::None => None,
+        }
+    }
+
+    fn grid_template_area_row_count(&self) -> u16 {
+        match &self.style.get_position().grid_template_areas {
+            GridTemplateAreas::Areas(areas) => as_clamped_i16(areas.0.strings.len() as i32) as u16,
+            GridTemplateAreas::None => 0,
+        }
+    }
+
+    fn grid_template_area_column_count(&self) -> u16 {
+        match &self.style.get_position().grid_template_areas {
+            GridTemplateAreas::Areas(areas) => as_clamped_i16(areas.0.width as i32) as u16,
+            GridTemplateAreas::None => 0,
         }
     }
 

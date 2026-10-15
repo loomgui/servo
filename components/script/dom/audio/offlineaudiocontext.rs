@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::Builder;
 
@@ -12,7 +11,7 @@ use js::context::JSContext;
 use js::realm::CurrentRealm;
 use js::rust::HandleObject;
 use script_bindings::cell::DomRefCell;
-use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
+use script_bindings::reflector::reflect_dom_object_with_proto;
 use servo_base::id::PipelineId;
 use servo_media::audio::context::OfflineAudioContextOptions as ServoMediaOfflineAudioContextOptions;
 
@@ -31,7 +30,7 @@ use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
-use crate::dom::promise::Promise;
+use crate::dom::promise::{Promise, RootedPromise, TracedPromise};
 use crate::dom::window::Window;
 
 #[dom_struct]
@@ -40,8 +39,7 @@ pub(crate) struct OfflineAudioContext {
     channel_count: u32,
     length: u32,
     rendering_started: Cell<bool>,
-    #[conditional_malloc_size_of]
-    pending_rendering_promise: DomRefCell<Option<Rc<Promise>>>,
+    pending_rendering_promise: DomRefCell<Option<TracedPromise>>,
 }
 
 impl OfflineAudioContext {
@@ -89,11 +87,11 @@ impl OfflineAudioContext {
         let pipeline_id = window.pipeline_id();
         let context =
             OfflineAudioContext::new_inherited(channel_count, length, sample_rate, pipeline_id)?;
-        Ok(reflect_dom_object_with_proto_and_cx(
+        Ok(reflect_dom_object_with_proto(
+            cx,
             Box::new(context),
             window,
             proto,
-            cx,
         ))
     }
 }
@@ -137,7 +135,7 @@ impl OfflineAudioContextMethods<crate::DomTypeHolder> for OfflineAudioContext {
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-startrendering>
-    fn StartRendering(&self, cx: &mut CurrentRealm) -> Rc<Promise> {
+    fn StartRendering(&self, cx: &mut CurrentRealm) -> RootedPromise {
         let promise = Promise::new_in_realm(cx);
         if self.rendering_started.get() {
             promise.reject_error(cx, Error::InvalidState(None));
@@ -145,7 +143,7 @@ impl OfflineAudioContextMethods<crate::DomTypeHolder> for OfflineAudioContext {
         }
         self.rendering_started.set(true);
 
-        *self.pending_rendering_promise.borrow_mut() = Some(promise.clone());
+        *self.pending_rendering_promise.safe_borrow_mut(cx.no_gc()) = Some(promise.to_traced());
 
         let processed_audio = Arc::new(Mutex::new(Vec::new()));
         let processed_audio_ = processed_audio.clone();
@@ -192,10 +190,15 @@ impl OfflineAudioContextMethods<crate::DomTypeHolder> for OfflineAudioContext {
                         *this.context.SampleRate(),
                         Some(processed_audio.as_slice()),
                     );
-                    (*this.pending_rendering_promise.borrow_mut())
-                        .take()
-                        .unwrap()
-                        .resolve_native(cx, &buffer);
+                    let promise = {
+                        (*this
+                            .pending_rendering_promise
+                            .safe_borrow_mut(cx.no_gc()))
+                            .take()
+                            .unwrap()
+                            .root(cx)
+                    };
+                    promise.resolve_native(cx, &buffer);
                     let global = &this.global();
                     let window = global.as_window();
                     let event = OfflineAudioCompletionEvent::new(cx, window,

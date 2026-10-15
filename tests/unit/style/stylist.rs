@@ -167,9 +167,6 @@ fn test_revalidation_selectors() {
     .collect::<Vec<_>>();
 
     let reference = parse_selectors(&[
-        // ID selectors.
-        "#foo3 > span",
-        "#foo1 > span",
         // Attribute selectors.
         "div[foo]",
         "div:not([foo])",
@@ -201,10 +198,7 @@ fn test_revalidation_selectors() {
     .into_iter()
     .collect::<Vec<_>>();
 
-    assert_eq!(test.len(), reference.len());
-    for (t, r) in test.into_iter().zip(reference.into_iter()) {
-        assert_eq!(t, r)
-    }
+    assert_eq!(test, reference);
 }
 
 #[test]
@@ -257,6 +251,7 @@ fn mock_stylist() -> Stylist {
     let device = Device::new(
         MediaType::screen(),
         QuirksMode::NoQuirks,
+        Size2D::new(0f32, 0f32),
         Size2D::new(0f32, 0f32),
         Scale::new(1.0),
         Box::new(DummyMetricsProvider),

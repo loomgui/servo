@@ -60,7 +60,7 @@ impl<'dom> TryFrom<ServoLayoutNode<'dom>> for LayoutRoot<'dom> {
     }
 }
 
-impl LayoutRoot<'_> {
+impl<'dom> LayoutRoot<'dom> {
     pub(crate) fn try_layout(&self, layout_context: &LayoutContext) -> bool {
         let Some(inner_layout_data) = self.node.inner_layout_data_mut() else {
             return false;
@@ -119,5 +119,14 @@ impl LayoutRoot<'_> {
                 &layout_root_fragment.fragment,
             )
             .is_ok()
+    }
+
+    pub(crate) fn handle_failed_layout_root_layout(&self) {
+        self.node
+            .clear_fragments_and_dirty_fragment_caches_recursively();
+    }
+
+    pub(crate) fn node(&self) -> ServoLayoutNode<'dom> {
+        self.node
     }
 }

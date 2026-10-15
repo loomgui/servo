@@ -9,11 +9,12 @@ use js::context::JSContext;
 use js::rust::HandleObject;
 use script_bindings::codegen::GenericBindings::DOMMatrixBinding::DOMMatrix2DInit;
 use script_bindings::error::ErrorResult;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto_and_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use script_bindings::str::DOMString;
 use servo_canvas_traits::canvas::Path;
 
 use crate::dom::bindings::codegen::Bindings::CanvasRenderingContext2DBinding::Path2DMethods;
+use crate::dom::bindings::codegen::UnionTypes::UnrestrictedDoubleOrDOMPointInitOrUnrestrictedDoubleOrDOMPointInitSequence;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::dommatrixreadonly::dommatrix2dinit_to_matrix;
@@ -147,6 +148,22 @@ impl Path2DMethods<crate::DomTypeHolder> for Path2D {
         self.path.borrow_mut().rect(x, y, w, h);
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-roundrect>
+    fn RoundRect(
+        &self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        radii: UnrestrictedDoubleOrDOMPointInitOrUnrestrictedDoubleOrDOMPointInitSequence,
+    ) -> Fallible<()> {
+        let radii = super::canvas_state::round_rect_radii(&radii);
+        self.path
+            .borrow_mut()
+            .round_rect(x, y, w, h, &radii)
+            .map_err(super::canvas_state::round_rect_error)
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-arc>
     fn Arc(
         &self,
@@ -196,7 +213,7 @@ impl Path2DMethods<crate::DomTypeHolder> for Path2D {
         global: &GlobalScope,
         proto: Option<HandleObject>,
     ) -> DomRoot<Path2D> {
-        reflect_dom_object_with_proto_and_cx(Box::new(Self::new()), global, proto, cx)
+        reflect_dom_object_with_proto(cx, Box::new(Self::new()), global, proto)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-path2d-dev>
@@ -206,12 +223,7 @@ impl Path2DMethods<crate::DomTypeHolder> for Path2D {
         proto: Option<HandleObject>,
         other: &Path2D,
     ) -> DomRoot<Path2D> {
-        reflect_dom_object_with_proto_and_cx(
-            Box::new(Self::new_with_path(other)),
-            global,
-            proto,
-            cx,
-        )
+        reflect_dom_object_with_proto(cx, Box::new(Self::new_with_path(other)), global, proto)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-path2d-dev>
@@ -221,11 +233,11 @@ impl Path2DMethods<crate::DomTypeHolder> for Path2D {
         proto: Option<HandleObject>,
         path_string: DOMString,
     ) -> DomRoot<Path2D> {
-        reflect_dom_object_with_proto_and_cx(
+        reflect_dom_object_with_proto(
+            cx,
             Box::new(Self::new_with_str(&path_string.str())),
             global,
             proto,
-            cx,
         )
     }
 }

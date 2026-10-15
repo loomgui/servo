@@ -5,10 +5,10 @@
 use std::cell::Cell;
 
 use dom_struct::dom_struct;
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use js::rust::HandleObject;
 use rustc_hash::FxHashMap;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto_and_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use servo_base::id::{DomPointId, DomPointIndex};
 use servo_constellation_traits::DomPoint;
 
@@ -24,7 +24,7 @@ use crate::dom::dommatrixreadonly::dommatrixinit_to_matrix;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::types::DOMPoint;
 
-/// <http://dev.w3.org/fxtf/geometry/Overview.html#dompointreadonly>
+/// <http://dev.w3.org/csswg/geometry/Overview.html#dompointreadonly>
 #[dom_struct]
 pub(crate) struct DOMPointReadOnly {
     reflector_: Reflector,
@@ -65,17 +65,17 @@ impl DOMPointReadOnly {
         z: f64,
         w: f64,
     ) -> DomRoot<DOMPointReadOnly> {
-        reflect_dom_object_with_proto_and_cx(
+        reflect_dom_object_with_proto(
+            cx,
             Box::new(DOMPointReadOnly::new_inherited(x, y, z, w)),
             global,
             proto,
-            cx,
         )
     }
 }
 
 impl DOMPointReadOnlyMethods<crate::DomTypeHolder> for DOMPointReadOnly {
-    /// <https://drafts.fxtf.org/geometry/#dom-dompoint-dompoint>
+    /// <https://drafts.csswg.org/geometry/#dom-dompoint-dompoint>
     fn Constructor(
         cx: &mut JSContext,
         global: &GlobalScope,
@@ -90,33 +90,33 @@ impl DOMPointReadOnlyMethods<crate::DomTypeHolder> for DOMPointReadOnly {
         ))
     }
 
-    /// <https://drafts.fxtf.org/geometry/#dom-dompointreadonly-frompoint>
+    /// <https://drafts.csswg.org/geometry/#dom-dompointreadonly-frompoint>
     fn FromPoint(cx: &mut JSContext, global: &GlobalScope, init: &DOMPointInit) -> DomRoot<Self> {
         Self::new(cx, global, init.x, init.y, init.z, init.w)
     }
 
-    /// <https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-x>
+    /// <https://dev.w3.org/csswg/geometry/Overview.html#dom-dompointreadonly-x>
     fn X(&self) -> f64 {
         self.x.get()
     }
 
-    /// <https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-y>
+    /// <https://dev.w3.org/csswg/geometry/Overview.html#dom-dompointreadonly-y>
     fn Y(&self) -> f64 {
         self.y.get()
     }
 
-    /// <https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-z>
+    /// <https://dev.w3.org/csswg/geometry/Overview.html#dom-dompointreadonly-z>
     fn Z(&self) -> f64 {
         self.z.get()
     }
 
-    /// <https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-w>
+    /// <https://dev.w3.org/csswg/geometry/Overview.html#dom-dompointreadonly-w>
     fn W(&self) -> f64 {
         self.w.get()
     }
 
-    /// <https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-matrixtransform>
-    /// <https://drafts.fxtf.org/geometry/Overview.html#transform-a-point-with-a-matrix>
+    /// <https://dev.w3.org/csswg/geometry/Overview.html#dom-dompointreadonly-matrixtransform>
+    /// <https://drafts.csswg.org/geometry/Overview.html#transform-a-point-with-a-matrix>
     fn MatrixTransform(
         &self,
         cx: &mut JSContext,
@@ -182,7 +182,7 @@ impl Serializable for DOMPointReadOnly {
     type Index = DomPointIndex;
     type Data = DomPoint;
 
-    fn serialize(&self) -> Result<(DomPointId, Self::Data), ()> {
+    fn serialize(&self, _no_gc: &NoGC) -> Result<(DomPointId, Self::Data), ()> {
         let serialized = DomPoint {
             x: self.x.get(),
             y: self.y.get(),
