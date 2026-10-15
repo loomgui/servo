@@ -2598,7 +2598,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3166,7 +3166,7 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6459,7 +6459,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6582,8 +6582,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 [[package]]
 name = "peek-poke"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef60922033e31835f6cf98b9b81b58368037b71d2a81928985cd9d0b3b3171fb"
+source = "git+https://github.com/loomgui/webrender?rev=82affc7e81013b6aec09ad43328d53710a77facd#82affc7e81013b6aec09ad43328d53710a77facd"
 dependencies = [
  "euclid",
  "peek-poke-derive",
@@ -6592,8 +6591,7 @@ dependencies = [
 [[package]]
 name = "peek-poke-derive"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "271f78bae1e699b58c180a384a2e8d78ccbb60b853e15db92339725f3a2764d5"
+source = "git+https://github.com/loomgui/webrender?rev=82affc7e81013b6aec09ad43328d53710a77facd#82affc7e81013b6aec09ad43328d53710a77facd"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7681,7 +7679,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7738,7 +7736,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7913,8 +7911,7 @@ dependencies = [
 [[package]]
 name = "selectors"
 version = "0.41.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8322aebea94a6cc288ff884e8a49bdbceef60206c400c6c46d22e62fc4fd91a6"
+source = "git+https://github.com/loomgui/stylo?rev=789f53f98a6c96d1e4c50e501f222bb5269b27de#789f53f98a6c96d1e4c50e501f222bb5269b27de"
 dependencies = [
  "bitflags 2.13.2",
  "cssparser",
@@ -9765,8 +9762,7 @@ dependencies = [
 [[package]]
 name = "servo_arc"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4eceb519ec34d8290aaf6e46f435102f2bfa63f22b05a144fb16ab266d3b198"
+source = "git+https://github.com/loomgui/stylo?rev=789f53f98a6c96d1e4c50e501f222bb5269b27de#789f53f98a6c96d1e4c50e501f222bb5269b27de"
 dependencies = [
  "serde",
  "stable_deref_trait",
@@ -10272,8 +10268,7 @@ dependencies = [
 [[package]]
 name = "stylo"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a255e46af2478628c48daab3774090caabd7812b1dd3ca98801c2b9c53491ed"
+source = "git+https://github.com/loomgui/stylo?rev=789f53f98a6c96d1e4c50e501f222bb5269b27de#789f53f98a6c96d1e4c50e501f222bb5269b27de"
 dependencies = [
  "app_units",
  "arrayvec",
@@ -10329,8 +10324,7 @@ dependencies = [
 [[package]]
 name = "stylo_atoms"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee1771588fd747ef16f8b1990061b6f37c7d3251a0f9b74f405a44c0c5fb8966"
+source = "git+https://github.com/loomgui/stylo?rev=789f53f98a6c96d1e4c50e501f222bb5269b27de#789f53f98a6c96d1e4c50e501f222bb5269b27de"
 dependencies = [
  "string_cache",
  "string_cache_codegen",
@@ -10339,8 +10333,7 @@ dependencies = [
 [[package]]
 name = "stylo_derive"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ee5c550c2e00a0b3c046bef84a9ee217e04e7c014142eeb96f9e48781c5cfd3"
+source = "git+https://github.com/loomgui/stylo?rev=789f53f98a6c96d1e4c50e501f222bb5269b27de#789f53f98a6c96d1e4c50e501f222bb5269b27de"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -10352,8 +10345,7 @@ dependencies = [
 [[package]]
 name = "stylo_dom"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9febcb03f2b669ef06b3e8a5209e6280971ed55cecf83fbf3c0562fcf2aa2ec6"
+source = "git+https://github.com/loomgui/stylo?rev=789f53f98a6c96d1e4c50e501f222bb5269b27de#789f53f98a6c96d1e4c50e501f222bb5269b27de"
 dependencies = [
  "bitflags 2.13.2",
  "stylo_malloc_size_of",
@@ -10362,8 +10354,7 @@ dependencies = [
 [[package]]
 name = "stylo_malloc_size_of"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83ed69d55ee907599f093221004a28371925236f09f20961963020abf38bab6a"
+source = "git+https://github.com/loomgui/stylo?rev=789f53f98a6c96d1e4c50e501f222bb5269b27de#789f53f98a6c96d1e4c50e501f222bb5269b27de"
 dependencies = [
  "app_units",
  "cssparser",
@@ -10381,8 +10372,7 @@ dependencies = [
 [[package]]
 name = "stylo_static_prefs"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6767c48a1590461db79f8b434ccc5a2d65600a3b716751f7999b35ccead1e024"
+source = "git+https://github.com/loomgui/stylo?rev=789f53f98a6c96d1e4c50e501f222bb5269b27de#789f53f98a6c96d1e4c50e501f222bb5269b27de"
 dependencies = [
  "toml 1.1.6+spec-1.1.0",
 ]
@@ -10390,8 +10380,7 @@ dependencies = [
 [[package]]
 name = "stylo_traits"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "645d6bfe40eb6e86ebe9f2d2adadcbced41bfa96175de7cb13d4d178d27bc83d"
+source = "git+https://github.com/loomgui/stylo?rev=789f53f98a6c96d1e4c50e501f222bb5269b27de#789f53f98a6c96d1e4c50e501f222bb5269b27de"
 dependencies = [
  "app_units",
  "bitflags 2.13.2",
@@ -10579,7 +10568,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10813,8 +10802,7 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 [[package]]
 name = "to_shmem"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbf077da8dd01cc18453bd7d9bc3a945c262f5f344562e5f6deb3914b4dd6f14"
+source = "git+https://github.com/loomgui/stylo?rev=789f53f98a6c96d1e4c50e501f222bb5269b27de#789f53f98a6c96d1e4c50e501f222bb5269b27de"
 dependencies = [
  "cssparser",
  "servo_arc",
@@ -10827,8 +10815,7 @@ dependencies = [
 [[package]]
 name = "to_shmem_derive"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f8e91a023810fd2019648410d00eea13a71f21d849e71d6d9ed936fb8061174"
+source = "git+https://github.com/loomgui/stylo?rev=789f53f98a6c96d1e4c50e501f222bb5269b27de#789f53f98a6c96d1e4c50e501f222bb5269b27de"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -11899,8 +11886,7 @@ dependencies = [
 [[package]]
 name = "webrender"
 version = "0.70.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ede9dbc3cfb3e2c073a68e20f8fd54d9f6be8587be1c7c948e1ac51112421ef6"
+source = "git+https://github.com/loomgui/webrender?rev=82affc7e81013b6aec09ad43328d53710a77facd#82affc7e81013b6aec09ad43328d53710a77facd"
 dependencies = [
  "allocator-api2",
  "bincode",
@@ -11935,8 +11921,7 @@ dependencies = [
 [[package]]
 name = "webrender_api"
 version = "0.70.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11fa15766536df782680147d2ed7a2d2cebd2dc9f0f48e89c56ca39f11259d76"
+source = "git+https://github.com/loomgui/webrender?rev=82affc7e81013b6aec09ad43328d53710a77facd#82affc7e81013b6aec09ad43328d53710a77facd"
 dependencies = [
  "app_units",
  "bitflags 2.13.2",
@@ -11955,8 +11940,7 @@ dependencies = [
 [[package]]
 name = "webrender_build"
 version = "0.70.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "674538885dba825ee1ddda72ade941fef81364cb843bbb0452fe7d134068ed89"
+source = "git+https://github.com/loomgui/webrender?rev=82affc7e81013b6aec09ad43328d53710a77facd#82affc7e81013b6aec09ad43328d53710a77facd"
 dependencies = [
  "bitflags 2.13.2",
  "lazy_static",
@@ -12300,7 +12284,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -12708,8 +12692,7 @@ dependencies = [
 [[package]]
 name = "wr_glyph_rasterizer"
 version = "0.70.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcda26d8788ba57a04cd75ae4a2c6da3aa8e5ab16ed1cfd5db09d0fbc04df2fb"
+source = "git+https://github.com/loomgui/webrender?rev=82affc7e81013b6aec09ad43328d53710a77facd#82affc7e81013b6aec09ad43328d53710a77facd"
 dependencies = [
  "core-foundation 0.9.4",
  "core-graphics",
@@ -12733,8 +12716,7 @@ dependencies = [
 [[package]]
 name = "wr_malloc_size_of"
 version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "482308b684f11723b200a32808094bb460b5ac4840903ccbcb78ad92a6354a1f"
+source = "git+https://github.com/loomgui/webrender?rev=82affc7e81013b6aec09ad43328d53710a77facd#82affc7e81013b6aec09ad43328d53710a77facd"
 dependencies = [
  "app_units",
  "euclid",

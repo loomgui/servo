@@ -1123,20 +1123,15 @@ impl Painter {
         if fully_exited {
             let mut transaction = Transaction::new();
             transaction.remove_pipeline(pipeline_id.into());
-            self.send_transaction(transaction);
-        }
-        // Free this pipeline's `background-clip: text` snapshot images.
-        if let Some(keys) = self
-            .prev_snapshot_image_keys
-            .remove(&(webview_id, pipeline_id))
-        {
-            if !keys.is_empty() {
-                let mut txn = Transaction::new();
+            if let Some(keys) = self
+                .prev_snapshot_image_keys
+                .remove(&(webview_id, pipeline_id))
+            {
                 for key in keys {
-                    txn.delete_snapshot_image(key);
+                    transaction.delete_snapshot_image(key);
                 }
-                self.send_transaction(txn);
             }
+            self.send_transaction(transaction);
         }
     }
 
@@ -1576,10 +1571,17 @@ impl Painter {
             warn!("Tried removing unknown WebView: {webview_id:?}");
             return;
         };
-        self.prev_snapshot_image_keys
-            .retain(|(other_webview, _), _| *other_webview != webview_id);
-
         let mut transaction = Transaction::new();
+        self.prev_snapshot_image_keys
+            .retain(|(other_webview, _), keys| {
+                if *other_webview != webview_id {
+                    return true;
+                }
+                for key in keys {
+                    transaction.delete_snapshot_image(*key);
+                }
+                false
+            });
         for pipeline_id in webview_renderer.pipelines.keys() {
             transaction.remove_pipeline(pipeline_id.into());
         }
