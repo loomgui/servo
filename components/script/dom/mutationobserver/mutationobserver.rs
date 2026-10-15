@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::LazyCell;
+use std::cell::{LazyCell, OnceCell};
 
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Namespace, ns};
@@ -12,6 +12,7 @@ use rustc_hash::FxHashMap;
 use script_bindings::callback::{OwnerWindow, RootedCallback, TracedCallback};
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
+use style::attr::AttrValue;
 
 use crate::dom::bindings::codegen::Bindings::MutationObserverBinding::MutationObserver_Binding::MutationObserverMethods;
 use crate::dom::bindings::codegen::Bindings::MutationObserverBinding::{
@@ -39,7 +40,7 @@ pub(crate) enum Mutation<'a> {
     Attribute {
         name: LocalName,
         namespace: Namespace,
-        old_value: Option<DOMString>,
+        old_value: Option<&'a AttrValue>,
     },
     CharacterData {
         old_value: String,
@@ -112,6 +113,10 @@ impl MutationObserver {
         // Step 1 Let interestedObservers be an empty map.
         let mut interested_observers: FxHashMap<DomRoot<MutationObserver>, Option<DOMString>> =
             FxHashMap::default();
+        // Attribute values such as inline declaration blocks serialize lazily. Match
+        // observer options before requesting their string, and share the result when
+        // multiple observers request the old value of this mutation.
+        let attribute_old_value = OnceCell::new();
 
         // Step 2 Let nodes be the inclusive ancestors of target.
         // Step 3 For each node in nodes ...
@@ -159,6 +164,8 @@ impl MutationObserver {
                         // 3.2.2 If interestedObservers[mo] does not exist, then set interestedObservers[mo] to null.
                         if registered.options.attribute_old_value {
                             // 3.2.3 ... type is "attributes" and options["attributeOldValue"] is true ...
+                            let old_value = attribute_old_value
+                                .get_or_init(|| old_value.map(|value| DOMString::from(&**value)));
                             interested_observers.insert(mo, old_value.clone());
                         } else {
                             // 3.2.2 If interestedObservers[mo] does not exist, then set interestedObservers[mo] to null.
@@ -263,8 +270,8 @@ impl MutationObserverMethods<crate::DomTypeHolder> for MutationObserver {
         let subtree = options.subtree;
 
         // Step 1
-        if (options.attributeOldValue.is_some() || options.attributeFilter.is_some()) &&
-            options.attributes.is_none()
+        if (options.attributeOldValue.is_some() || options.attributeFilter.is_some())
+            && options.attributes.is_none()
         {
             attributes = true;
         }
