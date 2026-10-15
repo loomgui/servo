@@ -34,7 +34,9 @@ use profile_traits::time_profile;
 use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::Epoch;
 use servo_base::cross_process_instant::CrossProcessInstant;
-use servo_base::generic_channel::{GenericCallback, GenericReceiver, GenericSharedMemory};
+use servo_base::generic_channel::{
+    GenericCallback, GenericReceiver, GenericSharedMemory, SendError,
+};
 use servo_base::id::{PainterId, PipelineId, WebViewId};
 use servo_base::threadboost::{BoostAffinity, ThreadPriority};
 use servo_config::{opts, pref};
@@ -72,7 +74,7 @@ use crate::webrender_external_images::WebGLExternalImages;
 use crate::webview_renderer::{PinchZoomResult, ScrollResult, UnknownWebView, WebViewRenderer};
 
 struct EmbedderSceneFrameNotifier {
-    sender: Sender<Result<PaintMessage, ipc_channel::IpcError>>,
+    sender: Sender<Result<PaintMessage, SendError>>,
     event_loop_waker: Box<dyn EventLoopWaker>,
     painter_id: PainterId,
     frame_tag: u64,
@@ -159,7 +161,7 @@ pub(crate) struct Painter {
     pending_unchanged_frame_tag: Cell<Option<u64>>,
 
     /// Routes exact scene-transaction notifications back to this painter.
-    scene_frame_notification_sender: Sender<Result<PaintMessage, ipc_channel::IpcError>>,
+    scene_frame_notification_sender: Sender<Result<PaintMessage, SendError>>,
     scene_frame_notification_waker: Box<dyn EventLoopWaker>,
 
     /// The GL bindings for webrender
