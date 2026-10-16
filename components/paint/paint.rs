@@ -505,14 +505,52 @@ impl Paint {
                 display_list_info_receiver,
                 display_list_data_receiver,
             } => {
+                let profiler = self.time_profiler_chan.clone();
                 if let Some(mut painter) = self.maybe_painter_mut(webview_id.into()) {
-                    painter.handle_new_display_list(
-                        webview_id,
-                        display_list_descriptor,
-                        display_list_info_receiver,
-                        display_list_data_receiver,
+                    profile_time::profile_if_active(
+                        profile_time::ProfilerCategory::PaintDisplayListInstall,
+                        || None,
+                        &profiler,
+                        || {
+                            painter.handle_new_display_list(
+                                webview_id,
+                                display_list_descriptor,
+                                display_list_info_receiver,
+                                display_list_data_receiver,
+                            );
+                        },
                     );
                 }
+            },
+            PaintMessage::UpdateBackgroundColors {
+                webview_id,
+                pipeline_id,
+                epoch,
+                colors,
+                generation,
+                response,
+            } => {
+                let profiler = self.time_profiler_chan.clone();
+                let accepted = if let Some(mut painter) = self.maybe_painter_mut(webview_id.into())
+                {
+                    profile_time::profile_if_active(
+                        profile_time::ProfilerCategory::PaintBackgroundColorUpdate,
+                        || None,
+                        &profiler,
+                        || {
+                            painter.update_background_colors(
+                                webview_id,
+                                pipeline_id,
+                                epoch,
+                                generation,
+                                colors,
+                            )
+                        },
+                    )
+                } else {
+                    false
+                };
+                let _ = response.send(accepted);
             },
             PaintMessage::GenerateFrame(painter_ids) => {
                 for painter_id in painter_ids {
@@ -675,6 +713,9 @@ impl Paint {
     /// `Paint` no longer does any WebRender frame generation.
     fn handle_browser_message_while_shutting_down(&self, msg: PaintMessage) {
         match msg {
+            PaintMessage::UpdateBackgroundColors { response, .. } => {
+                let _ = response.send(false);
+            },
             PaintMessage::PipelineExited(webview_id, pipeline_id, pipeline_exit_source) => {
                 if let Some(mut painter) = self.maybe_painter_mut(webview_id.into()) {
                     painter.notify_pipeline_exited(webview_id, pipeline_id, pipeline_exit_source);
@@ -882,7 +923,9 @@ impl Paint {
         self.webxr_main_thread.borrow_mut().run_one_frame();
 
         for painter in &self.painters {
-            painter.borrow_mut().perform_updates();
+            painter
+                .borrow_mut()
+                .perform_updates(&self.time_profiler_chan);
         }
 
         self.shutdown_state() != ShutdownState::FinishedShuttingDown

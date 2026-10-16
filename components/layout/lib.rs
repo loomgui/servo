@@ -8,6 +8,7 @@
 //! painted.
 
 mod accessibility;
+mod background_color_cache;
 mod cell;
 mod context;
 mod display_list;

@@ -6,7 +6,7 @@ use std::cell::{LazyCell, OnceCell};
 
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Namespace, ns};
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use js::rust::HandleObject;
 use rustc_hash::FxHashMap;
 use script_bindings::callback::{OwnerWindow, RootedCallback, TracedCallback};
@@ -71,6 +71,15 @@ pub(crate) struct ObserverOptions {
     attribute_filter: Vec<DOMString>,
 }
 
+impl ObserverOptions {
+    fn observes_attribute(&self, name: &LocalName, namespace: &Namespace) -> bool {
+        self.attributes
+            && (self.attribute_filter.is_empty()
+                || (*namespace == ns!()
+                    && self.attribute_filter.iter().any(|filter| *filter == **name)))
+    }
+}
+
 impl MutationObserver {
     fn new_with_proto(
         cx: &mut JSContext,
@@ -97,6 +106,32 @@ impl MutationObserver {
 
     pub(crate) fn callback(&self) -> &TracedCallback<MutationCallback> {
         &self.callback
+    }
+
+    /// Whether queuing this attribute mutation can request its old value.
+    /// Use the same observer lists, ancestry, and option matching as record
+    /// delivery, including registered observers on a detached subtree.
+    pub(crate) fn has_attribute_old_value_observer(
+        no_gc: &NoGC,
+        target: &Node,
+        name: &LocalName,
+        namespace: &Namespace,
+    ) -> bool {
+        for node in target.inclusive_ancestors_unrooted(no_gc, ShadowIncluding::No) {
+            let Some(registered) = node.registered_mutation_observers() else {
+                continue;
+            };
+            for registered in &*registered {
+                let options = &registered.options;
+                if (*node == target || options.subtree)
+                    && options.attribute_old_value
+                    && options.observes_attribute(name, namespace)
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// <https://dom.spec.whatwg.org/#queueing-a-mutation-record>
@@ -140,24 +175,9 @@ impl MutationObserver {
                         ref namespace,
                         ref old_value,
                     } => {
-                        // 3.1.2 "2": type is "attributes" and options["attributes"] either does not exist or is false
-                        if !registered.options.attributes {
+                        // 3.1.2 "2", "3": match attributes, namespace, and filter.
+                        if !registered.options.observes_attribute(name, namespace) {
                             continue;
-                        }
-                        // 3.1.2 "3": type is "attributes", options["attributeFilter"] exists,
-                        // and options["attributeFilter"] does not contain name or namespace is non-null
-                        if !registered.options.attribute_filter.is_empty() {
-                            if *namespace != ns!() {
-                                continue;
-                            }
-                            if !registered
-                                .options
-                                .attribute_filter
-                                .iter()
-                                .any(|s| *s == **name)
-                            {
-                                continue;
-                            }
                         }
                         // 3.2.1 Let mo be registered’s observer.
                         let mo = registered.observer.as_rooted();

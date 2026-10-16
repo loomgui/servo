@@ -571,7 +571,71 @@ impl PaintTimingHandler {
         paint_timing_report
     }
 
+    /// A color delta introduces no new contentful primitives. Keep first-paint
+    /// and pending-content reporting on a full display list until that state is
+    /// settled, then use the normal bookkeeping without revisiting fragments.
+    pub(crate) fn can_retain_background_colors(&self, eligible: bool) -> bool {
+        !eligible
+            || (self
+                .previously_reported_paints
+                .contains(PaintTimingReport::FirstPaint)
+                && (!self.is_document_contentful
+                    || self
+                        .previously_reported_paints
+                        .contains(PaintTimingReport::FirstContentfulPaint))
+                && self.images_pending_rendering.is_empty()
+                && self.elements_with_pending_rendered_text.is_empty())
+    }
+
     pub(crate) fn largest_contentful_paint_candidate(&self) -> Option<LCPCandidate> {
         self.lcp_candidate.clone()
+    }
+}
+
+#[cfg(test)]
+mod retained_background_tests {
+    use super::*;
+
+    #[test]
+    fn plain_color_grid_becomes_eligible_without_contentful_or_largest_paint() {
+        let mut handler = PaintTimingHandler::new(LayoutSize::new(1280.0, 720.0));
+        handler.mark_document_is_paintable();
+        assert!(
+            handler
+                .mark_paint_timing(true, false)
+                .contains(PaintTimingReport::FirstPaint)
+        );
+        assert!(
+            !handler
+                .previously_reported_paints
+                .contains(PaintTimingReport::FirstContentfulPaint)
+        );
+        assert!(handler.largest_contentful_paint_candidate().is_none());
+        for _ in 0..100 {
+            assert!(handler.can_retain_background_colors(true));
+            assert!(handler.mark_paint_timing(true, false).is_empty());
+        }
+    }
+
+    #[test]
+    fn first_paint_and_first_contentful_paint_remain_on_complete_display_lists() {
+        let mut handler = PaintTimingHandler::new(LayoutSize::new(100.0, 100.0));
+        assert!(!handler.can_retain_background_colors(true));
+        assert!(handler.can_retain_background_colors(false));
+        handler.mark_document_is_paintable();
+        assert!(
+            handler
+                .mark_paint_timing(true, false)
+                .contains(PaintTimingReport::FirstPaint)
+        );
+        assert!(handler.can_retain_background_colors(true));
+        handler.mark_document_is_contentful();
+        assert!(!handler.can_retain_background_colors(true));
+        assert!(
+            handler
+                .mark_paint_timing(true, false)
+                .contains(PaintTimingReport::FirstContentfulPaint)
+        );
+        assert!(handler.can_retain_background_colors(true));
     }
 }

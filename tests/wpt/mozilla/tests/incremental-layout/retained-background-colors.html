@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>Retained background color updates and conservative fallbacks</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<style>
+#host { position: relative; width: 100px; height: 100px; }
+.cell { position: absolute; width: 8px; height: 8px; background: rgb(255, 0, 0); }
+</style>
+<div id="host"></div>
+<script>
+setup({explicit_done: true});
+window.onload = () => {
+    const cells = Array.from({length: 100}, (_, i) => {
+        const cell = document.createElement('div');
+        cell.className = 'cell';
+        cell.style.left = `${(i % 10) * 10}px`;
+        cell.style.top = `${Math.floor(i / 10) * 10}px`;
+        host.append(cell);
+        return cell;
+    });
+    function expectColors(description, count) {
+        const result = ServoTestUtils.forceLayout();
+        assert_array_equals(result.phases, ['UpdatedBackgroundColors'], description);
+        assert_equals(result.rebuiltFragmentCount, 0);
+        assert_equals(result.restyleFragmentCount, count);
+    }
+    function expectFull(description) {
+        const phases = ServoTestUtils.forceLayout().phases;
+        assert_true(phases.includes('BuiltDisplayList'), description);
+        assert_false(phases.includes('UpdatedBackgroundColors'), description);
+    }
+    test(() => {
+        ServoTestUtils.forceLayout();
+        cells[0].style.backgroundColor = 'green';
+        expectColors('sparse update', 1);
+        cells.forEach(cell => cell.style.backgroundColor = 'blue');
+        expectColors('dense update', 100);
+        cells[0].style.width = '9px';
+        cells[1].style.backgroundColor = 'red';
+        expectFull('geometry and color in the same frame');
+        cells[1].style.backgroundColor = 'green';
+        expectColors('eligible after layout fallback', 1);
+        cells[0].style.opacity = '0.5';
+        cells[1].style.backgroundColor = 'red';
+        expectFull('effect and color in the same frame');
+        cells[1].style.backgroundColor = 'green';
+        expectColors('eligible after effect fallback', 1);
+        cells[1].style.backgroundColor = 'rgba(255,0,0,.5)';
+        expectFull('opaque to translucent');
+        cells[1].style.backgroundColor = 'red';
+        expectFull('translucent to opaque');
+        cells[1].style.backgroundColor = 'green';
+        expectColors('eligible after alpha fallback', 1);
+        cells[1].style.backgroundImage = 'linear-gradient(red,blue)';
+        expectFull('background image mutation');
+        cells[1].style.backgroundImage = '';
+        expectFull('background image removal');
+        cells[1].style.backgroundColor = 'blue';
+        expectColors('eligible after image fallback', 1);
+        cells[1].style.setProperty('--retained-test-unused', 'changed');
+        cells[1].style.backgroundColor = 'green';
+        expectFull('custom property metadata changes with color');
+        cells[1].style.backgroundColor = 'blue';
+        expectColors('eligible after custom property fallback', 1);
+        document.body.style.backgroundColor = 'red';
+        expectFull('body propagation');
+        document.documentElement.style.backgroundColor = 'green';
+        expectFull('root propagation');
+        cells[1].style.backgroundClip = 'text';
+        cells[1].textContent = 'text';
+        expectFull('text clipping');
+        cells[2].style.backgroundColor = 'green';
+        expectFull('retained glyph snapshots require full display list');
+        cells[1].style.backgroundClip = '';
+        expectFull('remove text clipping');
+        cells[2].style.backgroundColor = 'blue';
+        expectColors('eligible after snapshot removal', 1);
+    }, 'Only complete opaque ordinary background batches retain their scene');
+    done();
+};
+</script>

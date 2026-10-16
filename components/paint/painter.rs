@@ -54,12 +54,12 @@ use webrender_api::units::{
 };
 use webrender_api::{
     self, BuiltDisplayList, BuiltDisplayListDescriptor, Checkpoint, ColorF, DirtyRect,
-    DisplayListPayload, DocumentId, DynamicProperties, Epoch as WebRenderEpoch, ExternalImageData,
-    ExternalScrollId, FontInstanceFlags, FontInstanceKey, FontInstanceOptions,
-    FontInstancePlatformOptions, FontKey, FontVariation, ImageData, ImageDescriptor, ImageKey,
-    NativeFontHandle, NotificationHandler, NotificationRequest, PipelineId as WebRenderPipelineId,
-    PropertyBinding, ReferenceFrameKind, RenderReasons, SampledScrollOffset, SnapshotImageKey,
-    SpaceAndClipInfo, SpatialId, TransformStyle,
+    DisplayListPayload, DocumentId, Epoch as WebRenderEpoch, ExternalImageData, ExternalScrollId,
+    FontInstanceFlags, FontInstanceKey, FontInstanceOptions, FontInstancePlatformOptions, FontKey,
+    FontVariation, ImageData, ImageDescriptor, ImageKey, NativeFontHandle, NotificationHandler,
+    NotificationRequest, PipelineId as WebRenderPipelineId, PropertyBinding, PropertyValue,
+    ReferenceFrameKind, RenderReasons, SampledScrollOffset, SnapshotImageKey, SpaceAndClipInfo,
+    SpatialId, TransformStyle,
 };
 use wr_malloc_size_of::MallocSizeOfOps;
 
@@ -132,6 +132,7 @@ pub(crate) struct Painter {
     /// display list or pipeline exit. Keyed per pipeline since a WebView's
     /// iframes each send their own.
     prev_snapshot_image_keys: FxHashMap<(WebViewId, PipelineId), Vec<SnapshotImageKey>>,
+    retained_colors: crate::retained_colors::RetainedColors,
 
     /// The active webrender document.
     pub(crate) webrender_document: DocumentId,
@@ -360,6 +361,7 @@ impl Painter {
             scene_frame_notification_waker: paint.paint_proxy.event_loop_waker.clone(),
             webrender_api,
             prev_snapshot_image_keys: FxHashMap::default(),
+            retained_colors: Default::default(),
             webrender_document,
             webrender_gl,
             last_mouse_move_position: None,
@@ -376,7 +378,7 @@ impl Painter {
         painter
     }
 
-    pub(crate) fn perform_updates(&mut self) {
+    pub(crate) fn perform_updates(&mut self, profiler_chan: &ProfilerChan) {
         let mut need_zoom = false;
         let scroll_offset_updates: Vec<_> = self
             .webview_renderers
@@ -392,15 +394,18 @@ impl Painter {
         self.send_zoom_and_scroll_offset_updates(need_zoom, scroll_offset_updates);
 
         if let Some(colors) = self.web_content_animator.update(&self.webview_renderers) {
-            let mut transaction = Transaction::new();
-            transaction.reset_dynamic_properties();
-            transaction.append_dynamic_properties(DynamicProperties {
-                transforms: Vec::new(),
-                floats: Vec::new(),
-                colors,
-            });
-            self.generate_frame(&mut transaction, RenderReasons::ANIMATED_PROPERTY);
-            self.send_transaction(transaction);
+            profile_traits::time::profile_if_active(
+                ProfilerCategory::PaintCaretColorReset,
+                || None,
+                profiler_chan,
+                || {
+                    self.retained_colors.sample_carets(colors);
+                    let mut transaction = Transaction::new();
+                    self.reset_dynamic_colors(&mut transaction);
+                    self.generate_frame(&mut transaction, RenderReasons::ANIMATED_PROPERTY);
+                    self.send_transaction(transaction);
+                },
+            );
         }
     }
 
@@ -1123,8 +1128,11 @@ impl Painter {
         // WebRender as well. Without this, `Scene.pipelines` accumulates one
         // entry per navigation for the lifetime of the process.
         if fully_exited {
+            self.retained_colors
+                .remove_pipeline(webview_id, pipeline_id);
             let mut transaction = Transaction::new();
             transaction.remove_pipeline(pipeline_id.into());
+            self.reset_dynamic_colors(&mut transaction);
             if let Some(keys) = self
                 .prev_snapshot_image_keys
                 .remove(&(webview_id, pipeline_id))
@@ -1229,6 +1237,49 @@ impl Painter {
             .display_list_epoch = Some(Epoch(epoch.0));
     }
 
+    fn reset_dynamic_colors(&self, transaction: &mut Transaction) {
+        self.retained_colors.reset_transaction(transaction);
+    }
+
+    #[servo_tracing::instrument(skip_all)]
+    pub(crate) fn update_background_colors(
+        &mut self,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        epoch: Epoch,
+        generation: u64,
+        colors: Vec<PropertyValue<ColorF>>,
+    ) -> bool {
+        if !self
+            .retained_colors
+            .update(webview_id, pipeline_id, generation, epoch, &colors)
+        {
+            warn!("Received background colors from an obsolete display list");
+            return false;
+        }
+        self.update_epoch(webview_id, pipeline_id, epoch);
+        if let Some(renderer) = self.webview_renderers.get_mut(&webview_id) {
+            // A retained update represents the same content activity as the
+            // full DL it replaces. Keep the baseline caret timeout refreshed.
+            renderer
+                .ensure_pipeline_details(pipeline_id)
+                .animations
+                .handle_new_display_list(
+                    self.retained_colors.caret_binding(webview_id, pipeline_id),
+                    &self.web_content_animator,
+                );
+        }
+        let mut transaction = Transaction::new();
+        transaction.update_epoch(pipeline_id.into(), epoch.into());
+        // WebRender appends retain history until a reset. Reinstall the latest
+        // value for every live binding so transaction storage stays bounded.
+        self.reset_dynamic_colors(&mut transaction);
+        // GenerateFrame arrives through the same ordered script channel as this
+        // update and performs normal SCENE tagging and asynchronous-image gating.
+        self.send_transaction(transaction);
+        true
+    }
+
     #[servo_tracing::instrument(skip_all)]
     pub(crate) fn handle_new_display_list(
         &mut self,
@@ -1305,6 +1356,20 @@ impl Painter {
             self.send_root_pipeline_display_list_in_transaction(&mut transaction);
         }
 
+        let colors: Vec<_> = display_list_info
+            .background_colors
+            .into_iter()
+            .map(|(key, color)| key.with(color))
+            .collect();
+        self.retained_colors.install(
+            webview_id,
+            pipeline_id.into(),
+            display_list_info.background_color_generation,
+            display_list_info.epoch,
+            colors,
+            display_list_info.caret_property_binding,
+        );
+        self.reset_dynamic_colors(&mut transaction);
         transaction.set_display_list(epoch, (pipeline_id, built_display_list));
 
         // Register clip:text snapshot keys. Diff against the previous set rather
@@ -1574,6 +1639,7 @@ impl Painter {
             return;
         };
         let mut transaction = Transaction::new();
+        self.retained_colors.remove_webview(webview_id);
         self.prev_snapshot_image_keys
             .retain(|(other_webview, _), keys| {
                 if *other_webview != webview_id {
@@ -1587,6 +1653,7 @@ impl Painter {
         for pipeline_id in webview_renderer.pipelines.keys() {
             transaction.remove_pipeline(pipeline_id.into());
         }
+        self.reset_dynamic_colors(&mut transaction);
         self.send_transaction(transaction);
 
         self.send_root_pipeline_display_list();

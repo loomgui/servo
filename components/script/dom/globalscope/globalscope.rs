@@ -1315,6 +1315,13 @@ impl GlobalScope {
         set.retain(|dom_signal| dom_signal.must_keep_alive_for_gc());
     }
 
+    /// Test-only observation of signals retained by the abort GC predicate.
+    #[cfg(feature = "testbinding")]
+    pub(crate) fn dependent_abort_signal_count(&self) -> usize {
+        self.perform_an_abort_signal_garbage_collection_checkpoint();
+        self.abort_signal_dependents.borrow().len()
+    }
+
     /// Start tracking a broadcast-channel.
     pub(crate) fn track_broadcast_channel(&self, dom_channel: &BroadcastChannel) {
         let mut current_state = self.broadcast_channel_state.borrow_mut();

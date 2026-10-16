@@ -2877,19 +2877,37 @@ impl Element {
     /// attribute to persist after modification, because it is sent as an argument to
     /// script callbacks. Normally that's not the case, so this method tries to detect
     /// when it's required so it can be avoided for performance reasons.
-    pub(crate) fn needs_preserved_style_attribute_after_change(&self) -> bool {
-        // This is a global check for whether any mutation observers are installed on this
-        // Document at all. If cloning of the property declaration block (look at the
-        // caller of this method), starts showing up in profiles, this check may need to
-        // be a bit smarter. For instance, maybe only returning true if any mutation
-        // observer is installed on an inclusive ancestor and only if it has an observer
-        // with the attribute filter set to include `style`.
-        self.owner_window().get_exists_mut_observer()
-            || self
-                .get_custom_element_definition()
-                .is_some_and(|custom_element_definition| {
-                    custom_element_definition.has_attribute_changed_callback()
-                })
+    pub(crate) fn needs_preserved_style_attribute_after_change(&self, no_gc: &NoGC) -> bool {
+        if self
+            .get_custom_element_definition()
+            .is_some_and(|definition| {
+                definition.has_attribute_changed_callback()
+                    && definition
+                        .observed_attributes
+                        .iter()
+                        .any(|name| *name == *local_name!("style"))
+            })
+        {
+            return true;
+        }
+
+        if !self.owner_window().get_exists_mut_observer() {
+            return false;
+        }
+
+        // Keep detached-node preservation conservative: subtree removals can
+        // leave transient observer registrations until the next delivery.
+        let node = self.upcast::<Node>();
+        if !node.is_connected() {
+            return true;
+        }
+
+        MutationObserver::has_attribute_old_value_observer(
+            no_gc,
+            node,
+            &local_name!("style"),
+            &ns!(),
+        )
     }
 
     pub(crate) fn register_current_id_and_name_attribute(&self, cx: &mut JSContext) {

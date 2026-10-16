@@ -176,6 +176,8 @@ pub struct LayoutThread {
     /// layout requests a display list, it is produced unconditionally, even when the
     /// layout trees remain the same.
     need_new_display_list: Cell<bool>,
+    background_colors: Mutex<crate::background_color_cache::BackgroundColorCache>,
+    previously_frame_focused: Cell<bool>,
 
     /// Whether or not cumulative containing blocks offsets have been set into the
     /// [`FragmentTree`]. This typically happens during [`StackingContextTree`]
@@ -748,6 +750,7 @@ impl Layout for LayoutThread {
     }
 
     fn set_needs_new_display_list(&self) {
+        self.background_colors.lock().invalidate();
         self.need_new_display_list.set(true);
     }
 
@@ -855,6 +858,8 @@ impl LayoutThread {
             device_has_changed: false,
             need_containing_block_calculation: Cell::new(false),
             need_new_display_list: Cell::new(false),
+            background_colors: Default::default(),
+            previously_frame_focused: Cell::new(false),
             need_new_stacking_context_tree: Cell::new(false),
             box_tree: Default::default(),
             fragment_tree: Default::default(),
@@ -1092,9 +1097,8 @@ impl LayoutThread {
         if self.build_stacking_context_tree_for_reflow(&reflow_request) {
             reflow_phases_run.insert(ReflowPhasesRun::BuiltStackingContextTree);
         }
-        if self.build_display_list(&reflow_request, &image_resolver, &mut reflow_statistics) {
-            reflow_phases_run.insert(ReflowPhasesRun::BuiltDisplayList);
-        }
+        reflow_phases_run |=
+            self.build_display_list(&reflow_request, &image_resolver, &mut reflow_statistics);
         if self.handle_update_scroll_node_request(&reflow_request) {
             reflow_phases_run.insert(ReflowPhasesRun::UpdatedScrollNodeOffset);
         }
@@ -1218,6 +1222,14 @@ impl LayoutThread {
         image_resolver: &Arc<ImageResolver>,
         mut accessibility_damage: Option<&mut AccessibilityDamageMap<'dom>>,
     ) -> (ReflowPhasesRun, IFrameSizes, WebFontSetDifference) {
+        if reflow_request.restyle.as_ref().is_some_and(|restyle| {
+            !(restyle.reason
+                - (layout_api::RestyleReason::DOMChanged
+                    | layout_api::RestyleReason::PendingRestyles))
+                .is_empty()
+        }) {
+            self.background_colors.lock().invalidate();
+        }
         let mut snapshot_map = SnapshotMap::new();
         let _snapshot_setter = match reflow_request.restyle.as_mut() {
             Some(restyle) => SnapshotSetter::new(restyle, &mut snapshot_map),
@@ -1259,13 +1271,16 @@ impl LayoutThread {
             .invalidation_set
             .process_style(dangerous_root_element, Some(&snapshot_map));
 
-        if self.previously_highlighted_dom_node.get() != reflow_request.highlighted_dom_node {
+        if self.previously_highlighted_dom_node.get() != reflow_request.highlighted_dom_node
+            || self.previously_frame_focused.get() != reflow_request.frame_focused
+        {
             // Need to manually force layout to build a new display list regardless of whether the box tree
             // changed or not.
-            self.need_new_display_list.set(true);
+            self.set_needs_new_display_list();
         }
 
         let layout_context = LayoutContext {
+            background_colors: &self.background_colors,
             style_context: self.build_shared_style_context(
                 guards,
                 &snapshot_map,
@@ -1316,7 +1331,12 @@ impl LayoutThread {
                 return Default::default();
             }
 
-            dirty_root = driver::traverse_dom(&recalc_style_traversal, token, rayon_pool).as_node();
+            dirty_root = profile_time::profile_if_active(
+                profile_time::ProfilerCategory::LayoutStyleTraversal,
+                || self.profiler_metadata(),
+                &self.time_profiler_chan,
+                || driver::traverse_dom(&recalc_style_traversal, token, rayon_pool).as_node(),
+            );
         }
 
         let root_node = root_element.as_node();
@@ -1328,27 +1348,33 @@ impl LayoutThread {
 
         let mut box_tree = self.box_tree.borrow_mut();
         let mut layout_roots = Vec::new();
-        let damage = {
-            let box_tree = &mut *box_tree;
-            let mut compute_damage_and_build_box_tree = || {
-                compute_damage_and_rebuild_box_tree(
-                    box_tree,
-                    &layout_context,
-                    dirty_root.layout_node(),
-                    root_node,
-                    damage_from_environment,
-                    &mut layout_roots,
-                )
-            };
+        let damage = profile_time::profile_if_active(
+            profile_time::ProfilerCategory::LayoutDamage,
+            || self.profiler_metadata(),
+            &self.time_profiler_chan,
+            || {
+                let box_tree = &mut *box_tree;
+                let mut compute_damage_and_build_box_tree = || {
+                    compute_damage_and_rebuild_box_tree(
+                        box_tree,
+                        &layout_context,
+                        dirty_root.layout_node(),
+                        root_node,
+                        damage_from_environment,
+                        &mut layout_roots,
+                    )
+                };
 
-            if let Some(pool) = rayon_pool {
-                pool.install(compute_damage_and_build_box_tree)
-            } else {
-                compute_damage_and_build_box_tree()
-            }
-        };
+                if let Some(pool) = rayon_pool {
+                    pool.install(compute_damage_and_build_box_tree)
+                } else {
+                    compute_damage_and_build_box_tree()
+                }
+            },
+        );
 
         if damage.contains(LayoutDamage::RebuildStackingContextTree) {
+            self.background_colors.lock().invalidate();
             self.need_new_stacking_context_tree.set(true);
         }
         if damage.contains(LayoutDamage::Repaint) {
@@ -1473,6 +1499,7 @@ impl LayoutThread {
             return false;
         };
 
+        self.background_colors.lock().invalidate();
         let mut stacking_context_tree = self.stacking_context_tree.borrow_mut();
         let old_scroll_offsets = stacking_context_tree
             .as_ref()
@@ -1526,27 +1553,129 @@ impl LayoutThread {
         reflow_request: &ReflowRequest,
         image_resolver: &Arc<ImageResolver>,
         reflow_statistics: &mut ReflowStatistics,
-    ) -> bool {
+    ) -> ReflowPhasesRun {
         if !ReflowPhases::necessary(&reflow_request.reflow_goal)
             .contains(ReflowPhases::DisplayListConstruction)
         {
-            return false;
+            return ReflowPhasesRun::empty();
         }
         let Some(fragment_tree) = &*self.fragment_tree.borrow() else {
-            return false;
+            return ReflowPhasesRun::empty();
         };
         let mut stacking_context_tree = self.stacking_context_tree.borrow_mut();
         let Some(stacking_context_tree) = stacking_context_tree.as_mut() else {
-            return false;
+            return ReflowPhasesRun::empty();
         };
 
         // If a non-display-list-generating reflow updated layout in a previous refow, we
         // cannot skip display list generation here the next time a display list is
         // requested.
         if !self.need_new_display_list.get() {
-            return false;
+            return ReflowPhasesRun::empty();
         }
 
+        // Property-only transactions still run the ordinary script frame request,
+        // including canvas delays and the embedder's exact FrameBuilt tag gate.
+        let eligible = stacking_context_tree
+            .paint_info
+            .snapshot_image_keys
+            .is_empty()
+            && self.previously_highlighted_dom_node.get() == reflow_request.highlighted_dom_node
+            && self.previously_frame_focused.get() == reflow_request.frame_focused
+            && self
+                .paint_timing_handler
+                .borrow()
+                .as_ref()
+                .is_some_and(|handler| {
+                    handler.can_retain_background_colors(reflow_request.paint_timing_eligible)
+                });
+        // End the mutex borrow before waiting for the owner's validation ACK.
+        let updates = if eligible {
+            self.background_colors.lock().take_updates()
+        } else {
+            None
+        };
+        let phase = Self::submit_render_update(
+            updates,
+            &self.background_colors,
+            &self.need_new_display_list,
+            reflow_statistics,
+            |generation, colors| {
+                profile_time::profile_if_active(
+                    profile_time::ProfilerCategory::LayoutBackgroundColorUpdate,
+                    || self.profiler_metadata(),
+                    &self.time_profiler_chan,
+                    || {
+                        self.paint_api.update_background_colors(
+                            self.webview_id,
+                            self.id,
+                            reflow_request.epoch,
+                            generation,
+                            colors,
+                        )
+                    },
+                )
+            },
+            |statistics| {
+                self.build_full_display_list(
+                    reflow_request,
+                    image_resolver,
+                    statistics,
+                    fragment_tree,
+                    stacking_context_tree,
+                )
+            },
+        );
+        if phase == ReflowPhasesRun::UpdatedBackgroundColors {
+            profile_time::profile_if_active(
+                profile_time::ProfilerCategory::LayoutBackgroundColorCommit,
+                || self.profiler_metadata(),
+                &self.time_profiler_chan,
+                || {
+                    if let Some(handler) = self.paint_timing_handler.borrow_mut().as_mut() {
+                        let report = handler.mark_paint_timing(
+                            reflow_request.paint_timing_eligible,
+                            reflow_request.halt_lcp,
+                        );
+                        debug_assert!(report.is_empty());
+                    }
+                    stacking_context_tree.paint_info.epoch = reflow_request.epoch;
+                },
+            );
+        }
+        phase
+    }
+
+    /// The production caller owns rejection recovery: the full list is built
+    /// and submitted in this same call before any successful phase is returned.
+    pub(crate) fn submit_render_update(
+        updates: Option<crate::background_color_cache::BackgroundColorUpdates>,
+        cache: &Mutex<crate::background_color_cache::BackgroundColorCache>,
+        dirty: &Cell<bool>,
+        statistics: &mut ReflowStatistics,
+        submit: impl FnOnce(u64, Vec<webrender_api::PropertyValue<webrender_api::ColorF>>) -> bool,
+        rebuild_and_submit: impl FnOnce(&mut ReflowStatistics) -> ReflowPhasesRun,
+    ) -> ReflowPhasesRun {
+        if let Some(updates) = updates {
+            if updates.submit(statistics, submit) {
+                dirty.set(false);
+                return ReflowPhasesRun::UpdatedBackgroundColors;
+            }
+        }
+        cache.lock().invalidate();
+        let phases = rebuild_and_submit(statistics);
+        dirty.set(!phases.contains(ReflowPhasesRun::BuiltDisplayList));
+        phases
+    }
+
+    fn build_full_display_list(
+        &self,
+        reflow_request: &ReflowRequest,
+        image_resolver: &Arc<ImageResolver>,
+        reflow_statistics: &mut ReflowStatistics,
+        fragment_tree: &FragmentTree,
+        stacking_context_tree: &mut StackingContextTree,
+    ) -> ReflowPhasesRun {
         // TODO: Eventually this should be set when `paint_info` is created, but that requires
         // ensuring that the Epoch is passed to any method that can creates `StackingContextTree`.
         stacking_context_tree.paint_info.epoch = reflow_request.epoch;
@@ -1566,18 +1695,28 @@ impl LayoutThread {
             },
         };
 
-        let built_display_list = DisplayListBuilder::build(
-            stacking_context_tree,
-            fragment_tree,
-            image_resolver.clone(),
-            self.device().device_pixel_ratio(),
-            reflow_request.highlighted_dom_node,
-            &self.debug,
-            paint_timing_handler,
-            reflow_statistics,
-            Some((self.paint_api.clone(), self.webview_id)),
-            &mut self.snapshot_image_key_cache.borrow_mut(),
-            reflow_request.frame_focused,
+        let mut background_colors = self.background_colors.lock();
+        background_colors.begin_display_list();
+        let built_display_list = profile_time::profile_if_active(
+            profile_time::ProfilerCategory::LayoutDisplayListBuild,
+            || self.profiler_metadata(),
+            &self.time_profiler_chan,
+            || {
+                DisplayListBuilder::build(
+                    stacking_context_tree,
+                    fragment_tree,
+                    image_resolver.clone(),
+                    self.device().device_pixel_ratio(),
+                    reflow_request.highlighted_dom_node,
+                    &self.debug,
+                    paint_timing_handler,
+                    reflow_statistics,
+                    Some((self.paint_api.clone(), self.webview_id)),
+                    &mut self.snapshot_image_key_cache.borrow_mut(),
+                    reflow_request.frame_focused,
+                    &mut background_colors,
+                )
+            },
         );
 
         stacking_context_tree.paint_info.paint_timing_info = reflow_request.paint_timing_info;
@@ -1594,10 +1733,17 @@ impl LayoutThread {
             stacking_context_tree.paint_info.lcp_candidate = None;
         }
 
-        self.paint_api.send_display_list(
-            self.webview_id,
-            &stacking_context_tree.paint_info,
-            built_display_list,
+        profile_time::profile_if_active(
+            profile_time::ProfilerCategory::LayoutDisplayListSubmit,
+            || self.profiler_metadata(),
+            &self.time_profiler_chan,
+            || {
+                self.paint_api.send_display_list(
+                    self.webview_id,
+                    &stacking_context_tree.paint_info,
+                    built_display_list,
+                );
+            },
         );
 
         let (keys, instance_keys) = self
@@ -1607,10 +1753,11 @@ impl LayoutThread {
             .remove_unused_font_resources(self.webview_id.into(), keys, instance_keys);
         self.last_display_list_was_empty.set(false);
         self.have_ever_generated_display_list.set(true);
-        self.need_new_display_list.set(false);
+        self.previously_frame_focused
+            .set(reflow_request.frame_focused);
         self.previously_highlighted_dom_node
             .set(reflow_request.highlighted_dom_node);
-        true
+        ReflowPhasesRun::BuiltDisplayList
     }
 
     fn set_scroll_offset_from_script(
@@ -1680,6 +1827,7 @@ impl LayoutThread {
         self.box_tree.borrow_mut().take();
         self.fragment_tree.borrow_mut().take();
         self.stacking_context_tree.borrow_mut().take();
+        self.background_colors.lock().begin_display_list();
         self.need_new_display_list.set(false);
 
         // If the last display list was also empty a new one is not necessary.

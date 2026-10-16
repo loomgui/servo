@@ -87,9 +87,21 @@ impl InnerDOMLayoutData {
         layout_box.with_base(|base| callback(&base.fragments()))
     }
 
-    fn repair_style(&self, node: &ServoLayoutNode, context: &SharedStyleContext) {
+    fn repair_style(&self, node: &ServoLayoutNode, context: &LayoutContext) {
         if let Some(layout_object) = &*self.self_box.borrow() {
-            layout_object.repair_style(context, node, &node.style(context));
+            let new_style = node.style(&context.style_context);
+            if layout_object
+                .with_base(|base| {
+                    context
+                        .background_colors
+                        .lock()
+                        .record_style_change(base, &new_style);
+                })
+                .is_none()
+            {
+                context.background_colors.lock().invalidate();
+            }
+            layout_object.repair_style(&context.style_context, node, &new_style);
         }
 
         for pseudo_layout_data in self.pseudo_boxes.iter() {
@@ -452,7 +464,7 @@ pub(crate) trait NodeExt<'dom> {
     fn with_layout_box_base(&self, callback: impl FnMut(&LayoutBoxBase));
     fn with_layout_box_base_including_pseudos(&self, callback: impl FnMut(&LayoutBoxBase));
 
-    fn repair_style(&self, context: &SharedStyleContext);
+    fn repair_style(&self, context: &LayoutContext);
 
     /// Whether or not this node isolates downward flowing box tree rebuild damage and
     /// fragment tree layout cache damage. Roughly, this corresponds to independent
@@ -544,8 +556,8 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
     }
 
     fn as_typeless_object_with_data_attribute(&self) -> Option<String> {
-        if self.type_id() !=
-            Some(ScriptLayoutNodeType::Element(
+        if self.type_id()
+            != Some(ScriptLayoutNodeType::Element(
                 LayoutElementType::HTMLObjectElement,
             ))
         {
@@ -693,7 +705,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
         self.inner_layout_data()?.with_fragments(callback)
     }
 
-    fn repair_style(&self, context: &SharedStyleContext) {
+    fn repair_style(&self, context: &LayoutContext) {
         if let Some(layout_data) = self.inner_layout_data() {
             layout_data.repair_style(self, context);
         }
@@ -721,9 +733,9 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
             LayoutBox::DisplayContents(..) => false,
             LayoutBox::BlockLevel(block_level) => matches!(
                 &*block_level.borrow(),
-                BlockLevelBox::Independent(..) |
-                    BlockLevelBox::OutOfFlowFloatBox(..) |
-                    BlockLevelBox::OutOfFlowAbsolutelyPositionedBox(..)
+                BlockLevelBox::Independent(..)
+                    | BlockLevelBox::OutOfFlowFloatBox(..)
+                    | BlockLevelBox::OutOfFlowAbsolutelyPositionedBox(..)
             ),
             LayoutBox::InlineLevel(inline_level) => matches!(
                 inline_level,
@@ -783,8 +795,8 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                 let mut block_level = block_level.borrow_mut();
                 match &mut *block_level {
                     BlockLevelBox::Independent(independent_formatting_context) => {
-                        if box_style.position.is_absolutely_positioned() ||
-                            box_style.float.is_floating()
+                        if box_style.position.is_absolutely_positioned()
+                            || box_style.float.is_floating()
                         {
                             return false;
                         }
@@ -821,8 +833,8 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                         // original display was inline-level, then the box needs to be handled as
                         // an inline-level in order to compute the static position correctly.
                         // See `BlockContainerBuilder::handle_absolutely_positioned_element()`.
-                        if !info.style.clone_position().is_absolutely_positioned() ||
-                            box_style.original_display.outside() != StyloDisplayOutside::Block
+                        if !info.style.clone_position().is_absolutely_positioned()
+                            || box_style.original_display.outside() != StyloDisplayOutside::Block
                         {
                             return false;
                         }
@@ -864,8 +876,8 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                 let mut flex_level_box = flex_level_box.borrow_mut();
                 match &mut *flex_level_box {
                     FlexLevelBox::FlexItem(flex_item_box) => {
-                        if info.style.clone_position().is_absolutely_positioned() ||
-                            flex_item_box.style().clone_order() != info.style.clone_order()
+                        if info.style.clone_position().is_absolutely_positioned()
+                            || flex_item_box.style().clone_order() != info.style.clone_order()
                         {
                             return false;
                         }
@@ -887,8 +899,8 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
             },
             LayoutBox::TableLevelBox(table_level_box) => match table_level_box {
                 TableLevelBox::Caption(caption) => {
-                    if display !=
-                        DisplayGeneratingBox::LayoutInternal(DisplayLayoutInternal::TableCaption)
+                    if display
+                        != DisplayGeneratingBox::LayoutInternal(DisplayLayoutInternal::TableCaption)
                     {
                         return false;
                     }
@@ -896,8 +908,8 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                     true
                 },
                 TableLevelBox::Cell(table_cell) => {
-                    if display !=
-                        DisplayGeneratingBox::LayoutInternal(DisplayLayoutInternal::TableCell)
+                    if display
+                        != DisplayGeneratingBox::LayoutInternal(DisplayLayoutInternal::TableCell)
                     {
                         return false;
                     }

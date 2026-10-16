@@ -667,13 +667,17 @@ bitflags! {
         /// progressing to a new animated image frame.
         const UpdatedImageData = 1 << 5;
         const UpdatedAccessibilityTree = 1 << 6;
+        const UpdatedBackgroundColors = 1 << 7;
     }
 }
 
 impl ReflowPhasesRun {
     pub fn needs_frame(&self) -> bool {
         self.intersects(
-            Self::BuiltDisplayList | Self::UpdatedScrollNodeOffset | Self::UpdatedImageData,
+            Self::BuiltDisplayList
+                | Self::UpdatedScrollNodeOffset
+                | Self::UpdatedImageData
+                | Self::UpdatedBackgroundColors,
         )
     }
 }
@@ -875,8 +879,9 @@ impl ImageAnimationState {
             return false;
         }
         let time_interval_since_last_update = now - self.frame_start_time;
-        let mut remain_time_interval = time_interval_since_last_update -
-            self.image
+        let mut remain_time_interval = time_interval_since_last_update
+            - self
+                .image
                 .frames
                 .get(self.active_frame)
                 .unwrap()

@@ -135,19 +135,29 @@ impl PipelineAnimations {
             return;
         };
 
-        *self.caret.borrow_mut() = match caret_property_binding {
-            Some((caret_property_key, original_caret_color)) => {
-                web_content_animator.schedule_timer_if_necessary();
-                Some(CaretAnimation {
+        if caret_property_binding.is_some() {
+            web_content_animator.schedule_timer_if_necessary();
+        }
+        self.reset_for_content_update(caret_property_binding, caret_blink_time);
+    }
+
+    // Both full DL and retained content activity enter handle_new_display_list.
+    // Keep timeout accounting independent from the current global blink phase.
+    fn reset_for_content_update(
+        &self,
+        caret_property_binding: Option<(PropertyBindingKey<ColorF>, ColorF)>,
+        caret_blink_time: Duration,
+    ) {
+        *self.caret.borrow_mut() =
+            caret_property_binding.map(|(caret_property_key, original_caret_color)| {
+                CaretAnimation {
                     caret_property_key,
                     original_caret_color,
-                    remaining_blink_count: (CARET_BLINK_TIMEOUT.as_millis() /
-                        caret_blink_time.as_millis())
+                    remaining_blink_count: (CARET_BLINK_TIMEOUT.as_millis()
+                        / caret_blink_time.as_millis())
                         as usize,
-                })
-            },
-            None => None,
-        }
+                }
+            });
     }
 }
 
@@ -175,5 +185,43 @@ impl CaretAnimation {
             key: self.caret_property_key,
             value,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_activity_keeps_blinking_past_timeout_without_changing_phase() {
+        let active = PipelineAnimations::default();
+        let idle = PipelineAnimations::default();
+        let binding = Some((PropertyBindingKey::new(1), ColorF::WHITE));
+        let interval = Duration::from_millis(500);
+        idle.reset_for_content_update(binding, interval);
+        // 90s of deterministic timer samples; baseline content activity renews
+        // the 30s timeout while an idle caret stops. No wall-clock sleeps.
+        for tick in 0..180 {
+            if tick % 10 == 0 {
+                active.reset_for_content_update(binding, interval);
+            }
+            let visible = tick % 2 == 0;
+            let sample = active
+                .update(visible)
+                .expect("content activity must keep caret active");
+            assert_eq!(
+                sample.value,
+                if visible {
+                    ColorF::WHITE
+                } else {
+                    ColorF::TRANSPARENT
+                }
+            );
+            if tick >= 60 {
+                assert!(idle.update(visible).is_none());
+            } else {
+                assert!(idle.update(visible).is_some());
+            }
+        }
     }
 }

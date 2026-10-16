@@ -36,6 +36,8 @@ pub(crate) struct LayoutContext<'a> {
     /// Bits shared by the layout and style system.
     pub style_context: SharedStyleContext<'a>,
 
+    pub background_colors: &'a Mutex<crate::background_color_cache::BackgroundColorCache>,
+
     /// A FontContext to be used during layout.
     pub font_context: Arc<FontContext>,
 
@@ -70,10 +72,11 @@ impl LayoutContext<'_> {
     }
 
     pub(crate) fn should_parallelize_layout(&self, jobs: impl Iterator<Item = usize>) -> bool {
-        self.allow_parallel_layout &&
-            jobs.filter(|job| *job >= self.parallelism_job_size_minimum)
-                .count() >=
-                self.parallelism_job_count_minimum
+        self.allow_parallel_layout
+            && jobs
+                .filter(|job| *job >= self.parallelism_job_size_minimum)
+                .count()
+                >= self.parallelism_job_count_minimum
     }
 }
 

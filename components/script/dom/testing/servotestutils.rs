@@ -15,6 +15,7 @@ use script_bindings::root::DomRoot;
 use servo_base::Epoch;
 use time::Duration;
 
+use crate::dom::abortsignal::AbortSignal;
 use crate::dom::bindings::codegen::Bindings::ServoTestUtilsBinding::ServoTestUtilsMethods;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::layoutresult::LayoutResult;
@@ -50,6 +51,9 @@ impl ServoTestUtilsMethods<crate::DomTypeHolder> for ServoTestUtils {
         if phases_run.contains(ReflowPhasesRun::BuiltDisplayList) {
             phases.push(DOMString::from_static("BuiltDisplayList"))
         }
+        if phases_run.contains(ReflowPhasesRun::UpdatedBackgroundColors) {
+            phases.push(DOMString::from_static("UpdatedBackgroundColors"))
+        }
         if phases_run.contains(ReflowPhasesRun::UpdatedScrollNodeOffset) {
             phases.push(DOMString::from_static("UpdatedScrollNodeOffset"))
         }
@@ -65,6 +69,18 @@ impl ServoTestUtilsMethods<crate::DomTypeHolder> for ServoTestUtils {
             statistics.restyle_fragment_count,
             statistics.only_descendants_changed_count,
         )
+    }
+
+    fn AbortSignalFollowerCount(_: &GlobalScope, signal: &AbortSignal) -> u32 {
+        signal.dependent_signal_count() as u32
+    }
+
+    fn DependentAbortSignalCount(global: &GlobalScope) -> u32 {
+        global.dependent_abort_signal_count() as u32
+    }
+
+    fn InlineStylePreservationCloneCount(_: &GlobalScope) -> u32 {
+        crate::dom::cssstyledeclaration::inline_style_preservation_clone_count()
     }
 
     fn Js_backtrace(_: &GlobalScope) {

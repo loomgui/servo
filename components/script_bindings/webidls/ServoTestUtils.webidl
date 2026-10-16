@@ -17,6 +17,12 @@ namespace ServoTestUtils {
   [Exposed=Window]
   LayoutResult forceLayout();
 
+  unsigned long inlineStylePreservationCloneCount();
+
+  unsigned long dependentAbortSignalCount();
+
+  unsigned long abortSignalFollowerCount(AbortSignal signal);
+
   undefined js_backtrace();
 
   undefined panic();

@@ -440,7 +440,7 @@ pub(crate) fn Fetch(
     let fetch_context = network_listener.context.clone();
 
     // Step 11. Add the following abort steps to requestObject’s signal:
-    signal.add(&AbortAlgorithm::Fetch(fetch_context));
+    signal.add(&AbortAlgorithm::Fetch(request_builder.id, fetch_context));
 
     // Step 12. Set controller to the result of calling fetch given request and
     // processResponse given response being these steps:
@@ -755,10 +755,18 @@ impl FetchResponseListener for FetchContext {
     fn process_response_eof(
         self,
         cx: &mut JSContext,
-        _: RequestId,
+        request_id: RequestId,
         response: Result<(), NetworkError>,
         timing: ResourceFetchTiming,
     ) {
+        // NetworkListener has already taken this context out of the shared slot,
+        // so its abort algorithm is now inert. Do not remove it at headers: the
+        // listener must still abort the response body while delivery is active.
+        self.request
+            .root()
+            .Signal()
+            .remove_completed_fetch(request_id);
+
         let response_object = self.response_object.root();
         let mut realm = enter_auto_realm(cx, &*response_object);
         let cx = &mut realm.current_realm();

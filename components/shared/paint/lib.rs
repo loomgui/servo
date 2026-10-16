@@ -40,10 +40,10 @@ use servo_base::generic_channel::{
 pub use webrender_api::ExternalImageSource;
 use webrender_api::units::{DevicePixel, LayoutVector2D, TexelRect};
 use webrender_api::{
-    BuiltDisplayList, BuiltDisplayListDescriptor, ExternalImage, ExternalImageData,
+    BuiltDisplayList, BuiltDisplayListDescriptor, ColorF, ExternalImage, ExternalImageData,
     ExternalImageHandler, ExternalImageId, ExternalScrollId, FontInstanceFlags, FontInstanceKey,
     FontKey, ImageData, ImageDescriptor, ImageKey, NativeFontHandle,
-    PipelineId as WebRenderPipelineId,
+    PipelineId as WebRenderPipelineId, PropertyValue,
 };
 
 use crate::viewport_description::ViewportDescription;
@@ -140,6 +140,15 @@ pub enum PaintMessage {
         display_list_info_receiver: GenericReceiver<PaintDisplayListInfo>,
         /// A [`GenericReceiver`] used to send the serialized  version of `DisplayListPayload.
         display_list_data_receiver: GenericReceiver<SerializableDisplayListPayload>,
+    },
+    /// Change retained background primitives without replacing their scene.
+    UpdateBackgroundColors {
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        epoch: Epoch,
+        colors: Vec<PropertyValue<ColorF>>,
+        generation: u64,
+        response: GenericSender<bool>,
     },
     /// Ask the renderer to generate a frame for the current set of display lists
     /// from the given `PainterId`s that have been sent to the renderer.
@@ -327,6 +336,36 @@ impl CrossProcessPaintApi {
         }) {
             warn!("Error updating epoch for pipeline: {error:?}");
         }
+    }
+
+    /// The reply acknowledges validation and transaction queueing, not painting.
+    /// A rejected batch lets layout build a full display list in this reflow.
+    pub fn update_background_colors(
+        &self,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        epoch: Epoch,
+        generation: u64,
+        colors: Vec<PropertyValue<ColorF>>,
+    ) -> bool {
+        let Some((response, receiver)) = generic_channel::channel() else {
+            return false;
+        };
+        if self
+            .0
+            .send(PaintMessage::UpdateBackgroundColors {
+                webview_id,
+                pipeline_id,
+                epoch,
+                colors,
+                generation,
+                response,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        receiver.recv().unwrap_or(false)
     }
 
     /// Inform WebRender of a new display list for the given pipeline.

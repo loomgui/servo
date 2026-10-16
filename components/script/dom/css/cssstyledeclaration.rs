@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+#[cfg(feature = "testbinding")]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::sync::LazyLock;
@@ -34,6 +36,16 @@ use crate::dom::element::Element;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::types::CSSFontFaceDescriptors;
 use crate::dom::window::Window;
+
+#[cfg(feature = "testbinding")]
+thread_local! {
+    static INLINE_STYLE_PRESERVATION_CLONES: Cell<u32> = const { Cell::new(0) };
+}
+
+#[cfg(feature = "testbinding")]
+pub(crate) fn inline_style_preservation_clone_count() -> u32 {
+    INLINE_STYLE_PRESERVATION_CLONES.with(Cell::get)
+}
 
 // http://dev.w3.org/csswg/cssom/#the-cssstyledeclaration-interface
 #[dom_struct]
@@ -81,12 +93,14 @@ impl CSSStyleOwner {
                 let mut attribute_pdb =
                     element.style_attribute().safe_borrow_mut(cx.no_gc()).take();
 
-                // When there are mutation observers, the old PDB and the new PDB need to
-                // co-exist so that both attribute values can be serialized and sent to
-                // the observer. In that case, first clone the block and mutate that instead
-                // of mutating the existing one.
-                if element.needs_preserved_style_attribute_after_change() {
+                // Preserve the old PDB only when an observer or custom-element
+                // callback can request the old style attribute value.
+                if element.needs_preserved_style_attribute_after_change(cx.no_gc()) {
                     attribute_pdb = attribute_pdb.map(|attribute_pdb| {
+                        #[cfg(feature = "testbinding")]
+                        INLINE_STYLE_PRESERVATION_CLONES.with(|count| {
+                            count.set(count.get().wrapping_add(1));
+                        });
                         let new_pdb = attribute_pdb.read_with(&shared_lock.read()).clone();
                         Arc::new(shared_lock.wrap(new_pdb))
                     });
