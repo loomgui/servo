@@ -17,7 +17,7 @@ use script::layout_dom::{ServoDangerousStyleElement, ServoLayoutElement, ServoLa
 use servo_config::pref;
 use style::context::{SharedStyleContext, StyleContext, ThreadLocalStyleContext};
 use style::data::ElementDataRef;
-use style::dom::{TElement, TNode};
+use style::dom::{OpaqueNode, TElement, TNode};
 use style::inline_background::{
     BackgroundBatchProof, BackgroundParentProof, BackgroundStyleReuse, CapturedBackgroundStyle,
     PreparedBackgroundStyle, capture_background_style_in_batch, commit_background_style,
@@ -111,11 +111,17 @@ impl CertifiedBackgroundInput {
         shared: &SharedStyleContext,
         cache: &mut BackgroundColorCache,
         pool: Option<&rayon::ThreadPool>,
+        document: OpaqueNode,
     ) -> Option<PreparedBackgroundBatch<'dom>> {
         let mut reusable_styles = cache.detach_reusable_styles();
         if !cache.can_prepare_certified_updates() {
             return None;
         }
+        cache.scope_target_leases(
+            &mut reusable_styles,
+            document,
+            shared.inline_background_epoch,
+        );
         // Ordinary environment invalidation has already run. Certify every
         // ancestor again before staging; its fresh descendant flag alone must
         // never hide a pending hint, damage or animation-only traversal.
@@ -150,34 +156,39 @@ impl CertifiedBackgroundInput {
             let dangerous = unsafe { element.dangerous_style_element() };
             let data = element.style_data()?.element_data.borrow();
             let primary = data.styles.primary.as_ref()?;
-            // Validate every actual owner/base/fragment/IFC/Selection reference
-            // before consuming scratch. The complete current Stylo proof still
-            // runs for every target; a slot/address is never style authority.
+            // A warm slot carries owned handles, never style authority. Every
+            // current data/Selection/parent/PDB proof below remains fresh.
             let selection = data
                 .styles
                 .pseudos
                 .get(&style::selector_parser::PseudoElement::Selection)?;
             let mut reuse = None;
-            let layout = PreparedEmptyBackgroundLeaf::prepare_with_cached(
-                node,
-                primary,
-                selection,
-                |fragment| {
-                    let (bound, retired) = cache.take_bound_leaf(&mut reusable_styles, fragment)?;
-                    let proof = retired
-                        .map(|retired| {
-                            let same = retired.style.matches_primary_selection(
-                                primary,
-                                selection,
-                                shared.inline_background_epoch,
-                            );
-                            reuse = Some(retired.style);
-                            same.then_some(retired.proof)
-                        })
-                        .flatten();
-                    Some((bound, proof))
-                },
-            )?;
+            let warm = cache
+                .take_target_leaf(&mut reusable_styles, node.opaque())
+                .and_then(|retired| {
+                    let BackgroundLeafReuse { style, layout } = retired;
+                    let same = style.matches_primary_selection(
+                        primary,
+                        selection,
+                        shared.inline_background_epoch,
+                    );
+                    reuse = Some(style);
+                    same.then(|| layout.revalidate_owned(primary, selection))
+                        .flatten()
+                });
+            let layout = match warm {
+                Some(layout) => layout,
+                None => PreparedEmptyBackgroundLeaf::prepare_with_cached(
+                    node,
+                    primary,
+                    selection,
+                    |fragment| {
+                        cache
+                            .bound_fragment(fragment)
+                            .map(|binding| (binding, None))
+                    },
+                )?,
+            };
             let binding = layout.binding()?;
             let parent_id = dangerous.traversal_parent()?.as_node().opaque();
             let parent = match parents.entry(parent_id) {
@@ -187,6 +198,7 @@ impl CertifiedBackgroundInput {
                 },
             };
             targets.push(BackgroundPreparationTarget {
+                target: node.opaque(),
                 element,
                 data,
                 layout,
@@ -243,6 +255,7 @@ impl CertifiedBackgroundInput {
         let mut changed_fragments = Vec::with_capacity(targets.len());
         for (target, style) in targets.into_iter().zip(styles) {
             let BackgroundPreparationTarget {
+                target,
                 element,
                 data,
                 layout,
@@ -263,6 +276,7 @@ impl CertifiedBackgroundInput {
             )?);
             changed_fragments.push(layout.fragment().clone());
             entries.push(PreparedEntry {
+                target,
                 element,
                 style,
                 layout,
@@ -283,6 +297,7 @@ impl CertifiedBackgroundInput {
 
 /// DOM/layout/cache-bearing state stays on the calling Layout thread.
 struct BackgroundPreparationTarget<'dom> {
+    target: OpaqueNode,
     element: ServoLayoutElement<'dom>,
     data: ElementDataRef<'dom>,
     layout: PreparedEmptyBackgroundLeaf,
@@ -316,6 +331,7 @@ fn prepare_captured_background_styles(
 }
 
 struct PreparedEntry<'dom> {
+    target: OpaqueNode,
     element: ServoLayoutElement<'dom>,
     style: PreparedBackgroundStyle,
     layout: PreparedEmptyBackgroundLeaf,
@@ -352,18 +368,16 @@ impl PreparedBackgroundBatch<'_> {
             reusable_styles,
             |reusable_styles| {
                 for entry in entries {
-                    let fragment = entry.layout.fragment().clone();
                     let reuse =
                         commit_background_style(&mut entry.element.element_data_mut(), entry.style);
-                    let proof = entry.layout.proof();
-                    entry
+                    let layout = entry
                         .layout
-                        .commit(reuse.new_primary(), reuse.selection().unwrap());
-                    reusable_styles.insert(
-                        &fragment,
+                        .commit_for_reuse(reuse.new_primary(), reuse.selection().unwrap());
+                    reusable_styles.insert_target(
+                        entry.target,
                         BackgroundLeafReuse {
                             style: reuse,
-                            proof,
+                            layout,
                         },
                     );
                     unsafe {

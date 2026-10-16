@@ -1,0 +1,123 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Warm owned background repair handles revoke on real DOM and CSSOM invalidation</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<body><script>
+'use strict';
+setup({explicit_done:true});
+const COUNT=128;
+const CSS_COLORS={red:'rgb(255, 0, 0)',green:'rgb(0, 128, 0)',blue:'rgb(0, 0, 255)'};
+async function fixture(t) {
+  const frame=document.createElement('iframe');
+  frame.width=400;frame.height=240;frame.style.border='0';
+  const loaded=new Promise(resolve=>frame.onload=resolve);
+  frame.srcdoc='<!doctype html><style>html,body{margin:0;overflow:hidden}</style><body>';
+  document.body.append(frame);t.add_cleanup(()=>frame.remove());await loaded;
+  const w=frame.contentWindow,d=w.document,u=w.ServoTestUtils,cells=[];
+  const fragment=d.createDocumentFragment();
+  for(let i=0;i<COUNT;i++) {
+    const cell=d.createElement('div');
+    cell.style.cssText=`position:${i%2?'fixed':'absolute'};left:${2+(i%16)*10}px;top:${2+Math.floor(i/16)*10}px;width:6px;height:6px;background-color:red`;
+    cell.className='lease-cell';cells.push(cell);fragment.append(cell);
+  }
+  d.body.append(fragment);
+  ServoTestUtils.forceLayout();u.forceLayout();
+  const f={frame,w,d,u,cells,trace:[]};
+  setColors(f,'green');ack(f,render(f,'setup green'),false);
+  setColors(f,'blue');ack(f,render(f,'setup blue'),true);
+  setColors(f,'red');ack(f,render(f,'setup red'),true);
+  current(f,'red');geometry(f);
+  return f;
+}
+function setColors(f,value) {
+  f.cells.forEach((cell,index)=>cell.style.backgroundColor=typeof value==='function'?value(index):value);
+}
+function render(f,label) {
+  const result=f.u.forceLayout();
+  f.trace.push({label,phases:Array.from(result.phases),ack:result.certifiedBackgroundColorCount,leaf:result.certifiedBackgroundCachedLeafCount,family:result.certifiedBackgroundCachedFamilyCount});
+  return result;
+}
+function detail(f,message) {return message+'; trace='+JSON.stringify(f.trace);}
+function ack(f,result,cached) {
+  assert_equals(result.certifiedBackgroundColorCount,COUNT,detail(f,'complete actual Painter ACK'));
+  assert_true(result.phases.includes('UpdatedBackgroundColors'),detail(f,'real update phase'));
+  assert_false(result.phases.includes('RanLayout'),detail(f,'accepted update preserves layout'));
+  assert_false(result.phases.includes('BuiltDisplayList'),detail(f,'accepted update preserves display list'));
+  if(cached) {
+    assert_equals(result.certifiedBackgroundCachedLeafCount,COUNT,detail(f,'every cached leaf'));
+    assert_equals(result.certifiedBackgroundCachedFamilyCount,COUNT,detail(f,'every cached family'));
+  }
+}
+function fallback(f,result,label) {
+  assert_equals(result.certifiedBackgroundColorCount,0,detail(f,label+': whole batch falls back'));
+  assert_equals(result.certifiedBackgroundCachedLeafCount,0,detail(f,label+': no leaf success'));
+  assert_equals(result.certifiedBackgroundCachedFamilyCount,0,detail(f,label+': no family success'));
+}
+function current(f,value) {
+  f.cells.forEach((cell,index)=> {
+    const color=typeof value==='function'?value(index):value;
+    assert_equals(f.w.getComputedStyle(cell).backgroundColor,CSS_COLORS[color],detail(f,'current complete style '+index));
+  });
+}
+function geometry(f,lastWidth=6) {
+  assert_equals(f.w.innerWidth,400);assert_equals(f.w.innerHeight,240);
+  f.cells.forEach((cell,index)=> {
+    const rect=cell.getBoundingClientRect();
+    assert_equals(rect.left,2+(index%16)*10,'left '+index);
+    assert_equals(rect.top,2+Math.floor(index/16)*10,'top '+index);
+    assert_equals(rect.width,index===COUNT-1?lastWidth:6,'width '+index);
+    assert_equals(rect.height,6,'height '+index);
+  });
+}
+function recover(f) {
+  setColors(f,'green');ack(f,render(f,'recovery seed'),false);current(f,'green');geometry(f);
+  for(const color of ['blue','red']) {
+    setColors(f,color);ack(f,render(f,'recovered warm '+color),true);current(f,color);geometry(f);
+  }
+}
+window.onload=()=> {
+  promise_test(async t=> {
+    const f=await fixture(t);
+    for(const color of ['green','blue','red']) {
+      setColors(f,color);ack(f,render(f,'warm same handles '+color),true);current(f,color);geometry(f);
+    }
+  },'Warm owned repair handles preserve real complete Painter ACKs, current styles and geometry');
+  promise_test(async t=> {
+    const f=await fixture(t),last=f.cells[COUNT-1];
+    last.textContent='x';setColors(f,'blue');
+    fallback(f,render(f,'text insertion'),'nonempty owner cannot use a warm empty-leaf lease');current(f,'blue');
+    assert_equals(last.textContent,'x');
+    last.textContent='';setColors(f,'red');
+    fallback(f,render(f,'text removal'),'tree repair revokes the previous population');current(f,'red');geometry(f);
+    recover(f);
+  },'Real text/tree mutation rejects the whole warm batch and removing the content permits recovery');
+  promise_test(async t=> {
+    const f=await fixture(t),sheet=f.d.createElement('style');
+    sheet.textContent='.lease-cell{outline:0px solid}';f.d.head.append(sheet);
+    setColors(f,'blue');fallback(f,render(f,'stylesheet insertion'),'stylesheet insertion');current(f,'blue');
+    sheet.sheet.insertRule('.lease-cell{height:7px!important}',1);
+    setColors(f,'red');fallback(f,render(f,'CSSOM insertRule'),'CSSOM change without a DOM text mutation');current(f,'red');
+    for(const cell of f.cells) assert_equals(cell.getBoundingClientRect().height,7,'current CSSOM geometry');
+    sheet.remove();setColors(f,'blue');fallback(f,render(f,'stylesheet removal'),'stylesheet removal');current(f,'blue');geometry(f);
+    // An environment change clears the old baseline. The first distinct color
+    // must pass ordinary eager cascade before a later certified batch can use it.
+    setColors(f,'red');
+    const baselineSeed=render(f,'ordinary post-CSSOM baseline seed');
+    fallback(f,baselineSeed,'first post-CSSOM color establishes the current baseline');
+    assert_true(baselineSeed.phases.includes('UpdatedBackgroundColors'),detail(f,'real ordinary Painter color update'));
+    current(f,'red');geometry(f);
+    recover(f);
+  },'CSSOM and stylesheet environment changes revoke warm handles before repair and allow ordinary recovery');
+  promise_test(async t=> {
+    const f=await fixture(t),cell=f.cells[COUNT-1],host=f.d.createElement('div');
+    f.d.body.append(host);const shadow=host.attachShadow({mode:'open'});shadow.append(cell);
+    setColors(f,'blue');fallback(f,render(f,'move through shadow root'),'shadow tree mutation');current(f,'blue');
+    assert_equals(cell.getRootNode(),shadow,'the target actually moved into a shadow tree');
+    f.d.body.append(cell);host.remove();setColors(f,'red');
+    fallback(f,render(f,'return to light tree'),'owner/chain invalidation on return');current(f,'red');geometry(f);
+    recover(f);
+  },'A real shadow-tree move cannot preserve an old owner-chain lease and light-tree recovery uses fresh proofs');
+  done();
+};
+</script>

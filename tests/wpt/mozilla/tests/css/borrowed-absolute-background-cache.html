@@ -6,19 +6,20 @@
 <body><script>
 'use strict';
 setup({explicit_done:true});
-async function fixture(t) {
+async function fixture(t, referenceValue) {
   const frame=document.createElement('iframe');frame.width=400;frame.height=240;
   const loaded=new Promise(resolve=>frame.onload=resolve);
   frame.srcdoc='<!doctype html><style>html,body{margin:0}.cell{position:absolute;left:2px;top:2px;width:8px;height:8px}</style><div class="cell" style="background-color:red;color:black"></div>';
   document.body.append(frame);t.add_cleanup(()=>frame.remove());await loaded;
   const w=frame.contentWindow,d=w.document,u=w.ServoTestUtils,cell=d.querySelector('.cell');
+  const reference=referenceValue === undefined ? null : ordinary({d},referenceValue);
   ServoTestUtils.forceLayout();u.forceLayout();
   let warm;
   for(const value of ['green','blue','red']) {cell.style.backgroundColor=value;warm=u.forceLayout();}
   assert_equals(warm.certifiedBackgroundColorCount,1,'real painter ACK establishes the lease');
   assert_equals(warm.certifiedBackgroundCachedLeafCount,1,'actual cached leaf');
   assert_equals(warm.certifiedBackgroundCachedFamilyCount,1,'actual cached style family');
-  return {w,d,u,cell};
+  return {w,d,u,cell,reference};
 }
 function ordinary(f,value) {
   const el=f.d.createElement('div');el.style.backgroundColor=value;return el;
@@ -31,14 +32,14 @@ function ack(f) {
 }
 window.onload=()=>{
   promise_test(async t=>{
-    const f=await fixture(t),reference=ordinary(f,'blue');
+    const f=await fixture(t,'blue'),reference=f.reference;
     const attr=f.cell.getAttributeNode('style'),clone=attr.cloneNode(),previous=attr.value;
     const order=Array.from({length:f.cell.style.length},(_,i)=>f.cell.style.item(i));
     const count=f.u.compactBackgroundMutationCount(),parsed=f.u.backgroundParseAttemptCount();
     f.cell.style.backgroundColor='blue';
     assert_equals(f.u.compactBackgroundMutationCount(),count+1,'real compact mutation');
     assert_equals(f.u.backgroundParseAttemptCount(),parsed,'borrowed exact cache hit');
-    assert_equals(f.cell.style.backgroundColor,reference.style.backgroundColor);
+    assert_equals(f.cell.style.backgroundColor,reference.style.backgroundColor,'same authored inline background serialization');
     assert_equals(f.cell.getAttributeNode('style'),attr,'live Attr identity');
     assert_equals(attr.value,f.cell.style.cssText,'previously serialized Attr is invalidated');
     assert_equals(f.cell.getAttribute('style'),attr.value);
@@ -47,7 +48,7 @@ window.onload=()=>{
     const current=attr.value;f.cell.style.backgroundColor='blue';
     assert_equals(f.u.compactBackgroundMutationCount(),count+1,'same-value no-op');
     assert_equals(attr.value,current,'no-op serialization');
-    ack(f);assert_equals(f.w.getComputedStyle(f.cell).backgroundColor,reference.style.backgroundColor);
+    ack(f);assert_equals(f.w.getComputedStyle(f.cell).backgroundColor,'rgb(0, 0, 255)','computed background is the current canonical blue');
   },'Borrowed cache hit preserves Attr identity, authored serialization, order, no-op and painter ACK');
   promise_test(async t=>{
     const f=await fixture(t);

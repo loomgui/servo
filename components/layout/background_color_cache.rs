@@ -13,6 +13,7 @@ use layout_api::ReflowStatistics;
 use rustc_hash::FxHashMap;
 use servo_base::id::ColorBindingId;
 use style::data::BackgroundColorChangeWitness;
+use style::dom::OpaqueNode;
 use style::inline_background::BackgroundStyleReuse;
 use style::properties::ComputedValues;
 use webrender_api::{ColorF, PropertyBindingKey, PropertyValue};
@@ -35,12 +36,24 @@ pub(crate) struct BackgroundColorCache {
 }
 
 /// Non-authoritative, bounded by this display list's retained bindings. A slot
-/// retains one retired CV/Background plus its exact-current/family references.
-/// Clearing a warmed population synchronously drops O(population) references,
-/// including on a sparse fallback; no deferred cleanup or history is retained.
+/// retains one retired style and the owned handles discovered for that target.
+/// No DOM root, borrowed ElementData, or lock guard survives preparation.
+/// Invalidation synchronously drops the complete warmed population.
 pub(crate) struct BackgroundLeafReuse {
     pub(crate) style: BackgroundStyleReuse,
-    pub(crate) proof: crate::dom::EmptyBackgroundLeafProof,
+    pub(crate) layout: crate::dom::PreparedEmptyBackgroundLeaf,
+}
+
+/// Existing document/environment/list identities, not a new invalidation epoch.
+/// The complete pending-path certificate and clear-before-ordinary traversal are
+/// the owner-lifetime barrier. Ordinary certified style writes may advance the
+/// DOM mutation version without replacing a layout owner. A scope mismatch still
+/// retires the entire population before any target lease is read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BackgroundTargetLeaseStamp {
+    document: OpaqueNode,
+    epoch: Option<u64>,
+    generation: u64,
 }
 
 /// One live binding checked under the exclusive prepare guard, never GPU authority.
@@ -53,6 +66,7 @@ pub(crate) struct CertifiedBackgroundBinding {
 
 pub(crate) struct BackgroundStyleReuseStore<T = BackgroundLeafReuse> {
     generation: u64,
+    target_stamp: Option<BackgroundTargetLeaseStamp>,
     entries: FxHashMap<usize, Option<T>>,
     additional_slots: usize,
 }
@@ -61,6 +75,7 @@ impl<T> Default for BackgroundStyleReuseStore<T> {
     fn default() -> Self {
         Self {
             generation: 0,
+            target_stamp: None,
             entries: FxHashMap::default(),
             additional_slots: 0,
         }
@@ -70,6 +85,14 @@ impl<T> Default for BackgroundStyleReuseStore<T> {
 impl<T> BackgroundStyleReuseStore<T> {
     fn clear(&mut self) {
         self.entries.clear();
+        self.target_stamp = None;
+    }
+
+    fn select_target_stamp(&mut self, stamp: BackgroundTargetLeaseStamp) {
+        if self.target_stamp != Some(stamp) {
+            self.clear();
+            self.target_stamp = Some(stamp);
+        }
     }
 
     fn detach(&mut self, generation: u64) -> Self {
@@ -78,6 +101,7 @@ impl<T> BackgroundStyleReuseStore<T> {
         }
         Self {
             generation,
+            target_stamp: self.target_stamp.take(),
             entries: std::mem::take(&mut self.entries),
             additional_slots: 0,
         }
@@ -106,9 +130,8 @@ impl<T> BackgroundStyleReuseStore<T> {
         self.entries.reserve(self.additional_slots);
     }
 
-    pub(crate) fn insert(&mut self, fragment: &Arc<BoxFragment>, value: T) {
-        self.entries
-            .insert(Arc::as_ptr(fragment) as usize, Some(value));
+    pub(crate) fn insert_target(&mut self, target: OpaqueNode, value: T) {
+        self.entries.insert(target.0, Some(value));
     }
 }
 
@@ -148,12 +171,24 @@ impl BackgroundColorCache {
         self.reusable_styles.detach(self.generation)
     }
 
-    pub(crate) fn take_bound_leaf(
+    pub(crate) fn scope_target_leases(
         &self,
         prepared: &mut BackgroundStyleReuseStore,
+        document: OpaqueNode,
+        epoch: Option<u64>,
+    ) {
+        prepared.select_target_stamp(BackgroundTargetLeaseStamp {
+            document,
+            epoch,
+            generation: self.generation,
+        });
+    }
+
+    pub(crate) fn bound_fragment(
+        &self,
         fragment: &Arc<BoxFragment>,
-    ) -> Option<(CertifiedBackgroundBinding, Option<BackgroundLeafReuse>)> {
-        if prepared.generation != self.generation || !self.can_prepare_certified_updates() {
+    ) -> Option<CertifiedBackgroundBinding> {
+        if !self.can_prepare_certified_updates() {
             return None;
         }
         let identity = Arc::as_ptr(fragment) as usize;
@@ -161,13 +196,51 @@ impl BackgroundColorCache {
         if !Arc::ptr_eq(bound, fragment) {
             return None;
         }
+        Some(CertifiedBackgroundBinding {
+            generation: self.generation,
+            fragment: identity,
+            key: *key,
+        })
+    }
+
+    /// The caller has freshly obtained this target and its current ElementData.
+    /// Owned handles keep all saved addresses alive; the stamp is not sufficient
+    /// style authority, and the caller still revalidates every live style guard.
+    pub(crate) fn take_target_leaf(
+        &self,
+        prepared: &mut BackgroundStyleReuseStore,
+        target: OpaqueNode,
+    ) -> Option<BackgroundLeafReuse> {
+        if prepared.generation != self.generation
+            || prepared.target_stamp.is_none()
+            || !self.can_prepare_certified_updates()
+        {
+            return None;
+        }
+        let retired = prepared.take(target.0)?;
+        let binding = retired.layout.binding()?;
+        let current = self.bound_fragment(retired.layout.fragment())?;
+        if binding.generation != current.generation
+            || binding.fragment != current.fragment
+            || binding.key != current.key
+        {
+            return None;
+        }
+        Some(retired)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_bound_leaf(
+        &self,
+        prepared: &mut BackgroundStyleReuseStore,
+        fragment: &Arc<BoxFragment>,
+    ) -> Option<(CertifiedBackgroundBinding, Option<BackgroundLeafReuse>)> {
+        if prepared.generation != self.generation {
+            return None;
+        }
         Some((
-            CertifiedBackgroundBinding {
-                generation: self.generation,
-                fragment: identity,
-                key: *key,
-            },
-            prepared.take(identity),
+            self.bound_fragment(fragment)?,
+            prepared.take(Arc::as_ptr(fragment) as usize),
         ))
     }
 
@@ -214,7 +287,8 @@ impl BackgroundColorCache {
     /// Only after every style/leaf repair and changed-fragment cleanup. A
     /// generation/eligibility mismatch destroys scratch, never republishes it.
     pub(crate) fn publish_reusable_styles(&mut self, prepared: BackgroundStyleReuseStore) {
-        let eligible = self.can_prepare_certified_updates();
+        let eligible =
+            self.can_prepare_certified_updates() && prepared.entries.len() <= self.bindings.len();
         self.reusable_styles
             .publish(self.generation, eligible, prepared);
     }
@@ -1053,6 +1127,134 @@ mod reuse_tests {
         store.entries.insert(1, Some(Retired(dropped.clone())));
         drop(store); // Session teardown owns and retires its complete population.
         assert_eq!(dropped.get(), 20_004);
+    }
+
+    #[test]
+    fn warm_background_owned_lease_and_cache_remain_send_without_unsafe_traits() {
+        fn assert_send<T: Send>() {}
+        assert_send::<BackgroundColorCache>();
+        assert_send::<crate::dom::PreparedEmptyBackgroundLeaf>();
+    }
+
+    fn lease_stamp() -> BackgroundTargetLeaseStamp {
+        BackgroundTargetLeaseStamp {
+            document: OpaqueNode(91),
+            epoch: Some(3),
+            generation: 7,
+        }
+    }
+
+    #[test]
+    fn warm_background_target_scope_retires_on_document_environment_list_or_ordinary_clear() {
+        let stamp = lease_stamp();
+        for next in [
+            BackgroundTargetLeaseStamp {
+                document: OpaqueNode(92),
+                ..stamp
+            },
+            BackgroundTargetLeaseStamp {
+                epoch: Some(4),
+                ..stamp
+            },
+            BackgroundTargetLeaseStamp {
+                epoch: None,
+                ..stamp
+            },
+            BackgroundTargetLeaseStamp {
+                generation: 8,
+                ..stamp
+            },
+        ] {
+            let dropped = Rc::new(Cell::new(0));
+            let mut store = BackgroundStyleReuseStore::<Retired>::default();
+            store.generation = 7;
+            store.select_target_stamp(stamp);
+            for target in 0..128 {
+                store.entries.insert(target, Some(Retired(dropped.clone())));
+            }
+            store.select_target_stamp(stamp);
+            assert_eq!(
+                dropped.get(),
+                0,
+                "same stamp must retain the owned population"
+            );
+            store.select_target_stamp(next);
+            assert_eq!(
+                dropped.get(),
+                128,
+                "mismatch must synchronously retire every lease"
+            );
+            assert!(store.entries.is_empty());
+            assert_eq!(store.target_stamp, Some(next));
+            store.clear();
+            assert!(store.target_stamp.is_none());
+        }
+
+        // The unconditional ordinary-traversal barrier retires owners even when
+        // the document/environment/list scope itself did not change. Attribute
+        // mutation versions are deliberately not part of this lifetime scope.
+        let dropped = Rc::new(Cell::new(0));
+        let mut store = BackgroundStyleReuseStore::<Retired>::default();
+        store.generation = stamp.generation;
+        store.select_target_stamp(stamp);
+        for target in 0..128 {
+            store.insert_target(OpaqueNode(target), Retired(dropped.clone()));
+        }
+        store.clear();
+        assert_eq!(dropped.get(), 128);
+        assert!(store.target_stamp.is_none());
+        store.select_target_stamp(stamp);
+        assert!(
+            store.entries.is_empty(),
+            "the same scope cannot revive retired owners"
+        );
+    }
+
+    #[test]
+    fn warm_background_target_sparse_take_and_reinsert_preserve_bounded_storage() {
+        let dropped = Rc::new(Cell::new(0));
+        let mut store = BackgroundStyleReuseStore::<Retired>::default();
+        store.generation = 7;
+        store.select_target_stamp(lease_stamp());
+        for target in 0..128 {
+            store.insert_target(OpaqueNode(target), Retired(dropped.clone()));
+        }
+        let capacity = store.entries.capacity();
+        for _ in 0..3 {
+            let mut detached = store.detach(7);
+            assert!(store.target_stamp.is_none());
+            detached.select_target_stamp(lease_stamp());
+            for target in (0..128).step_by(17) {
+                let value = detached.take(target).unwrap();
+                detached.insert_target(OpaqueNode(target), value);
+            }
+            assert_eq!(detached.additional_slots, 0);
+            detached.reserve_for_commit();
+            assert_eq!(detached.entries.len(), 128);
+            assert_eq!(detached.entries.capacity(), capacity);
+            store.publish(7, true, detached);
+        }
+        assert_eq!(dropped.get(), 0);
+        store.clear();
+        assert_eq!(dropped.get(), 128);
+    }
+
+    #[test]
+    fn warm_background_target_detached_unwind_retires_and_never_republishes() {
+        let dropped = Rc::new(Cell::new(0));
+        let mut store = BackgroundStyleReuseStore::<Retired>::default();
+        store.generation = 7;
+        store.select_target_stamp(lease_stamp());
+        store.insert_target(OpaqueNode(1), Retired(dropped.clone()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut detached = store.detach(7);
+            let _taken = detached.take(1).unwrap();
+            panic!("simulated preparation unwind");
+        }));
+        assert!(result.is_err());
+        assert!(store.entries.is_empty());
+        assert!(store.target_stamp.is_none());
+        assert_eq!(dropped.get(), 1);
     }
 
     fn fragment() -> Arc<BoxFragment> {

@@ -161,9 +161,9 @@ pub(crate) struct PreparedEmptyBackgroundLeaf {
     proof: EmptyBackgroundLeafProof,
 }
 
-/// Plain shape token carried in the existing per-binding reuse slot. Generation
-/// and exact current style/Selection are checked before this token is considered.
-/// No node or owner allocation is kept alive by these integer identities.
+/// Plain shape token inside an owned repair handle. The token alone confers no
+/// authority: store scope and exact current owner/style/Selection remain checked.
+/// The containing owned handle, not these integers, keeps allocations alive.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EmptyBackgroundLeafProof {
     owner: (u8, usize),
@@ -193,6 +193,22 @@ impl EmptyBackgroundOwner {
             Self::Block(value) => (0, &**value as *const _ as usize),
             Self::Positioned(value) => (1, &**value as *const _ as usize),
             Self::Atomic(value) => (2, &**value as *const _ as usize),
+        }
+    }
+
+    fn matches_live_base(
+        &self,
+        proof: EmptyBackgroundLeafProof,
+        primary: &ServoArc<ComputedValues>,
+    ) -> bool {
+        let matches = |base: &LayoutBoxBase| {
+            base.base_fragment_info.flags.bits() == proof.base_flags.bits()
+                && ServoArc::ptr_eq(&base.style, primary)
+        };
+        match self {
+            Self::Block(block) => block.borrow().with_base(matches),
+            Self::Positioned(positioned) => matches(&positioned.borrow().context.base),
+            Self::Atomic(atomic) => matches(&atomic.borrow().base),
         }
     }
 
@@ -388,6 +404,39 @@ impl PreparedEmptyBackgroundLeaf {
         })
     }
 
+    /// Reuse only under the document/tree/environment stamp checked by the
+    /// detached store. No DOM or layout-data discovery occurs on this path.
+    /// Fresh current owner/base/fragment/inline primary and Selection checks
+    /// remain mandatory; the unchanged Stylo capture validates the DOM and PDB.
+    pub(crate) fn revalidate_owned(
+        mut self,
+        primary: &ServoArc<ComputedValues>,
+        selection: &ServoArc<ComputedValues>,
+    ) -> Option<Self> {
+        if self.owner.identity() != self.proof.owner
+            || Arc::as_ptr(&self.fragment) as usize != self.proof.fragment
+            || !self.owner.matches_live_base(self.proof, primary)
+            || !self.fragment.children.is_empty()
+            || self.fragment.base.flags.intersects(
+                FragmentFlags::IS_ROOT_ELEMENT
+                    | FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT,
+            )
+            || self.fragment.base.status() != FragmentStatus::Clean
+            || !ServoArc::ptr_eq(&self.fragment.style(), primary)
+        {
+            return None;
+        }
+        if let Some(styles) = &self.inline_styles {
+            if !ServoArc::ptr_eq(&styles.style.borrow(), primary)
+                || !ServoArc::ptr_eq(&styles.selected.borrow(), selection)
+            {
+                return None;
+            }
+        }
+        self.used_cached_proof = true;
+        Some(self)
+    }
+
     pub(crate) fn binding(&self) -> Option<CertifiedBackgroundBinding> {
         self.binding
     }
@@ -396,6 +445,7 @@ impl PreparedEmptyBackgroundLeaf {
         self.used_cached_proof
     }
 
+    #[cfg(test)]
     pub(crate) fn proof(&self) -> EmptyBackgroundLeafProof {
         self.proof
     }
@@ -409,14 +459,24 @@ impl PreparedEmptyBackgroundLeaf {
     pub(crate) fn commit(
         self,
         primary: &ServoArc<ComputedValues>,
-        _selection: &ServoArc<ComputedValues>,
+        selection: &ServoArc<ComputedValues>,
     ) {
+        drop(self.commit_for_reuse(primary, selection));
+    }
+
+    /// Move these same owned handles into scratch only after positive ACK.
+    pub(crate) fn commit_for_reuse(
+        self,
+        primary: &ServoArc<ComputedValues>,
+        _selection: &ServoArc<ComputedValues>,
+    ) -> Self {
         self.owner.repair(primary);
-        if let Some(styles) = self.inline_styles {
+        if let Some(styles) = &self.inline_styles {
             *styles.style.borrow_mut() = primary.clone();
             // Exact Selection identity was validated during preparation. Keep
             // that unchanged reference in place instead of retiring/recloning it.
         }
+        self
     }
 }
 
@@ -1452,6 +1512,113 @@ mod certified_background_tests {
             selected,
             &mut |_| binding.map(|binding| (binding, None)),
         )
+    }
+
+    #[test]
+    fn warm_background_owned_leaf_rechecks_live_base_fragment_primary_and_selection() {
+        std::thread::spawn(|| {
+            use servo_base::id::{PipelineNamespace, PipelineNamespaceId};
+            PipelineNamespace::install(PipelineNamespaceId(10108));
+            let old = style(Color::BLACK);
+            let selected = style(Color::BLACK);
+            let other = style(Color::BLACK);
+            for failure in 0..6 {
+                let (block, fragment) = fixed_leaf(&old, &selected);
+                let prepared = prepare_fixed_leaf(&block, &old, &selected, None).unwrap();
+                match failure {
+                    1 => block.borrow_mut().with_base_mut(|base| {
+                        base.base_fragment_info
+                            .flags
+                            .insert(FragmentFlags::IS_ROOT_ELEMENT);
+                    }),
+                    2 => block
+                        .borrow_mut()
+                        .with_base_mut(|base| base.style = other.clone()),
+                    3 => fragment.base.set_status(FragmentStatus::StyleChanged),
+                    4 => {
+                        *prepared.inline_styles.as_ref().unwrap().style.borrow_mut() = other.clone()
+                    },
+                    5 => {
+                        *prepared
+                            .inline_styles
+                            .as_ref()
+                            .unwrap()
+                            .selected
+                            .borrow_mut() = other.clone()
+                    },
+                    _ => {},
+                }
+                let result = prepared.revalidate_owned(&old, &selected);
+                assert_eq!(result.is_some(), failure == 0, "live guard case {failure}");
+                if let Some(result) = result {
+                    assert!(result.used_cached_proof());
+                    // Dropping the caller's owner reference cannot dangle the lease.
+                    drop(block);
+                    assert!(result.revalidate_owned(&old, &selected).is_some());
+                }
+            }
+            let (block, fragment) = fixed_leaf(&old, &selected);
+            let prepared = prepare_fixed_leaf(&block, &old, &selected, None).unwrap();
+            Fragment::Box(fragment.clone()).repair_style(&other);
+            fragment.base.set_status(FragmentStatus::Clean);
+            assert!(prepared.revalidate_owned(&old, &selected).is_none());
+            let prepared = prepare_fixed_leaf(&block, &old, &selected, None);
+            assert!(
+                prepared.is_none(),
+                "cold proof also rejects mismatching fragment primary"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn warm_background_owned_leaf_moves_only_after_positive_ack_and_revalidates_new_style() {
+        std::thread::spawn(|| {
+            use servo_base::id::{PipelineNamespace, PipelineNamespaceId};
+            PipelineNamespace::install(PipelineNamespaceId(10109));
+            use crate::background_color_cache::BackgroundColorCache;
+            let old = style(Color::BLACK);
+            let new = style(Color::WHITE);
+            let selected = style(Color::BLACK);
+            for accepted in [false, true] {
+                let (block, fragment) = fixed_leaf(&old, &selected);
+                let mut cache = BackgroundColorCache::default();
+                cache.begin_display_list();
+                cache.bind(&fragment);
+                let binding = cache.bound_fragment(&fragment).unwrap();
+                let prepared = prepare_fixed_leaf(&block, &old, &selected, Some(binding)).unwrap();
+                let color = cache
+                    .stage_bound_color(binding, &fragment, &old, &new)
+                    .unwrap();
+                let updates = cache
+                    .finish_certified_updates(vec![color], vec![fragment.clone()])
+                    .unwrap();
+                let mut published = None;
+                let mut statistics = layout_api::ReflowStatistics::default();
+                assert_eq!(
+                    updates.submit_with_reuse(
+                        &mut statistics,
+                        |_, _| accepted,
+                        None,
+                        |scratch| *scratch = Some(prepared.commit_for_reuse(&new, &selected)),
+                        |scratch| published = scratch,
+                    ),
+                    accepted
+                );
+                assert_eq!(published.is_some(), accepted);
+                assert!(ServoArc::ptr_eq(
+                    &fragment.style(),
+                    if accepted { &new } else { &old }
+                ));
+                assert_eq!(fragment.base.status(), FragmentStatus::Clean);
+                if let Some(lease) = published {
+                    assert!(lease.revalidate_owned(&new, &selected).is_some());
+                }
+            }
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

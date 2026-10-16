@@ -1481,6 +1481,7 @@ impl LayoutThread {
                         &shared,
                         &mut self.background_colors.lock(),
                         rayon_pool.as_ref(),
+                        document.as_node().opaque(),
                     );
                     style::inline_background::PreparedBackgroundStyle::layout_attribution_mark(
                         "prepare_end",
