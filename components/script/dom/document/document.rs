@@ -505,6 +505,11 @@ pub(crate) struct Document {
     /// Debt survives request draining until Layout completes; None snapshots alone
     /// never represent deliberately omitted attribute history.
     background_snapshot_debt: Cell<bool>,
+    #[cfg(feature = "testbinding")]
+    #[no_trace]
+    #[ignore_malloc_size_of = "One fixed-size observation for test bindings only"]
+    automatic_rendering_observation:
+        Cell<Option<crate::dom::servotestutils::AutomaticRenderingObservation>>,
     #[no_trace]
     #[ignore_malloc_size_of = "Bounded to sixteen short, independent declarations"]
     absolute_background_cache: DomRefCell<
@@ -3336,6 +3341,34 @@ impl Document {
         (phases, statistics)
     }
 
+    /// Called only by ScriptThread after its real automatic update, never by
+    /// forceLayout or a layout query. This is observation, not frame authority.
+    #[cfg(feature = "testbinding")]
+    pub(crate) fn record_automatic_rendering_observation(
+        &self,
+        phases: ReflowPhasesRun,
+        statistics: &ReflowStatistics,
+    ) {
+        if pref!(dom_servo_helpers_enabled) {
+            if let Some(observation) =
+                crate::dom::servotestutils::AutomaticRenderingObservation::next(
+                    self.automatic_rendering_observation.get(),
+                    phases,
+                    statistics,
+                )
+            {
+                self.automatic_rendering_observation.set(Some(observation));
+            }
+        }
+    }
+
+    #[cfg(feature = "testbinding")]
+    pub(crate) fn automatic_rendering_observation(
+        &self,
+    ) -> Option<crate::dom::servotestutils::AutomaticRenderingObservation> {
+        self.automatic_rendering_observation.get()
+    }
+
     pub(crate) fn handle_no_longer_waiting_on_asynchronous_image_updates(&self) {
         self.waiting_on_canvas_image_updates.set(false);
     }
@@ -4123,6 +4156,8 @@ impl Document {
             pending_restyles: DomRefCell::new(FxHashMap::default()),
             background_snapshot_lease: Cell::new(None),
             background_snapshot_debt: Cell::new(false),
+            #[cfg(feature = "testbinding")]
+            automatic_rendering_observation: Cell::new(None),
             absolute_background_cache: DomRefCell::new(Vec::new()),
             needs_restyle: Cell::new(RestyleReason::DOMChanged),
             origin: DomRefCell::new(origin),
@@ -5122,6 +5157,53 @@ impl Document {
             }
         }
         Some(ancestors)
+    }
+
+    /// Fresh internal focusability proof, never a substitute for public style
+    /// queries or the later retained transaction. No pending entry is drained.
+    pub(crate) fn background_style_for_focus_fixup(
+        &self,
+        focused: &Element,
+        no_gc: &NoGC,
+    ) -> Option<servo_arc::Arc<style::properties::ComputedValues>> {
+        let focused_node = focused.upcast::<Node>();
+        if !self.is_fully_active()
+            || !focused_node.is_connected()
+            || !std::ptr::eq(focused_node.owner_doc_unrooted(no_gc).as_ptr(), self)
+            || self.restyle_reason(no_gc) != RestyleReason::PendingRestyles
+            || self.stylesheets_changed_since_last_reflow()
+            || self.shadow_roots_styles_changed.get()
+        {
+            return None;
+        }
+        self.ensure_safe_to_run_script_or_layout();
+        let ancestors = self.certify_fresh_background_restyle_paths(no_gc)?;
+        let snapshot_lease = self.background_style_snapshot_lease(no_gc);
+        if self.background_style_has_omissions() && snapshot_lease.is_none() {
+            return None;
+        }
+        let pending = self.pending_restyles.borrow();
+        let pending_restyles = pending
+            .iter()
+            .map(|(element, pending)| {
+                (
+                    element.upcast::<Node>().to_trusted_node_address(),
+                    &pending.0,
+                )
+            })
+            .collect();
+        self.window.layout().background_style_for_focus_fixup(
+            layout_api::BackgroundFocusStyleRequest {
+                document: self.upcast::<Node>().to_trusted_node_address(),
+                focused: focused_node.to_trusted_node_address(),
+                pending_restyles,
+                ancestors,
+                snapshot_lease,
+                viewport_details: self.window.viewport_details(),
+                animations: self.animation_manager().sets(),
+                animation_timeline_value: self.current_animation_timeline_value(),
+            },
+        )
     }
 
     pub(crate) fn drain_pending_restyles(

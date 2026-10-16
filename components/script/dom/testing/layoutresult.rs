@@ -16,6 +16,7 @@ use crate::dom::globalscope::GlobalScope;
 pub(crate) struct LayoutResult {
     reflector_: Reflector,
     phases: Vec<DOMString>,
+    sequence: u64,
     inline_background_color_recascade_count: u32,
     certified_background_color_count: u32,
     certified_background_cached_leaf_count: u32,
@@ -28,6 +29,7 @@ pub(crate) struct LayoutResult {
 impl LayoutResult {
     pub(crate) fn new_inherited(
         phases: Vec<DOMString>,
+        sequence: u64,
         inline_background_color_recascade_count: u32,
         certified_background_color_count: u32,
         certified_background_cached_leaf_count: u32,
@@ -39,6 +41,7 @@ impl LayoutResult {
         Self {
             reflector_: Reflector::new(),
             phases,
+            sequence,
             inline_background_color_recascade_count,
             certified_background_color_count,
             certified_background_cached_leaf_count,
@@ -53,6 +56,7 @@ impl LayoutResult {
         cx: &mut JSContext,
         global: &GlobalScope,
         phases: Vec<DOMString>,
+        sequence: u64,
         inline_background_color_recascade_count: u32,
         certified_background_color_count: u32,
         certified_background_cached_leaf_count: u32,
@@ -65,6 +69,7 @@ impl LayoutResult {
             cx,
             Box::new(Self::new_inherited(
                 phases,
+                sequence,
                 inline_background_color_recascade_count,
                 certified_background_color_count,
                 certified_background_cached_leaf_count,
@@ -81,6 +86,10 @@ impl LayoutResult {
 impl LayoutResultMethods<crate::DomTypeHolder> for LayoutResult {
     fn Phases(&self, cx: &mut JSContext, return_value: MutableHandleValue) {
         to_frozen_array(cx, &self.phases, return_value);
+    }
+
+    fn ObservationSequence(&self) -> u64 {
+        self.sequence
     }
 
     fn InlineBackgroundColorRecascadeCount(&self) -> u32 {

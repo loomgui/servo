@@ -1255,7 +1255,12 @@ impl ScriptThread {
 
             // > Step 22: For each doc of docs, update the rendering or user interface of
             // > doc and its node navigable to reflect the current state.
-            if document.update_the_rendering(cx).0.needs_frame() {
+            let (phases, statistics) = document.update_the_rendering(cx);
+            #[cfg(feature = "testbinding")]
+            document.record_automatic_rendering_observation(phases, &statistics);
+            #[cfg(not(feature = "testbinding"))]
+            let _ = statistics;
+            if phases.needs_frame() {
                 painters_generating_frames.insert(document.webview_id().into());
             }
 

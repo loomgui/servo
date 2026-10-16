@@ -305,6 +305,45 @@ impl Layout for LayoutThread {
         true
     }
 
+    fn background_style_for_focus_fixup(
+        &self,
+        request: layout_api::BackgroundFocusStyleRequest<'_>,
+    ) -> Option<servo_arc::Arc<style::properties::ComputedValues>> {
+        with_layout_state(|| {
+            let device = self.stylist.device();
+            if self.device_has_changed
+                || !self.have_added_user_agent_stylesheets
+                || self.stylist.stylesheets_have_changed()
+                || self.need_new_display_list.get()
+                || self.need_new_stacking_context_tree.get()
+                || device.viewport_size() != request.viewport_details.size
+                || device.device_size() != request.viewport_details.device_size.cast_unit()
+                || device.device_pixel_ratio()
+                    != Scale::new(request.viewport_details.hidpi_scale_factor.get())
+                || !request.animations.sets.read().is_empty()
+            {
+                return None;
+            }
+            let document_node = unsafe { ServoLayoutNode::new(&request.document) };
+            let document = unsafe { document_node.dangerous_style_node() }.as_document()?;
+            let shared_locks = document.shared_style_locks();
+            let guards = StylesheetGuards {
+                author: &shared_locks.author.read(),
+                ua_or_user: &shared_locks.ua_or_user.read(),
+            };
+            let snapshots = SnapshotMap::new();
+            let mut shared = self.build_shared_style_context(
+                guards,
+                &snapshots,
+                request.animation_timeline_value,
+                &request.animations,
+                TraversalFlags::empty(),
+            );
+            shared.inline_background_epoch = self.inline_background_epoch;
+            crate::focus_style::validate(request, &shared)
+        })
+    }
+
     #[servo_tracing::instrument(skip_all)]
     fn add_stylesheet(
         &mut self,
@@ -917,6 +956,7 @@ impl LayoutThread {
             traversal_flags,
             snapshot_map,
             inline_background_epoch: None,
+            inline_background_record_epoch: None,
             inline_background_count: None,
         }
     }
@@ -1559,6 +1599,14 @@ impl LayoutThread {
                 false => TraversalFlags::empty(),
             },
         );
+        // A real ordinary query may record only its freshly completed styles.
+        // The separate epoch cannot enable a recascade or a paint transaction.
+        if stable_environment
+            && no_active_effects
+            && matches!(reflow_request.reflow_goal, ReflowGoal::LayoutQuery(_))
+        {
+            style_context.inline_background_record_epoch = self.inline_background_epoch;
+        }
         // Query contexts deliberately keep None. Effects are conservatively
         // excluded for the entire document, without per-element map locks.
         if stable_environment

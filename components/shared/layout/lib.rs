@@ -325,6 +325,14 @@ pub trait Layout {
     /// Removes an image from the Layout image resolver cache.
     fn remove_cached_image(&mut self, image_url: &ServoUrl);
 
+    /// Pure internal focus-fixup proof. Returns the actual current focused style
+    /// only if every pending target changes background color alone. This never
+    /// consumes restyles, updates styles, detaches paint caches or submits paint.
+    fn background_style_for_focus_fixup(
+        &self,
+        request: BackgroundFocusStyleRequest<'_>,
+    ) -> Option<ServoArc<ComputedValues>>;
+
     /// Requests a reflow.
     fn reflow(&mut self, reflow_request: ReflowRequest) -> Option<ReflowResult>;
 
@@ -717,6 +725,19 @@ pub struct ReflowStatistics {
     pub nodes_updated_bounds: u32,
     /// A count of the number of accessibility nodes actually serialized to the TreeUpdate.
     pub nodes_in_tree_update: u32,
+}
+
+/// Borrowed, non-consuming inputs for one synchronous focusability proof.
+/// The normal reflow continues to own all mutation and paint authority.
+pub struct BackgroundFocusStyleRequest<'a> {
+    pub document: TrustedNodeAddress,
+    pub focused: TrustedNodeAddress,
+    pub pending_restyles: Vec<(TrustedNodeAddress, &'a PendingRestyle)>,
+    pub ancestors: Vec<TrustedNodeAddress>,
+    pub snapshot_lease: Option<u64>,
+    pub viewport_details: ViewportDetails,
+    pub animations: DocumentAnimationSet,
+    pub animation_timeline_value: f64,
 }
 
 /// Information needed for a script-initiated reflow that requires a restyle

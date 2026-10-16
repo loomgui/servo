@@ -1,0 +1,224 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Focused automatic rendering preserves certified background ACKs and eager focus semantics</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<body><script>
+'use strict';
+setup({explicit_done:true});
+const RED='rgb(255, 0, 0)', BLUE='rgb(0, 0, 255)';
+const EXPECTED=2;
+
+async function fixture(t) {
+  const frame=document.createElement('iframe');
+  frame.width=400; frame.height=240; frame.style.border='0';
+  const loaded=new Promise(resolve=>frame.onload=resolve);
+  frame.srcdoc='<!doctype html><style>html,body{margin:0;overflow:hidden}#fixed{position:fixed;left:8vw;top:50vh;width:6vw;height:10vh}#pixel{position:absolute;left:2px;top:2px;width:8px;height:8px}#focus-host{position:absolute;left:80px;top:40px}#other{position:absolute;left:180px;top:40px;width:12px;height:12px}.never-rule-target{width:29px!important}</style><div id="fixed" style="background-color:red"></div><div id="pixel" style="background-color:red"></div><div id="focus-host"><input id="caret" type="text" value="focus"></div><div id="other"></div>';
+  document.body.append(frame); t.add_cleanup(()=>frame.remove()); await loaded;
+  const w=frame.contentWindow,d=w.document,u=w.ServoTestUtils;
+  assert_equals(typeof u.automaticRenderingObservation,'function','the observation-only test API is required; absence is not a behavioral regression baseline');
+  const f={frame,w,d,u,fixed:d.querySelector('#fixed'),pixel:d.querySelector('#pixel'),caret:d.querySelector('#caret'),focusHost:d.querySelector('#focus-host'),other:d.querySelector('#other'),focusEvents:0,blurEvents:0,trace:[]};
+  f.caret.addEventListener('focus',()=>f.focusEvents++);
+  f.caret.addEventListener('blur',()=>f.blurEvents++);
+  // Setup only: establish the real embedding, input UA shadow/layout, and native
+  // cached bindings. No tested operation below calls forceLayout().
+  ServoTestUtils.forceLayout(); u.forceLayout(); f.caret.focus(); u.forceLayout();
+  let setupResult;
+  for(const value of ['green','blue','red']) {
+    setColors(f,value); setupResult=u.forceLayout();
+  }
+  assert_equals(setupResult.certifiedBackgroundColorCount,EXPECTED,'setup has a real ACK for both leaf kinds');
+  assert_equals(setupResult.certifiedBackgroundCachedLeafCount,EXPECTED,'setup establishes actual cached leaves');
+  assert_equals(setupResult.certifiedBackgroundCachedFamilyCount,EXPECTED,'setup establishes actual cached families');
+  assert_equals(d.activeElement,f.caret,'real input starts focused, including its UA shadow');
+  assert_equals(w.getComputedStyle(f.caret).visibility,'visible','ordinary current input query seeds the query baseline');
+  assert_not_equals(w.getComputedStyle(f.caret).display,'none');
+  checkColors(f,RED); checkGeometry(f);
+  return f;
+}
+function setColors(f,value) {
+  f.fixed.style.backgroundColor=value; f.pixel.style.backgroundColor=value;
+}
+function details(f,label) { return label+'; observations='+JSON.stringify(f.trace); }
+function sequence(observation) { return observation===null?-1:Number(observation.observationSequence); }
+
+// The first callback mutates before ScriptThread's focus fixup and automatic
+// Document.update_the_rendering. The nested callback belongs to the next
+// rendering opportunity. Its FIRST observation is passive and precedes every
+// activeElement/computed-style/geometry assertion. A continuation of the first
+// callback would be a microtask and would not establish that ordering.
+function automaticMutation(f,mutate,label) {
+  return new Promise((resolve,reject)=> {
+    f.w.requestAnimationFrame(()=> {
+      try {
+        const before=f.u.automaticRenderingObservation();
+        const previousSequence=sequence(before);
+        mutate();
+        f.w.requestAnimationFrame(()=> {
+          try {
+            const after=f.u.automaticRenderingObservation();
+            assert_not_equals(after,null,label+': a real automatic update was observed');
+            const copy={sequence:Number(after.observationSequence),phases:Array.from(after.phases),inline:after.inlineBackgroundColorRecascadeCount,ack:after.certifiedBackgroundColorCount,leaf:after.certifiedBackgroundCachedLeafCount,family:after.certifiedBackgroundCachedFamilyCount,rebuilt:after.rebuiltFragmentCount,restyled:after.restyleFragmentCount,onlyDescendants:after.onlyDescendantsChangedCount};
+            f.trace.push(copy);
+            assert_greater_than(copy.sequence,previousSequence,details(f,label+': automatic observation is fresh'));
+            resolve(copy);
+          } catch(error) { reject(error); }
+        });
+      } catch(error) { reject(error); }
+    });
+  });
+}
+function checkGeometry(f) {
+  const width=f.w.innerWidth,height=f.w.innerHeight;
+  assert_equals(width,400,'current child viewport width');
+  assert_equals(height,240,'current child viewport height');
+  const fixed=f.fixed.getBoundingClientRect(),pixel=f.pixel.getBoundingClientRect();
+  assert_equals(fixed.left,width*8/100,'fixed left follows current viewport');
+  assert_equals(fixed.top,height/2,'fixed top follows current viewport');
+  assert_equals(fixed.width,width*6/100,'fixed width follows current viewport');
+  assert_equals(fixed.height,height/10,'fixed height follows current viewport');
+  assert_equals(pixel.left,2); assert_equals(pixel.top,2);
+  assert_equals(pixel.width,8); assert_equals(pixel.height,8);
+}
+function checkColors(f,expected) {
+  assert_equals(f.w.getComputedStyle(f.fixed).backgroundColor,expected,'fixed leaf current color');
+  assert_equals(f.w.getComputedStyle(f.pixel).backgroundColor,expected,'pixel leaf current color');
+}
+function checkHot(f,o,label,cached) {
+  assert_equals(o.ack,EXPECTED,details(f,label+': actual painter ACK, not ordinary fallback'));
+  if(cached) {
+    assert_equals(o.leaf,EXPECTED,details(f,label+': complete cached-leaf path'));
+    assert_equals(o.family,EXPECTED,details(f,label+': complete cached-family path'));
+    assert_false(o.phases.includes('BuiltDisplayList'),details(f,label+': warm operation does not rebuild the display list'));
+  }
+  assert_true(o.phases.includes('UpdatedBackgroundColors'),details(f,label+': actual background-update phase'));
+  assert_equals(f.d.activeElement,f.caret,details(f,label+': input retains focus'));
+  assert_equals(f.focusEvents,1); assert_equals(f.blurEvents,0,'no spurious blur');
+}
+function checkFallback(f,o,label) {
+  assert_equals(o.ack,0,details(f,label+': unknown/non-color mutation cannot use a certified color batch'));
+  assert_equals(o.leaf,0,details(f,label+': no cached-leaf success is fabricated'));
+  assert_equals(o.family,0,details(f,label+': no cached-family success is fabricated'));
+}
+
+window.onload=()=> {
+  promise_test(async t=> {
+    const f=await fixture(t);
+    const seed=await automaticMutation(f,()=>setColors(f,'blue'),'automatic blue seed');
+    checkHot(f,seed,'automatic blue seed',false); checkColors(f,BLUE); checkGeometry(f);
+    for(const [value,expected] of [['red',RED],['blue',BLUE]]) {
+      const o=await automaticMutation(f,()=>setColors(f,value),'automatic warm '+value);
+      checkHot(f,o,'automatic warm '+value,true); checkColors(f,expected); checkGeometry(f);
+    }
+  },'A focused real input preserves automatic fixed-vw and pixel-leaf ACKs through an actual seed and two strict warm rounds');
+
+  promise_test(async t=> {
+    const f=await fixture(t);
+    setColors(f,'green');
+    // A genuinely pending-color ordinary query, not only a clean/no-work read,
+    // must return eager current values and record the completed query baseline.
+    // It does not count as an automatic painter ACK or consume a paint ledger.
+    checkColors(f,'rgb(0, 128, 0)');
+    assert_equals(f.w.getComputedStyle(f.caret).visibility,'visible');
+    assert_not_equals(f.w.getComputedStyle(f.caret).display,'none');
+    checkGeometry(f);
+    // The eager ordinary query leaves pending paint. Settle it through exactly
+    // one real automatic update before asking for a certified color seed.
+    // Its fresh passive observation precedes every current-style/geometry read;
+    // this settlement is not a certified seed and has no warm-count credit.
+    await automaticMutation(f,()=>{},'post-query automatic green paint settlement');
+    assert_equals(f.d.activeElement,f.caret,details(f,'green paint settlement retains focus'));
+    assert_equals(f.focusEvents,1); assert_equals(f.blurEvents,0);
+    checkColors(f,'rgb(0, 128, 0)'); checkGeometry(f);
+    const seed=await automaticMutation(f,()=>setColors(f,'blue'),'post-query automatic blue seed');
+    checkHot(f,seed,'post-query automatic blue seed',false); checkColors(f,BLUE); checkGeometry(f);
+    for(const [value,expected] of [['red',RED],['blue',BLUE]]) {
+      const o=await automaticMutation(f,()=>setColors(f,value),'post-query automatic warm '+value);
+      checkHot(f,o,'post-query automatic warm '+value,true); checkColors(f,expected); checkGeometry(f);
+    }
+  },'A completed ordinary pending-color query records a fresh focus baseline before actual automatic seed and warm ACKs');
+
+  const focusLoss=[
+    ['display:none',f=>{f.caret.style.display='none';},f=>assert_equals(f.w.getComputedStyle(f.caret).display,'none')],
+    ['hidden ancestor',f=>{f.focusHost.hidden=true;},f=>assert_equals(f.w.getComputedStyle(f.focusHost).display,'none')],
+    ['visibility:hidden ancestor',f=>{f.focusHost.style.visibility='hidden';},f=>assert_equals(f.w.getComputedStyle(f.caret).visibility,'hidden')],
+    ['disabled input',f=>{f.caret.disabled=true;},f=>assert_true(f.caret.disabled)],
+    ['detached input',f=>{f.caret.remove();},f=>assert_false(f.caret.isConnected)]
+  ];
+  for(const [name,change,check] of focusLoss) promise_test(async t=> {
+    const f=await fixture(t);
+    const o=await automaticMutation(f,()=>{setColors(f,'blue');change(f);},name);
+    checkFallback(f,o,name);
+    assert_equals(f.d.activeElement,f.d.body,details(f,name+': actual focus fixup reaches the viewport'));
+    check(f); checkColors(f,BLUE); checkGeometry(f);
+  },'Focused background proof falls back and preserves focus loss for '+name);
+
+  promise_test(async t=> {
+    const f=await fixture(t);
+    const o=await automaticMutation(f,()=>{setColors(f,'blue');f.focusHost.setAttribute('inert','');},'inert attribute');
+    checkFallback(f,o,'inert attribute');
+    assert_true(f.focusHost.hasAttribute('inert'),'native inert attribute exists');
+    assert_equals(f.focusHost.getAttribute('inert'),'','native inert attribute value');
+    // Existing Servo inert focus conformance is a separate baseline-qualified
+    // upstream probe. This case proves guard revocation, not new inert support.
+    checkColors(f,BLUE); checkGeometry(f);
+  },'An inert-ancestor attribute change revokes the background proof without claiming unsupported inert focus conformance');
+
+  promise_test(async t=> {
+    const f=await fixture(t);
+    const o=await automaticMutation(f,()=>{setColors(f,'blue');f.other.style.width='31px';},'unrelated width');
+    checkFallback(f,o,'unrelated width');
+    assert_equals(f.d.activeElement,f.caret);
+    assert_equals(f.w.getComputedStyle(f.other).width,'31px'); checkColors(f,BLUE); checkGeometry(f);
+  },'An unrelated non-color inline style change cannot reuse the focused background proof');
+
+  promise_test(async t=> {
+    const f=await fixture(t),sheet=f.d.styleSheets[0];
+    const rule=Array.from(sheet.cssRules).find(r=>r.selectorText==='.never-rule-target');
+    assert_not_equals(rule,undefined,'hold the exact existing rule before mutation');
+    const o=await automaticMutation(f,()=>{setColors(f,'blue');rule.selectorText='#other';},'held selector');
+    checkFallback(f,o,'held selector');
+    assert_equals(f.d.activeElement,f.caret);
+    assert_equals(f.w.getComputedStyle(f.other).width,'29px','current selector rematch remains eager'); checkColors(f,BLUE); checkGeometry(f);
+  },'A held selector change rematches current styles instead of reusing the focused background proof');
+
+  promise_test(async t=> {
+    const f=await fixture(t);
+    const o=await automaticMutation(f,()=> {
+      setColors(f,'blue'); f.other.style.width='31px';
+      // These queries deliberately happen before the automatic painter ACK.
+      // This is a semantic fallback check, separate from the no-query hot test.
+      checkColors(f,BLUE);
+      assert_equals(f.w.getComputedStyle(f.other).width,'31px','new non-color style is eager before ACK');
+      assert_equals(f.w.getComputedStyle(f.caret).visibility,'visible');
+      assert_not_equals(f.w.getComputedStyle(f.caret).display,'none');
+      checkGeometry(f);
+    },'eager before ACK');
+    checkFallback(f,o,'eager before ACK'); assert_equals(f.d.activeElement,f.caret);
+    checkColors(f,BLUE); checkGeometry(f);
+  },'Computed colors, unrelated non-color styles and current viewport geometry remain eager before the automatic ACK');
+  promise_test(async t=> {
+    const f=await fixture(t);
+    const hiddenParent=f.d.createElement('div'); hiddenParent.style.display='none';
+    const neverStyled=f.d.createElement('div'); hiddenParent.append(neverStyled);
+    f.d.body.append(hiddenParent);
+    // Setup only: consume DOMChanged while the hidden ancestor prevents the
+    // child from ever being styled. Never query the child before observation.
+    // The measured operation must contain only PendingRestyles, otherwise an
+    // earlier DOM-reason rejection would hide the missing-style-data guard.
+    f.u.forceLayout();
+    const o=await automaticMutation(f,()=> {
+      neverStyled.style.backgroundColor='blue'; setColors(f,'blue');
+    },'connected never-styled hidden target');
+    checkFallback(f,o,'connected never-styled hidden target');
+    assert_equals(f.d.activeElement,f.caret,'visible input retains focus after safe fallback');
+    assert_true(neverStyled.isConnected);
+    assert_equals(neverStyled.style.backgroundColor,'blue','current inline value survives the unsupported target');
+    assert_equals(f.w.getComputedStyle(neverStyled).backgroundColor,BLUE,'hidden descendant computed color is current');
+    assert_equals(f.w.getComputedStyle(hiddenParent).display,'none');
+    assert_equals(neverStyled.getClientRects().length,0,'hidden descendant does not acquire visible geometry');
+    checkColors(f,BLUE); checkGeometry(f);
+  },'A connected never-styled hidden pending target safely falls back without panic, stale CSS or loss of the visible input focus');
+  done();
+};
+</script>
