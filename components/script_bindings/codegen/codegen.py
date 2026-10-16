@@ -2651,6 +2651,40 @@ DOMClass {{
 }}"""
 
 
+def cached_same_object_slot(interface: IDLInterface, member: IDLAttribute) -> int | None:
+    """Native-instance slots only: immutable object identity, not mutable [Cached]."""
+    if not member.getExtendedAttribute("Cached"):
+        if member.slotIndices is not None:
+            raise TypeError("Only [Cached, SameObject] object attributes have slot support")
+        return None
+    if (not member.readonly or member.isStatic()
+            or not member.getExtendedAttribute("SameObject")
+            or member.type.nullable() or not member.type.isNonCallbackInterface()):
+        raise TypeError("[Cached] requires a nonnullable readonly [SameObject] interface attribute")
+    slot = 1 + member.slotIndices[interface.identifier.name]
+    # JSClass has at most 255 total slots, including native-private slot zero.
+    # This stricter class bound also fits the 10-bit JSJitInfo slot index.
+    if not 0 < slot < 255:
+        raise TypeError("Cached member requires JSClass reserved slot index in 1..254")
+    return slot
+
+
+def cached_same_object_slot_count(descriptor: Descriptor) -> int:
+    # Parser indices already include inherited members. Slot zero remains the
+    # existing native-private pointer. Proxy wrappers never use these slots.
+    last = 0
+    interface = descriptor.interface
+    while interface:
+        for member in interface.members:
+            if member.isAttr():
+                slot = cached_same_object_slot(interface, member)
+                if slot is not None:
+                    last = max(last, slot)
+        interface = interface.parent
+    if last and descriptor.isGlobal():
+        raise TypeError("Cached globals require a separate global-slot layout")
+    return last + 1
+
 class CGDOMJSClass(CGThing):
     """
     Generate a DOMJSClass for a given descriptor
@@ -2672,7 +2706,7 @@ class CGDOMJSClass(CGThing):
             "name": str_to_cstr_ptr(self.descriptor.interface.identifier.name),
             "resolveHook": "None",
             "mayResolveHook": "None",
-            "slots": "1",
+            "slots": str(cached_same_object_slot_count(self.descriptor)),
             "traceHook": f"{TRACE_HOOK_NAME}::<D>",
         }
         if self.descriptor.isGlobal():
@@ -4542,9 +4576,26 @@ class CGGetterCall(CGPerSignatureCall):
     getter.
     """
     def __init__(self, argsPre: list[str], returnType: IDLType | None, nativeMethodName: str, descriptor: Descriptor, attr: IDLAttribute) -> None:
+        self.cached_slot = cached_same_object_slot(descriptor.interface, attr)
         CGPerSignatureCall.__init__(self, returnType, argsPre, [],
                                     nativeMethodName, attr.isStatic(), descriptor,
                                     attr, getter=True)
+
+    def wrap_return_value(self) -> str:
+        if self.cached_slot is None:
+            return super().wrap_return_value()
+        # Native getter and ordinary compartment wrapping completed first. The
+        # rval is rooted by the call frame; SetReservedSlot supplies the GC barrier.
+        return wrapForType(
+            "MutableHandleValue::from_raw(args.rval())",
+            successCode=fill("""
+                if cacheable {
+                    let value = MutableHandleValue::from_raw(args.rval()).get();
+                    JS_SetReservedSlot(cache_obj.get(), ${slot}, &value);
+                }
+                return true;
+                """, slot=str(self.cached_slot)),
+        )
 
 
 class FakeArgument():
@@ -4818,11 +4869,30 @@ class CGSpecializedGetter(CGAbstractExternMethod):
         nativeName = CGSpecializedGetter.makeNativeName(self.descriptor,
                                                         self.attr)
 
+        slot = cached_same_object_slot(self.descriptor.interface, self.attr)
+        cache = ""
+        if slot is not None:
+            cache = fill("""
+                let cache_obj = HandleObject::from_raw(_obj);
+                // Never read native slots on DOM proxies or CCWs. A borrowed
+                // foreign-realm getter keeps the original conversion path too.
+                let cacheable = js::rust::is_dom_object(cache_obj.get())
+                    && js::rust::get_context_realm(cx.raw_cx_no_gc())
+                        == js::rust::get_object_realm(cache_obj.get());
+                if cacheable {
+                    let mut value = UndefinedValue();
+                    JS_GetReservedSlot(cache_obj.get(), ${slot}, &mut value);
+                    if !value.is_undefined() {
+                        MutableHandleValue::from_raw(args.rval()).set(value);
+                        return true;
+                    }
+                }
+                """, slot=str(slot))
         return CGWrapper(CGGetterCall([], self.attr.type, nativeName,
                                       self.descriptor, self.attr),
                          pre="let mut cx = JSContext::from_ptr(ptr::NonNull::new(cx).unwrap());\n"
                              "let cx = &mut cx;\n"
-                             f"let this = &*(this as *const {self.descriptor.concreteType});\n")
+                             f"let this = &*(this as *const {self.descriptor.concreteType});\n" + cache)
 
     @staticmethod
     def makeNativeName(descriptor: Descriptor, attr: IDLAttribute) -> str:
@@ -5076,18 +5146,10 @@ pub(crate) fn init_{infoName}<D: DomTypes>() {{
             movable = self.mayBeMovable() and getterinfal
             aliasSet = self.aliasSet()
 
-            isAlwaysInSlot = self.member.getExtendedAttribute("StoreInSlot") or False
-            if self.member.slotIndices is not None:
-                assert isAlwaysInSlot or self.member.getExtendedAttribute("Cached")
-                isLazilyCachedInSlot = not isAlwaysInSlot
-                # pyrefly: ignore  # unknown-name
-                slotIndex = memberReservedSlot(self.member)  # noqa: F821 FIXME: memberReservedSlot is not defined
-                # We'll statically assert that this is not too big in
-                # CGUpdateMemberSlotsMethod, in the case when
-                # isAlwaysInSlot is true.
-            else:
-                isLazilyCachedInSlot = False
-                slotIndex = "0"
+            cachedSlot = cached_same_object_slot(self.descriptor.interface, self.member)
+            isAlwaysInSlot = False
+            isLazilyCachedInSlot = cachedSlot is not None
+            slotIndex = str(cachedSlot) if cachedSlot is not None else "0"
 
             result = self.defineJitInfo(getterinfo, getter, "Getter",
                                         getterinfal, movable, aliasSet,

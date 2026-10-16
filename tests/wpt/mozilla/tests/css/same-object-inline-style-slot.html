@@ -1,0 +1,130 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>SameObject inline style cache preserves live CSSOM and receiver semantics</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<body><script>
+'use strict';
+setup({explicit_done:true});
+const SVG='http://www.w3.org/2000/svg';
+async function collect() {
+  assert_true('TestUtils' in window,'test harness must expose existing TestUtils');
+  assert_equals(typeof TestUtils.gc,'function','real GC helper must be available');
+  await TestUtils.gc();
+}
+function frame(t) {
+  const f=document.createElement('iframe');
+  const loaded=new Promise(resolve=>f.onload=()=>resolve(f));
+  f.srcdoc='<!doctype html><body>';
+  document.body.append(f);t.add_cleanup(()=>f.remove());return loaded;
+}
+window.onload=()=>{
+  test(()=>{
+    for(const el of [document.createElement('div'),document.createElement('span'),
+                    document.createElement('input'),document.createElementNS(SVG,'svg'),
+                    document.createElementNS(SVG,'rect')]) {
+      const style=el.style;assert_equals(el.style,style,'inherited SameObject identity');
+      el.setAttribute('style','color:red');assert_equals(el.style,style);
+      assert_equals(style.color,'red','setAttribute remains live');
+      el.removeAttribute('style');assert_equals(style.cssText,'','removal remains live');
+      el.style='width:7px';assert_equals(el.style,style,'PutForwards keeps identity');
+      assert_equals(style.width,'7px','PutForwards writes the current CSSOM object');
+    }
+  },'HTML and SVG inherited style slots retain identity across attribute changes and PutForwards');
+  test(()=>{
+    const el=document.createElement('div');el.style.color='red';const old=el.style;
+    document.body.append(el);el.remove();assert_equals(el.style,old);
+    const clone=el.cloneNode();assert_not_equals(clone.style,old,'clone has a fresh SameObject');
+    clone.style.color='blue';assert_equals(old.color,'red','clone mutation cannot alias source');
+    assert_equals(clone.style.color,'blue');
+  },'Removal retains live style identity and cloning creates a distinct independent cache');
+  promise_test(async t=>{
+    const f=await frame(t),el=f.contentDocument.createElement('div');
+    f.contentDocument.body.append(el);const held=el.style;held.color='red';
+    await collect();
+    const getter=Object.getOwnPropertyDescriptor(HTMLElement.prototype,'style').get;
+    assert_equals(getter.call(el),held,'foreign-realm receiver uses ordinary wrapping');
+    const foreignGetter=Object.getOwnPropertyDescriptor(f.contentWindow.HTMLElement.prototype,'style').get;
+    const local=document.createElement('div'),localStyle=local.style;
+    assert_equals(foreignGetter.call(local),localStyle,'foreign getter on local receiver returns the current wrapper');
+    document.adoptNode(el);document.body.append(el);t.add_cleanup(()=>el.remove());
+    assert_equals(el.style,held,'adoption preserves the original live object');
+    el.setAttribute('style','color:blue');assert_equals(held.color,'blue');
+    await collect();assert_equals(el.style,held,'adopted cache survives collection');
+    f.remove();await collect();assert_equals(el.style,held,'removed original realm does not dangle');
+  },'Same-origin cross-realm borrowed getter and adoption preserve live identity');
+  test(()=>{
+    const getter=Object.getOwnPropertyDescriptor(HTMLElement.prototype,'style').get;
+    assert_throws_js(TypeError,()=>getter.call({}),'plain-object brand check is preserved');
+    assert_throws_js(TypeError,()=>getter.call(null),'null receiver brand check is preserved');
+    for(const el of [document.createElement('div'),document.createElement('form')]) {
+      const held=el.style;held.color='red';
+      for(let i=0;i<128;i++)assert_equals(el.style,held,'native or DOM-proxy repeated identity');
+      assert_equals(getter.call(el),held,'borrowed getter handles the actual receiver');
+      assert_throws_js(TypeError,()=>getter.call(new Proxy(el,{})),'ordinary JS Proxy is not a branded DOM receiver');
+      const own={};Object.defineProperty(el,'style',{value:own,configurable:true});
+      assert_equals(el.style,own,'native and DOM-proxy own shadowing is honored');
+      delete el.style;assert_equals(el.style,held,'deleting shadowing reveals the live native getter');
+    }
+  },'DOM proxy, invalid receiver, and own-property shadowing retain normal property behavior');
+  test(t=>{
+    const calls=[];
+    class Styled extends HTMLElement {
+      static get observedAttributes(){return ['style'];}
+      attributeChangedCallback(name,oldValue,newValue){calls.push({name,oldValue,newValue});}
+    }
+    customElements.define('same-object-style-slot-element',Styled);
+    const el=document.createElement('same-object-style-slot-element'),held=el.style;
+    const observer=new MutationObserver(()=>{});observer.observe(el,{attributes:true,attributeOldValue:true});
+    t.add_cleanup(()=>observer.disconnect());
+    el.style='color:red';assert_equals(el.style,held);
+    assert_equals(calls.length,1,'CE reaction remains synchronous and singular');
+    assert_equals(calls[0].oldValue,null);assert_equals(calls[0].newValue,el.getAttribute('style'));
+    const records=observer.takeRecords();assert_equals(records.length,1);
+    assert_equals(records[0].oldValue,null,'observer preservation is unchanged');
+  },'Cached identity does not bypass PutForwards CE reactions or MutationObserver oldValue');
+  test(()=>{
+    const el=document.createElement('div'),held=el.style;
+    for(let i=0;i<10000;i++){const other=document.createElement('span');other.style.color='red';}
+    assert_equals(el.style,held);held.color='blue';assert_equals(el.style.color,'blue');
+  },'Identity remains stable under allocation pressure (not a forced or moving-GC proof)');
+  promise_test(async()=>{
+    const owners=[document.createElement('div'),document.createElementNS(SVG,'rect')];
+    const markers=owners.map(()=>({}));
+    for(let i=0;i<owners.length;i++) {
+      // No independent JS style reference survives this scope. The owner/cache
+      // and existing native tracing must retain this wrapper and its expando.
+      owners[i].style.sameObjectGcMarker=markers[i];owners[i].style.color='red';
+    }
+    await collect();
+    for(let i=0;i<owners.length;i++) {
+      const el=owners[i],held=el.style;
+      assert_equals(held.sameObjectGcMarker,markers[i],'owner-retained style wrapper survives real collection');
+      el.setAttribute('style','color:blue');assert_equals(held.color,'blue','post-GC attribute writes stay live');
+      el.style='width:9px';assert_equals(el.style,held,'post-GC PutForwards preserves identity');
+      assert_equals(held.width,'9px');el.removeAttribute('style');assert_equals(held.cssText,'');
+      delete held.sameObjectGcMarker;
+    }
+    await collect();
+    for(const el of owners)assert_equals(el.style.cssText,'','post-removal style stays live after another collection');
+  },'Real TestUtils GC retains HTML and SVG owner-cached style identity and live attribute behavior');
+  promise_test(async()=>{
+    function styleOnly(svg) {
+      const owner=svg?document.createElementNS(SVG,'rect'):document.createElement('div');
+      owner.style='color:red;width:11px';return owner.style;
+    }
+    const styles=[styleOnly(false),styleOnly(true)];
+    await collect();
+    for(const style of styles) {
+      assert_equals(style.color,'red','style-rooted owner remains readable after real collection');
+      assert_equals(style.width,'11px');style.color='blue';style.width='13px';
+    }
+    await collect();
+    for(const style of styles) {
+      assert_equals(style.color,'blue','style-only root preserves its live owner across collection');
+      assert_equals(style.width,'13px');style.cssText='';assert_equals(style.length,0);
+    }
+  },'Real TestUtils GC preserves detached owner liveness through HTML and SVG style-only roots');
+  done();
+};
+</script>

@@ -6,5 +6,5 @@
 
 [Exposed=Window]
 interface mixin ElementCSSInlineStyle {
-  [SameObject, PutForwards=cssText] readonly attribute CSSStyleDeclaration style;
+  [Cached, SameObject, PutForwards=cssText] readonly attribute CSSStyleDeclaration style;
 };
