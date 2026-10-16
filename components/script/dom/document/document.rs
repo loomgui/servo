@@ -4737,6 +4737,22 @@ impl Document {
         self.background_snapshot_lease.set(lease);
     }
 
+    /// Borrow an exact entry without copying a JS Latin1 string or its color.
+    /// Every admitted key is ASCII, so equal raw Latin1/UTF-8 bytes mean the same
+    /// Unicode string. Non-ASCII input cannot match an ASCII-only cache key.
+    pub(crate) fn borrowed_absolute_background(
+        &self,
+        value: &[u8],
+    ) -> Option<Ref<'_, style::properties::PropertyDeclaration>> {
+        Ref::filter_map(self.absolute_background_cache.borrow(), |cache| {
+            cache
+                .iter()
+                .find(|(text, quirks, _)| text.as_bytes() == value && *quirks == self.quirks_mode())
+                .map(|(_, _, declaration)| declaration)
+        })
+        .ok()
+    }
+
     pub(crate) fn cached_absolute_background(
         &self,
         value: &str,

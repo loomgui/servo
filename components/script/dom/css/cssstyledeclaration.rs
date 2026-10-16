@@ -414,53 +414,86 @@ impl CSSStyleDeclaration {
             return false;
         }
         let document = element.owner_document();
-        let mut declarations =
-            if let Some(declaration) = document.cached_absolute_background(&value.str()) {
-                SourcePropertyDeclaration::with_one(declaration)
-            } else {
-                let mut parsed = SourcePropertyDeclaration::default();
+        // Cache keys are ASCII-only. Borrowing the original encoded bytes avoids
+        // materializing a Rust string on hits, and borrowing the declaration lets
+        // the PDB retain its existing absolute-color allocation.
+        let cached_changed = {
+            let encoded = value.encoded_bytes();
+            document
+                .borrowed_absolute_background(encoded.bytes())
+                .map(|declaration| {
+                    let lock = document.style_shared_author_lock();
+                    let mut guard = lock.write();
+                    let pdb = block.write_with(&mut guard);
+                    if let Some(changed) =
+                        pdb.update_existing_normal_absolute_background(&declaration)
+                    {
+                        return changed;
+                    }
+                    // An absent, important or non-absolute old slot still uses
+                    // the ordinary declaration update and mutation barriers.
+                    let mut declarations =
+                        SourcePropertyDeclaration::with_one((*declaration).clone());
+                    let mut updates = Default::default();
+                    if !pdb.prepare_for_update(&declarations, Importance::Normal, &mut updates) {
+                        return false;
+                    }
+                    pdb.update(declarations.drain(), Importance::Normal, &mut updates);
+                    true
+                })
+        };
+        if let Some(changed) = cached_changed {
+            if changed {
+                element.complete_compact_background_style(cx, epoch, block);
                 #[cfg(feature = "testbinding")]
-                BACKGROUND_PARSE_ATTEMPTS.with(|count| count.set(count.get().saturating_add(1)));
-                if parse_one_declaration_into(
-                    &mut parsed,
-                    id.clone(),
-                    &value.str(),
-                    Origin::Author,
-                    &UrlExtraData(document.base_url().get_arc()),
-                    Some(element.owner_window().css_error_reporter()),
-                    ParsingMode::DEFAULT,
-                    document.quirks_mode(),
-                    CssRuleType::Style,
+                COMPACT_BACKGROUND_MUTATIONS.with(|count| count.set(count.get().saturating_add(1)));
+            }
+            return true;
+        }
+        let mut declarations = {
+            let mut parsed = SourcePropertyDeclaration::default();
+            #[cfg(feature = "testbinding")]
+            BACKGROUND_PARSE_ATTEMPTS.with(|count| count.set(count.get().saturating_add(1)));
+            if parse_one_declaration_into(
+                &mut parsed,
+                id.clone(),
+                &value.str(),
+                Origin::Author,
+                &UrlExtraData(document.base_url().get_arc()),
+                Some(element.owner_window().css_error_reporter()),
+                ParsingMode::DEFAULT,
+                document.quirks_mode(),
+                CssRuleType::Style,
+            )
+            .is_err()
+            {
+                return true;
+            } // Ordinary parse rejection: unchanged, one diagnostic only.
+            if parsed.declarations.len() != 1
+                || style::properties::declaration_block::independent_background_color(
+                    &parsed.declarations[0],
                 )
-                .is_err()
-                {
-                    return true;
-                } // Ordinary parse rejection: unchanged, one diagnostic only.
-                if parsed.declarations.len() != 1
-                    || style::properties::declaration_block::independent_background_color(
-                        &parsed.declarations[0],
-                    )
-                    .is_none()
-                {
-                    // Parsed once but not independently cacheable: perform the exact
-                    // ordinary mutation/install with this source declaration.
-                    self.owner.mutate_associated_block_with_preservation(
-                        cx,
-                        *preservation,
-                        |pdb, changed| {
-                            let mut updates = Default::default();
-                            *changed =
-                                pdb.prepare_for_update(&parsed, Importance::Normal, &mut updates);
-                            if *changed {
-                                pdb.update(parsed.drain(), Importance::Normal, &mut updates);
-                            }
-                        },
-                    );
-                    return true;
-                }
-                document.cache_absolute_background(&value.str(), parsed.declarations[0].clone());
-                parsed
-            };
+                .is_none()
+            {
+                // Parsed once but not independently cacheable: perform the exact
+                // ordinary mutation/install with this source declaration.
+                self.owner.mutate_associated_block_with_preservation(
+                    cx,
+                    *preservation,
+                    |pdb, changed| {
+                        let mut updates = Default::default();
+                        *changed =
+                            pdb.prepare_for_update(&parsed, Importance::Normal, &mut updates);
+                        if *changed {
+                            pdb.update(parsed.drain(), Importance::Normal, &mut updates);
+                        }
+                    },
+                );
+                return true;
+            }
+            document.cache_absolute_background(&value.str(), parsed.declarations[0].clone());
+            parsed
+        };
         let lock = document.style_shared_author_lock();
         let changed = {
             let mut guard = lock.write();

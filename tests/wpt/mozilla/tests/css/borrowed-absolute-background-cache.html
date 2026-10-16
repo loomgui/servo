@@ -1,0 +1,100 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Borrowed compact background cache retains synchronous CSSOM semantics</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<body><script>
+'use strict';
+setup({explicit_done:true});
+async function fixture(t) {
+  const frame=document.createElement('iframe');frame.width=400;frame.height=240;
+  const loaded=new Promise(resolve=>frame.onload=resolve);
+  frame.srcdoc='<!doctype html><style>html,body{margin:0}.cell{position:absolute;left:2px;top:2px;width:8px;height:8px}</style><div class="cell" style="background-color:red;color:black"></div>';
+  document.body.append(frame);t.add_cleanup(()=>frame.remove());await loaded;
+  const w=frame.contentWindow,d=w.document,u=w.ServoTestUtils,cell=d.querySelector('.cell');
+  ServoTestUtils.forceLayout();u.forceLayout();
+  let warm;
+  for(const value of ['green','blue','red']) {cell.style.backgroundColor=value;warm=u.forceLayout();}
+  assert_equals(warm.certifiedBackgroundColorCount,1,'real painter ACK establishes the lease');
+  assert_equals(warm.certifiedBackgroundCachedLeafCount,1,'actual cached leaf');
+  assert_equals(warm.certifiedBackgroundCachedFamilyCount,1,'actual cached style family');
+  return {w,d,u,cell};
+}
+function ordinary(f,value) {
+  const el=f.d.createElement('div');el.style.backgroundColor=value;return el;
+}
+function ack(f) {
+  const result=f.u.forceLayout();
+  assert_equals(result.certifiedBackgroundColorCount,1,'same-opportunity painter ACK');
+  assert_equals(result.certifiedBackgroundCachedLeafCount,1,'same cached leaf');
+  assert_equals(result.certifiedBackgroundCachedFamilyCount,1,'same cached family');
+}
+window.onload=()=>{
+  promise_test(async t=>{
+    const f=await fixture(t),reference=ordinary(f,'blue');
+    const attr=f.cell.getAttributeNode('style'),clone=attr.cloneNode(),previous=attr.value;
+    const order=Array.from({length:f.cell.style.length},(_,i)=>f.cell.style.item(i));
+    const count=f.u.compactBackgroundMutationCount(),parsed=f.u.backgroundParseAttemptCount();
+    f.cell.style.backgroundColor='blue';
+    assert_equals(f.u.compactBackgroundMutationCount(),count+1,'real compact mutation');
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed,'borrowed exact cache hit');
+    assert_equals(f.cell.style.backgroundColor,reference.style.backgroundColor);
+    assert_equals(f.cell.getAttributeNode('style'),attr,'live Attr identity');
+    assert_equals(attr.value,f.cell.style.cssText,'previously serialized Attr is invalidated');
+    assert_equals(f.cell.getAttribute('style'),attr.value);
+    assert_array_equals(Array.from({length:f.cell.style.length},(_,i)=>f.cell.style.item(i)),order);
+    assert_equals(clone.value,previous,'held detached Attr clone retains exact old declaration');
+    const current=attr.value;f.cell.style.backgroundColor='blue';
+    assert_equals(f.u.compactBackgroundMutationCount(),count+1,'same-value no-op');
+    assert_equals(attr.value,current,'no-op serialization');
+    ack(f);assert_equals(f.w.getComputedStyle(f.cell).backgroundColor,reference.style.backgroundColor);
+  },'Borrowed cache hit preserves Attr identity, authored serialization, order, no-op and painter ACK');
+  promise_test(async t=>{
+    const f=await fixture(t);
+    for(const token of ['#1A2b3C','rgba(26, 43, 60, 0.5)','rebeccapurple']) {
+      const reference=ordinary(f,token),parsed=f.u.backgroundParseAttemptCount();
+      f.cell.style.backgroundColor=token;
+      assert_equals(f.u.backgroundParseAttemptCount(),parsed,'exact seeded ASCII key '+token);
+      assert_equals(f.cell.style.backgroundColor,reference.style.backgroundColor);
+      assert_true(f.cell.getAttribute('style').includes(reference.style.backgroundColor));
+      f.u.forceLayout();
+    }
+    const before=f.cell.style.cssText,parsed=f.u.backgroundParseAttemptCount();
+    f.cell.style.backgroundColor='blüe';
+    assert_equals(f.cell.style.cssText,before,'non-ASCII Latin1 input cannot alias ASCII key');
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed+1,'non-ASCII miss uses ordinary parser');
+    f.cell.style.backgroundColor='blĀue';
+    assert_equals(f.cell.style.cssText,before,'UTF-8 non-ASCII input cannot alias ASCII key');
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed+2);
+  },'ASCII exact bytes preserve authored values while Latin1 and UTF-8 non-ASCII inputs miss safely');
+  promise_test(async t=>{
+    const f=await fixture(t),observer=new f.w.MutationObserver(()=>{});
+    t.add_cleanup(()=>observer.disconnect());
+    const old=f.cell.getAttribute('style'),count=f.u.compactBackgroundMutationCount();
+    f.cell.style.backgroundColor={toString(){
+      observer.observe(f.cell,{attributes:true,attributeOldValue:true,attributeFilter:['style']});
+      return 'blue';
+    }};
+    assert_equals(f.u.compactBackgroundMutationCount(),count,'binding conversion registered fresh observer before admission');
+    const records=observer.takeRecords();assert_equals(records.length,1);
+    assert_equals(records[0].oldValue,old,'ordinary preservation retains exact old declaration');
+    assert_equals(f.cell.style.backgroundColor,ordinary(f,'blue').style.backgroundColor);
+    const middle=f.cell.getAttribute('style');f.cell.style.backgroundColor='green';
+    assert_equals(observer.takeRecords()[0].oldValue,middle,'next observed write has fresh oldValue');
+  },'Reentrant binding conversion and observer registration retain exact ordinary oldValue records');
+  promise_test(async t=>{
+    const f=await fixture(t);
+    for(const old of ['red!important','currentColor','initial']) {
+      f.cell.style.cssText='background-color:'+old+';color:rgb(9,8,7)';f.u.forceLayout();
+      const parsed=f.u.backgroundParseAttemptCount();f.cell.style.backgroundColor='blue';
+      assert_equals(f.u.backgroundParseAttemptCount(),parsed,'previously seeded cache remains exact');
+      assert_equals(f.cell.style.backgroundColor,ordinary(f,'blue').style.backgroundColor);
+      assert_equals(f.cell.style.getPropertyPriority('background-color'),'','normal write clears old importance');
+      assert_equals(f.cell.style.color,'rgb(9, 8, 7)','other declaration survives');
+      assert_equals(f.cell.getAttribute('style'),f.cell.style.cssText);
+      assert_equals(f.w.getComputedStyle(f.cell).backgroundColor,'rgb(0, 0, 255)');
+    }
+  },'Important, contextual and CSS-wide old slots keep generic update semantics on borrowed cache hits');
+  done();
+};
+</script>
