@@ -1,0 +1,136 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Ordinary background-color parsing reuses only exact independent declarations</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<body><script>
+'use strict';
+setup({explicit_done:true});
+const TOKEN='#1a2b3c', COLOR='rgb(26, 43, 60)';
+async function fixture(t, quirks=false) {
+  const frame=document.createElement('iframe');
+  const loaded=new Promise(resolve=>frame.onload=resolve);
+  const markup=(quirks?'':'<!doctype html>')+
+    '<style>body{margin:0}#host{color:rgb(3,4,5)}.cell{position:absolute;width:8px;height:8px}</style>'+
+    '<input id="caret"><div id="host"><div id="target" class="cell"></div><span id="sibling"></span></div>';
+  if(quirks) frame.src='about:blank'; else frame.srcdoc=markup;
+  document.body.append(frame); t.add_cleanup(()=>frame.remove()); await loaded;
+  if(quirks){
+    const parsed=frame.contentDocument;
+    parsed.open(); parsed.write(markup); parsed.close();
+    assert_true(frame.isConnected && parsed===frame.contentDocument && parsed.defaultView===frame.contentWindow,
+      'ordinary parser retains the active same-origin iframe Document');
+  }
+  const w=frame.contentWindow,d=w.document,u=w.ServoTestUtils;
+  assert_equals(d.compatMode,quirks?'BackCompat':'CSS1Compat');
+  assert_true(d.querySelector('#caret') instanceof w.HTMLInputElement,'real input installs its UA shadow tree');
+  // No warm-up or forceLayout: the ordinary path must work without a snapshot lease.
+  return {w,d,u,host:d.querySelector('#host'),cell:d.querySelector('#target')};
+}
+function seed(f, value=TOKEN) {
+  const el=f.d.createElement('div'); el.style.backgroundColor=value; return el;
+}
+function currentColor(f, el=f.cell) { return f.w.getComputedStyle(el).backgroundColor; }
+window.onload=()=>{
+  promise_test(async t=>{
+    const f=await fixture(t),cells=[f.cell];
+    for(let i=0;i<7;i++){const el=f.d.createElement('div');f.host.append(el);cells.push(el);}
+    const parsed=f.u.backgroundParseAttemptCount(),compact=f.u.compactBackgroundMutationCount();
+    for(const el of cells) el.style.backgroundColor=TOKEN;
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed+1,'one real parse across eight ordinary element owners');
+    assert_equals(f.u.compactBackgroundMutationCount(),compact,'no omitted-snapshot mutation');
+    for(const el of cells) assert_equals(el.style.backgroundColor,COLOR);
+    const unchanged=f.cell.getAttribute('style');f.cell.style.backgroundColor=TOKEN;
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed+1,'same-value write also reuses the successful declaration');
+    assert_equals(f.cell.getAttribute('style'),unchanged,'no-op serialization stays exact');
+    assert_equals(currentColor(f),COLOR);assert_equals(currentColor(f,cells[7]),COLOR);
+  },'Fresh UA-shadow Document ordinary repeated colors parse once without a snapshot lease');
+  promise_test(async t=>{
+    const f=await fixture(t),parsed=f.u.backgroundParseAttemptCount(),compact=f.u.compactBackgroundMutationCount();
+    for(let i=0;i<32;i++){
+      f.cell.style.backgroundColor='#0100'+i.toString(16).padStart(2,'0');
+      assert_equals(f.cell.style.backgroundColor,`rgb(1, 0, ${i})`,'fresh unique declaration '+i);
+    }
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed+32,'one parse per fresh unique value, no duplicate parse');
+    f.cell.style.backgroundColor='#01001f';
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed+32,'newest exact entry is reusable');
+    f.cell.style.backgroundColor='#010000';
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed+33,'oldest entry was evicted from the existing bounded cache');
+    f.cell.style.backgroundColor='#010000';
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed+33,'reinserted value is reusable');
+    assert_equals(f.u.compactBackgroundMutationCount(),compact);assert_equals(currentColor(f),'rgb(1, 0, 0)');
+  },'Fresh unique ordinary colors parse once each and keep the existing bounded eviction policy');
+  promise_test(async t=>{
+    const f=await fixture(t);seed(f);seed(f,'#4d5e6f');
+    const observer=new f.w.MutationObserver(()=>{});observer.observe(f.cell,{attributes:true,attributeOldValue:true});
+    const old=f.cell.getAttribute('style'),parsed=f.u.backgroundParseAttemptCount();
+    f.cell.style.backgroundColor=TOKEN;const first=f.cell.getAttribute('style');
+    f.cell.style.backgroundColor='#4d5e6f';const second=f.cell.getAttribute('style');
+    f.cell.style.backgroundColor='#4d5e6f';
+    const records=observer.takeRecords();observer.disconnect();
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed,'all observed writes use previously parsed values');
+    assert_equals(records.length,2,'same-value no-op adds no mutation');
+    assert_array_equals(records.map(r=>r.oldValue),[old,first],'ordinary preserved old PDB values remain exact');
+    assert_true(records.every(r=>r.target===f.cell&&r.attributeName==='style'));
+    assert_equals(f.cell.getAttribute('style'),second);assert_equals(currentColor(f),'rgb(77, 94, 111)');
+  },'Ordinary cached declarations preserve observer oldValue and no-op mutation semantics');
+  promise_test(async t=>{
+    const f=await fixture(t);seed(f);
+    const sheet=f.d.createElement('style');sheet.textContent='.cell[style]{width:23px}.cell[style]+span{color:rgb(12,34,56)}';f.d.head.append(sheet);
+    assert_equals(f.w.getComputedStyle(f.cell).width,'8px');
+    const parsed=f.u.backgroundParseAttemptCount();f.cell.style.backgroundColor=TOKEN;
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed,'selector-sensitive write reuses only parsing');
+    assert_equals(f.w.getComputedStyle(f.cell).width,'23px','ordinary attribute invalidation rematches target');
+    assert_equals(f.w.getComputedStyle(f.d.querySelector('#sibling')).color,'rgb(12, 34, 56)','sibling selector rematches');
+    assert_equals(currentColor(f),COLOR);
+  },'Ordinary cached parsing retains style-attribute target and sibling selector invalidation');
+  promise_test(async t=>{
+    const f=await fixture(t);seed(f);const parsed=f.u.backgroundParseAttemptCount();
+    f.cell.style.setProperty('background-color',TOKEN,'important');
+    f.cell.style.setProperty('background-color',TOKEN,'important');
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed+2,'important remains on the original parser path');
+    assert_equals(f.cell.style.getPropertyPriority('background-color'),'important');
+    f.cell.style.setProperty('background-color','#fedcba','invalid-priority');
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed+2,'invalid priority exits before parsing');
+    assert_equals(f.cell.style.backgroundColor,COLOR);
+    f.cell.style.setProperty('background-color','');
+    assert_equals(f.cell.style.backgroundColor,'');assert_equals(f.u.backgroundParseAttemptCount(),parsed+2);
+    f.cell.style.setProperty('background-color',TOKEN);
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed+2,'normal element write may use the cached value');
+    assert_equals(f.cell.style.getPropertyPriority('background-color'),'');
+    const rule=f.d.styleSheets[0].cssRules[0].style;
+    rule.setProperty('background-color',TOKEN);rule.setProperty('background-color',TOKEN);
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed+4,'stylesheet owners never use the Document element cache');
+    assert_equals(rule.backgroundColor,COLOR);assert_equals(currentColor(f),COLOR);
+  },'Priority, removal and stylesheet-owner guards retain original ordinary parser behavior');
+  promise_test(async t=>{
+    const f=await fixture(t);let parsed=f.u.backgroundParseAttemptCount();
+    f.cell.style.backgroundColor='currentColor';f.cell.style.backgroundColor='currentColor';
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed+2,'context-dependent named color is never cached');
+    assert_equals(currentColor(f),'rgb(3, 4, 5)');
+    f.host.style.setProperty('--tone','rgb(8,9,10)');parsed=f.u.backgroundParseAttemptCount();
+    f.cell.style.backgroundColor='var(--tone)';f.cell.style.backgroundColor='var(--tone)';
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed+2,'variable syntax remains parsed on every call');
+    assert_equals(currentColor(f),'rgb(8, 9, 10)');
+    const old=f.cell.getAttribute('style');parsed=f.u.backgroundParseAttemptCount();
+    f.cell.style.backgroundColor='definitely-not-a-color';f.cell.style.backgroundColor='definitely-not-a-color';
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed+2,'invalid values are parsed/rejected once per call');
+    assert_equals(f.cell.getAttribute('style'),old);assert_equals(currentColor(f),'rgb(8, 9, 10)');
+    f.host.style.backgroundColor='#0c2238';parsed=f.u.backgroundParseAttemptCount();
+    f.cell.style.backgroundColor='inherit';f.cell.style.backgroundColor='inherit';
+    assert_equals(f.u.backgroundParseAttemptCount(),parsed+2,'CSS-wide keywords are never cached');
+    assert_equals(currentColor(f),'rgb(12, 34, 56)');
+  },'Context-dependent, variable, CSS-wide and invalid background tokens retain original parsing');
+  promise_test(async t=>{
+    const a=await fixture(t),b=await fixture(t,true),parsed=a.u.backgroundParseAttemptCount();
+    a.cell.style.backgroundColor=TOKEN;b.cell.style.backgroundColor=TOKEN;
+    assert_equals(a.u.backgroundParseAttemptCount(),parsed+2,'standards and quirks Documents each own a successful parse');
+    const base=a.d.createElement('base');base.href='https://example.invalid/one/';a.d.head.append(base);
+    const other=a.d.createElement('div');a.host.append(other);other.style.backgroundColor=TOKEN;
+    b.cell.style.backgroundColor=TOKEN;
+    assert_equals(a.u.backgroundParseAttemptCount(),parsed+2,'independent absolute colors survive base changes without crossing Documents');
+    assert_equals(currentColor(a,other),COLOR);assert_equals(currentColor(b),COLOR);
+  },'Successful absolute-color cache remains Document-local with standards, quirks and base-URL semantics');
+  done();
+};
+</script>

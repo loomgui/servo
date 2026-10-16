@@ -542,32 +542,68 @@ impl CSSStyleDeclaration {
                 // Step 5
                 let window = self.owner.window();
                 let quirks_mode = window.Document().quirks_mode();
-                let mut declarations = SourcePropertyDeclaration::default();
-                #[cfg(feature = "testbinding")]
-                if id == PropertyId::NonCustom(LonghandId::BackgroundColor.into()) {
-                    BACKGROUND_PARSE_ATTEMPTS
-                        .with(|count| count.set(count.get().saturating_add(1)));
-                }
-                let result = parse_one_declaration_into(
-                    &mut declarations,
-                    id,
-                    &value.str(),
-                    Origin::Author,
-                    &base_url,
-                    Some(window.css_error_reporter()),
-                    ParsingMode::DEFAULT,
-                    quirks_mode,
-                    CssRuleType::Style,
-                );
-
-                // Step 6
-                match result {
-                    Ok(()) => {},
-                    Err(_) => {
-                        *changed = false;
-                        return Ok(());
+                // Reuse only the existing bounded cache of successful, independent
+                // absolute colors. The ordinary owner/observer mutation transaction
+                // remains in charge; no snapshot lease or Layout proof is required.
+                let background_document = match &self.owner {
+                    CSSStyleOwner::Element(element)
+                        if priority.is_empty()
+                            && id == PropertyId::NonCustom(LonghandId::BackgroundColor.into()) =>
+                    {
+                        let document = element.owner_document();
+                        // The Document cache key must match the ordinary parser's
+                        // exact quirks semantics.
+                        (document.quirks_mode() == quirks_mode).then_some(document)
                     },
-                }
+                    _ => None,
+                };
+                let cached = background_document
+                    .as_ref()
+                    .and_then(|document| document.cached_absolute_background(&value.str()));
+                let mut declarations = if let Some(declaration) = cached {
+                    SourcePropertyDeclaration::with_one(declaration)
+                } else {
+                    let mut parsed = SourcePropertyDeclaration::default();
+                    #[cfg(feature = "testbinding")]
+                    if id == PropertyId::NonCustom(LonghandId::BackgroundColor.into()) {
+                        BACKGROUND_PARSE_ATTEMPTS
+                            .with(|count| count.set(count.get().saturating_add(1)));
+                    }
+                    let result = parse_one_declaration_into(
+                        &mut parsed,
+                        id,
+                        &value.str(),
+                        Origin::Author,
+                        &base_url,
+                        Some(window.css_error_reporter()),
+                        ParsingMode::DEFAULT,
+                        quirks_mode,
+                        CssRuleType::Style,
+                    );
+
+                    // Step 6
+                    match result {
+                        Ok(()) => {},
+                        Err(_) => {
+                            *changed = false;
+                            return Ok(());
+                        },
+                    }
+                    if let Some(document) = background_document {
+                        if parsed.declarations.len() == 1
+                            && style::properties::declaration_block::independent_background_color(
+                                &parsed.declarations[0],
+                            )
+                            .is_some()
+                        {
+                            document.cache_absolute_background(
+                                &value.str(),
+                                parsed.declarations[0].clone(),
+                            );
+                        }
+                    }
+                    parsed
+                };
 
                 let mut updates = Default::default();
                 *changed = pdb.prepare_for_update(&declarations, importance, &mut updates);
