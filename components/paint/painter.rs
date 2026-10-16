@@ -139,6 +139,7 @@ pub(crate) struct Painter {
 
     /// The webrender renderer.
     pub(crate) webrender_renderer: Option<webrender::Renderer>,
+    shader_program_cache: Option<crate::shader_program_cache::ShaderProgramCache>,
 
     /// Embedder tag whose WebRender updates have been consumed but whose
     /// framebuffer render has not run yet. A single rendering context can
@@ -295,6 +296,15 @@ impl Painter {
                 .expect("Unable to initialize WebRender worker pool."),
         ));
 
+        // Empty cache is installed immediately; IO never blocks initialization.
+        // Existing precache modes may create Programs during construction and
+        // cannot safely admit a later binary import through the pinned API.
+        let shader_program_cache = if pref!(gfx_precache_shaders) {
+            None
+        } else {
+            crate::shader_program_cache::ShaderProgramCache::new(&*webrender_gl)
+        };
+        let cached_programs = shader_program_cache.as_ref().map(|cache| cache.cache());
         let painter_id = PainterId::next();
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
             webrender_gl.clone(),
@@ -317,6 +327,7 @@ impl Painter {
                 allow_texture_swizzling: pref!(gfx_texture_swizzling_enabled),
                 enable_dithering: true,
                 clear_color,
+                cached_programs,
                 upload_method,
                 workers,
                 size_of_op: Some(servo_allocator::usable_size),
@@ -352,6 +363,7 @@ impl Painter {
             refresh_driver,
             animation_refresh_driver_observer,
             webrender_renderer: Some(webrender_renderer),
+            shader_program_cache,
             prepared_frame_tag: None,
             next_scene_frame_tag: Cell::new(None),
             ready_scene_frame_tags: RefCell::new(VecDeque::new()),
@@ -586,16 +598,24 @@ impl Painter {
             return false;
         }
 
+        let mut probe = crate::preparation_probe::PreparationSpan::begin(frame_tag);
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
+        probe.checkpoint();
 
         if let Err(error) = self.rendering_context.make_current() {
+            probe.checkpoint();
             error!("Failed to make the rendering context current: {error:?}");
             return false;
         }
         self.assert_no_gl_error();
+        probe.checkpoint();
 
         self.rendering_context.prepare_for_rendering();
+        if let Some(cache) = self.shader_program_cache.as_mut() {
+            cache.import_before_first_program();
+        }
+        probe.checkpoint();
 
         time_profile!(
             ProfilerCategory::Painting,
@@ -605,10 +625,20 @@ impl Painter {
                 if let Some(renderer) = self.webrender_renderer.as_mut() {
                     renderer.update();
                 }
+                if crate::shader_program_cache::gl_error_probe_enabled() {
+                    // glGetError consumes the observed error. Keep it fatal and
+                    // do not change preparation/FIFO decisions or clear a batch.
+                    let error = self.webrender_gl.get_error();
+                    if error != gleam::gl::NO_ERROR {
+                        error!("[Loom shader cache] FATAL post-update GL error 0x{error:x}");
+                    }
+                }
             }
         );
 
+        probe.checkpoint();
         self.prepared_frame_tag = Some(frame_tag);
+        probe.finish(true);
         true
     }
 

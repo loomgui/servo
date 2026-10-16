@@ -10,6 +10,7 @@
 mod accessibility;
 mod background_color_cache;
 mod cell;
+mod certified_background;
 mod context;
 mod display_list;
 mod dom;

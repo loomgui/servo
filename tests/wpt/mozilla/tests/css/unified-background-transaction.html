@@ -1,0 +1,173 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Unified background CSSOM omissions and cached proofs preserve synchronous semantics</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<body><script>
+'use strict';
+setup({explicit_done:true});
+const BLUE='rgb(0, 0, 255)', RED='rgb(255, 0, 0)';
+async function fixture(t, beforeWarm) {
+  // Every case owns a fresh Document: shadow roots, observers, rules and epochs
+  // cannot poison the positive admission proof of a subsequent case.
+  const frame=document.createElement('iframe'); frame.width=400; frame.height=240;
+  const loaded=new Promise(resolve=>frame.onload=resolve);
+  frame.srcdoc='<!doctype html><style>html,body{margin:0}#host{color:rgb(3,4,5)}.cell{position:absolute;left:2px;top:2px;width:8px;height:8px}</style><div id="host"><div class="cell" style="background-color:red"></div><span id="sibling"></span></div>';
+  document.body.append(frame); t.add_cleanup(()=>frame.remove()); await loaded;
+  const w=frame.contentWindow,d=w.document,u=w.ServoTestUtils,cell=d.querySelector('.cell'),host=d.querySelector('#host');
+  if(beforeWarm)await beforeWarm({w,d,u,cell,host});
+  // UpdateTheRendering assumes ancestors have already been laid out.
+  // Establish the real embedding/viewport before the subdocument warm-up.
+  ServoTestUtils.forceLayout();
+  u.forceLayout();
+  let warm;
+  for(const value of ['green','blue','red']) { cell.style.backgroundColor=value; warm=u.forceLayout(); }
+  assert_equals(warm.certifiedBackgroundColorCount,1,'actual painter ACK before every negative');
+  assert_equals(warm.certifiedBackgroundCachedLeafCount,1,'actual cached leaf path, not ordinary fallback');
+  assert_equals(warm.certifiedBackgroundCachedFamilyCount,1,'actual inductive family path, not cold reconstruction');
+  return {w,d,u,cell,host};
+}
+function compact(f,value='blue') {
+  const before=f.u.compactBackgroundMutationCount(); f.cell.style.backgroundColor=value;
+  assert_equals(f.u.compactBackgroundMutationCount(),before+1,'explicit omission path must execute before revocation');
+}
+function color(f,expected=BLUE) { assert_equals(f.w.getComputedStyle(f.cell).backgroundColor,expected); }
+window.onload=()=>{
+ promise_test(async t=>{
+   const f=await fixture(t);let current=RED;
+   for(const [index,value] of ['blue','red'].entries()){
+     const before=f.u.compactBackgroundMutationCount();
+     assert_equals(f.w.getComputedStyle(f.cell).backgroundColor,current,'clean no-work query '+index+' returns current color');
+     assert_equals(f.u.compactBackgroundMutationCount(),before,'clean query '+index+' does not mutate inline style');
+     f.cell.style.backgroundColor=value;
+     assert_equals(f.u.compactBackgroundMutationCount(),before+1,'compact admission after clean no-work query '+index);
+     const result=f.u.forceLayout();
+     assert_equals(result.certifiedBackgroundColorCount,1,'actual painter ACK after clean query '+index);
+     assert_equals(result.certifiedBackgroundCachedLeafCount,1,'actual cached leaf after clean query '+index);
+     assert_equals(result.certifiedBackgroundCachedFamilyCount,1,'actual cached family after clean query '+index);
+     current=value==='blue'?BLUE:RED;
+     assert_equals(f.w.getComputedStyle(f.cell).backgroundColor,current,'committed current color after clean query '+index);
+   }
+ },'Completed clean no-work style queries retain fresh omission proof and actual hot background commits');
+ promise_test(async t=>{
+  const f=await fixture(t),attr=f.cell.getAttributeNode('style'),clone=attr.cloneNode(); // NO value/cssText read before cloning
+  compact(f); assert_equals(f.cell.getAttributeNode('style'),attr,'live Attr identity retained');
+  assert_equals(attr.value,f.cell.style.cssText);
+  assert_equals(f.cell.getAttribute('style'),f.cell.style.cssText);
+  assert_true(f.cell.matches('[style='+JSON.stringify(f.cell.style.cssText)+']'),'selector reads current serialization');
+  const r=f.u.forceLayout(); assert_equals(r.certifiedBackgroundColorCount,1);
+  assert_equals(r.certifiedBackgroundCachedLeafCount,1); assert_equals(r.certifiedBackgroundCachedFamilyCount,1); color(f);
+  const decoded=f.d.createElement('div'),expected=f.d.createElement('div');
+  decoded.style.cssText=clone.value; expected.style.backgroundColor='red'; // FIRST clone value read, after mutation/commit
+  assert_equals(decoded.style.backgroundColor,expected.style.backgroundColor,'unmaterialized Attr clone keeps its old PDB');
+  assert_not_equals(clone.value,attr.value);
+ },'Positive compact writes preserve live Attr, serialization, selectors and actual hot native proofs');
+ promise_test(async t=>{
+  const f=await fixture(t); compact(f,'#1a2b3c'); f.u.forceLayout(); compact(f,'blue'); f.u.forceLayout();
+  const parsed=f.u.backgroundParseAttemptCount(); compact(f,'#1a2b3c');
+  assert_equals(f.u.backgroundParseAttemptCount(),parsed,'exact successful legacy parse cache hit'); f.u.forceLayout();
+  const value=f.cell.style.cssText,n=f.u.compactBackgroundMutationCount(),p=f.u.backgroundParseAttemptCount();
+  f.cell.style.backgroundColor='definitely-not-a-color';
+  assert_equals(f.u.backgroundParseAttemptCount(),p+1,'invalid declaration parsed/reported exactly once');
+  assert_equals(f.cell.style.cssText,value); assert_equals(f.u.compactBackgroundMutationCount(),n);
+  f.cell.style.backgroundColor=f.cell.style.backgroundColor;
+  assert_equals(f.u.compactBackgroundMutationCount(),n,'no-op has no pending mutation');
+  f.cell.style.backgroundColor='currentColor'; color(f,'rgb(3, 4, 5)');
+ },'Exact parse reuse, invalid input once, no-op and context-dependent ordinary fallback');
+ promise_test(async t=>{
+  const f=await fixture(t); compact(f);
+  const s=f.d.createElement('style');s.textContent='[style]{width:23px!important}#host{color:rgb(9,8,7)}';f.d.head.append(s);
+  assert_equals(f.w.getComputedStyle(f.cell).width,'23px'); assert_equals(f.w.getComputedStyle(f.host).color,'rgb(9, 8, 7)'); color(f);
+ },'Sheet insertion after a proved omission rematches current style selectors and ancestors before query');
+ promise_test(async t=>{
+  const f=await fixture(t); compact(f); f.d.styleSheets[0].insertRule('[style] + span { color:rgb(12,34,56) }',0);
+  assert_equals(f.w.getComputedStyle(f.d.querySelector('#sibling')).color,'rgb(12, 34, 56)'); color(f);
+ },'CSSOM insertRule after omission rematches a previously unaffected sibling');
+ promise_test(async t=>{
+  let sheet;
+  const f=await fixture(t,g=>{const s=g.d.createElement('style');s.media='not all';s.textContent='[style]{height:19px!important}';g.d.head.append(s);sheet=s.sheet;});
+  compact(f);sheet.media.mediaText='all';
+  assert_equals(f.w.getComputedStyle(f.cell).height,'19px');color(f);
+ },'Activating an existing inactive sheet media list after proved omission rematches before geometry');
+ promise_test(async t=>{
+  let sheet;
+  const f=await fixture(t,g=>{
+   const style=g.d.createElement('style');style.textContent='[style]{width:29px!important}';g.d.head.append(style);
+   sheet=style.sheet;sheet.disabled=true;assert_true(sheet.disabled,'the existing dependent sheet is disabled before warm-up');
+  });
+  compact(f);sheet.disabled=false;assert_false(sheet.disabled,'enable the same existing sheet after proved omission');
+  assert_equals(f.w.getComputedStyle(f.cell).width,'29px');color(f);
+ },'Enabling an existing disabled stylesheet after proved omission revokes missing-history lease');
+ promise_test(async t=>{
+  let rule;
+  const f=await fixture(t,g=>{
+   const style=g.d.createElement('style');style.textContent='.never-matches-compact-target{height:21px!important}';g.d.head.append(style);
+   rule=style.sheet.cssRules[0];assert_equals(rule.selectorText,'.never-matches-compact-target');
+  });
+  compact(f);rule.selectorText='[style]';assert_equals(rule.selectorText,'[style]','mutate the held rule to a STYLE-dependent selector');
+  assert_equals(f.w.getComputedStyle(f.cell).height,'21px');color(f);
+ },'Changing a held rule selector after proved omission rematches current STYLE dependencies');
+ promise_test(async t=>{
+  const f=await fixture(t); compact(f);const shadow=f.cell.attachShadow({mode:'open'});
+  shadow.innerHTML='<style>:host{width:27px!important}span{color:rgb(21,22,23)}</style><span>new shadow</span>';
+  assert_equals(f.w.getComputedStyle(f.cell).width,'27px');
+  assert_equals(f.w.getComputedStyle(shadow.querySelector('span')).color,'rgb(21, 22, 23)');color(f);
+ },'Shadow attachment after omission rematches host and newly attached shadow descendants');
+ promise_test(async t=>{
+  const f=await fixture(t);const host=f.d.createElement('div');f.d.body.append(host);host.attachShadow({mode:'open'});f.u.forceLayout();
+  const n=f.u.compactBackgroundMutationCount();f.cell.style.backgroundColor='blue';
+  assert_equals(f.u.compactBackgroundMutationCount(),n,'any shadow-containing Document uses ordinary CSSOM');color(f);
+ },'An already shadow-containing Document cannot reuse the document-only omission lease');
+ promise_test(async t=>{
+  const f=await fixture(t);compact(f);const old=f.cell.getAttribute('style');
+  const mo=new f.w.MutationObserver(()=>{});mo.observe(f.cell,{attributes:true,attributeOldValue:true,attributeFilter:['style']});t.add_cleanup(()=>mo.disconnect());
+  const n=f.u.compactBackgroundMutationCount();f.cell.style.backgroundColor='green';
+  assert_equals(f.u.compactBackgroundMutationCount(),n,'new matching registration refuses compact path');
+  const records=mo.takeRecords();assert_equals(records.length,1);assert_equals(records[0].oldValue,old);color(f,'rgb(0, 128, 0)');
+ },'Observer registration between omitted and ordinary writes preserves exact oldValue');
+ promise_test(async t=>{
+  const f=await fixture(t);const mo=new f.w.MutationObserver(()=>{});mo.observe(f.d,{subtree:true,attributes:true,attributeFilter:['data-unrelated'],childList:true});t.add_cleanup(()=>mo.disconnect());
+  compact(f);assert_equals(mo.takeRecords().length,0);const r=f.u.forceLayout();assert_equals(r.certifiedBackgroundColorCount,1);color(f);
+ },'Fresh filtered observer interest admits compact mutation without dropping eligible records');
+ promise_test(async t=>{
+  const f=await fixture(t);const s=f.d.createElement('style');s.textContent='.cell::before{content:attr(style)}';f.d.head.append(s);f.u.forceLayout();
+  const n=f.u.compactBackgroundMutationCount();f.cell.style.backgroundColor='blue';
+  assert_equals(f.u.compactBackgroundMutationCount(),n,'attr(style) eager pseudo retains original SELF invalidation');
+  const expected=JSON.stringify(f.cell.getAttribute('style'));
+  assert_equals(f.w.getComputedStyle(f.cell,'::before').content,expected);color(f);
+ },'Computed attr(style) consumers refuse compact mutation and update eager pseudo content');
+ promise_test(async t=>{
+  const f=await fixture(t);const s=f.d.createElement('style');s.textContent='#host{display:flex}.cell{position:static}';f.d.head.append(s);f.u.forceLayout();
+  compact(f);const result=f.u.forceLayout();assert_equals(result.certifiedBackgroundColorCount,0,'unsupported flex item uses ordinary eager fallback');color(f);
+  // Valid global negative proof remains usable after that producer miss and on
+  // synchronous queries; unsupported layout must not require a new pool/cache.
+  compact(f,'red');color(f,RED);compact(f);color(f);
+ },'Valid omission proof survives unsupported flex leaf miss and synchronous targeted queries');
+ promise_test(async t=>{
+  const f=await fixture(t);compact(f);const calls=[];
+  f.w.customElements.define('x-unified-background',class extends f.w.HTMLElement{static get observedAttributes(){return ['style']}attributeChangedCallback(n,o,v){calls.push([o,v])}});
+  const el=f.d.createElement('x-unified-background');f.d.body.append(el);el.style.backgroundColor='red';calls.length=0;
+  const old=el.getAttribute('style'),n=f.u.compactBackgroundMutationCount();el.style.backgroundColor='blue';
+  assert_equals(f.u.compactBackgroundMutationCount(),n);assert_equals(calls.length,1);assert_equals(calls[0][0],old);assert_equals(calls[0][1],el.getAttribute('style'));color(f);
+ },'Custom-element oldValue/reaction semantics stay on the original path');
+ for(const order of ['before','after']) promise_test(async t=>{
+  const f=await fixture(t);const s=f.d.createElement('style');s.textContent='.changed{width:31px!important}';f.d.head.append(s);f.u.forceLayout();
+  const n=f.u.compactBackgroundMutationCount();
+  if(order==='before')f.cell.className='cell changed';
+  if(order==='after')compact(f);else f.cell.style.backgroundColor='blue';
+  if(order==='after')f.cell.className='cell changed';else assert_equals(f.u.compactBackgroundMutationCount(),n);
+  assert_equals(f.w.getComputedStyle(f.cell).width,'31px');color(f);assert_equals(f.cell.getAttribute('class'),'cell changed');
+ },'Mixed real attribute snapshot '+order+' omitted STYLE preserves full invalidation');
+ promise_test(async t=>{
+  const f=await fixture(t);compact(f);const parent=f.d.createElement('div');parent.style.color='rgb(70,80,90)';f.d.body.append(parent);parent.append(f.cell);
+  assert_equals(f.w.getComputedStyle(f.cell).color,'rgb(70, 80, 90)');color(f);
+  f.cell.style.backgroundColor='currentColor';color(f,'rgb(70, 80, 90)');
+ },'Tree/parent change after omission cannot reuse the old parent or layout witness');
+ promise_test(async t=>{
+  const f=await fixture(t);compact(f);const s=f.d.createElement('style');s.textContent='::selection{color:rgb(33,44,55);background-color:rgb(66,77,88)}';f.d.head.append(s);
+  assert_equals(f.w.getComputedStyle(f.cell,'::selection').color,'rgb(33, 44, 55)');color(f);
+  const n=f.u.compactBackgroundMutationCount();f.cell.style.backgroundColor='inherit';assert_equals(f.u.compactBackgroundMutationCount(),n);color(f,'rgba(0, 0, 0, 0)');
+ },'Selection pseudo and CSS-wide fallback stay eager after omitted primary mutation');
+ done();
+};
+</script>

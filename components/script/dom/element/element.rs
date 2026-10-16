@@ -2877,6 +2877,74 @@ impl Element {
     /// attribute to persist after modification, because it is sent as an argument to
     /// script callbacks. Normally that's not the case, so this method tries to detect
     /// when it's required so it can be avoided for performance reasons.
+    /// A conservative ordinary-element lane; all other element virtual hooks keep
+    /// their original mutation path. No observer/reaction or script runs here.
+    pub(crate) fn compact_background_style_admission(
+        &self,
+        no_gc: &NoGC,
+    ) -> Option<(u64, ServoArc<Locked<PropertyDeclarationBlock>>)> {
+        let node = self.upcast::<Node>();
+        if !matches!(
+            node.type_id(),
+            NodeTypeId::Element(ElementTypeId::HTMLElement(
+                HTMLElementTypeId::HTMLDivElement
+            )) | NodeTypeId::Element(ElementTypeId::HTMLElement(
+                HTMLElementTypeId::HTMLSpanElement
+            ))
+        ) || self.get_custom_element_state() != CustomElementState::Uncustomized
+            || self.get_custom_element_definition().is_some()
+            || self.is_shadow_host()
+            || node.get_first_child_unrooted(no_gc).is_some()
+            || node.containing_shadow_root_unrooted(no_gc).is_some()
+            || node.assigned_slot_unrooted(no_gc).is_some()
+        {
+            return None;
+        }
+        // Ordinary attribute mutation requests RESTYLE_SELF when attr(style)
+        // is consumed by the primary or an eager pseudo. STYLE_ATTRIBUTE alone
+        // would retain old cascade/pseudo inputs, so keep that original path.
+        if self.check_style_on_self_or_eager_pseudos(|style| {
+            style
+                .attribute_references
+                .as_ref()
+                .is_some_and(|references| references.contains_key(&local_name!("style")))
+        }) {
+            return None;
+        }
+        let epoch = self
+            .owner_document()
+            .can_compact_background_style(self, no_gc)?;
+        let block = self.style_attribute().borrow().as_ref()?.clone();
+        let same = self.with_attribute(&ns!(), &local_name!("style"), |attr| {
+            matches!(&*attr.value(), AttrValue::Declaration { block: stored, .. } if ServoArc::ptr_eq(stored, &block))
+        }).unwrap_or(false);
+        same.then_some((epoch, block))
+    }
+
+    pub(crate) fn complete_compact_background_style(
+        &self,
+        cx: &mut JSContext,
+        epoch: u64,
+        block: ServoArc<Locked<PropertyDeclarationBlock>>,
+    ) {
+        // Admission, PDB update and this reset are one callback-free transaction.
+        // Record omission even if a defensive ordinary reinstall is necessary.
+        self.owner_document()
+            .note_compact_background_style(self, epoch);
+        if !self.attrs.invalidate_style_serialization(&block) {
+            self.set_attribute(
+                cx,
+                &local_name!("style"),
+                AttrValue::from_declaration(
+                    block,
+                    self.owner_document().style_shared_author_lock().clone(),
+                ),
+            );
+        } else {
+            MutationObserver::queue_unobserved_attribute_microtask(cx, self.upcast::<Node>());
+        }
+    }
+
     pub(crate) fn needs_preserved_style_attribute_after_change(&self, no_gc: &NoGC) -> bool {
         if self
             .get_custom_element_definition()

@@ -1068,6 +1068,9 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
         }
 
         if fragment.selected.load(Ordering::Relaxed) {
+            // The static selection color can change independently of the
+            // primary background binding, including transparent to visible.
+            self.background_colors.record_selection_highlight();
             // If there is no selected style, just fall back to using the unfocused selection color,
             // which is strictly better than not drawing a selection highlight.
             let selected_style = fragment.selected_style.borrow();
@@ -1629,6 +1632,7 @@ impl Fragment {
 
         let parent_style = fragment.style();
         if !selection_character_range.is_empty() {
+            builder.background_colors.record_selection_highlight();
             let selection_rect = Rect::new(
                 Point2D::new(fragment_origin.x, line_box_rect.min_y()),
                 Size2D::new(end_x - start_x, line_box_rect.height()),

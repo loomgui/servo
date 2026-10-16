@@ -401,6 +401,17 @@ impl IndependentFormattingContext {
         }
     }
 
+    /// Expose only normal flow contents for certified empty-leaf repair. Replaced,
+    /// widget, flex/grid/table and float-bearing contents retain ordinary repair.
+    pub(crate) fn certified_flow_contents(&self) -> Option<&crate::flow::BlockContainer> {
+        match &self.contents {
+            IndependentFormattingContextContents::Flow(flow) if !flow.contains_floats => {
+                Some(&flow.contents)
+            },
+            _ => None,
+        }
+    }
+
     #[inline]
     pub(crate) fn is_block_container(&self) -> bool {
         matches!(self.contents, IndependentFormattingContextContents::Flow(_))

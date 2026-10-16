@@ -231,7 +231,10 @@ impl HTMLStyleElement {
 
     pub(crate) fn will_modify_stylesheet(&self, no_gc: &NoGC) {
         if let Some(stylesheet_with_owned_contents) = self.create_owned_contents_stylesheet() {
-            self.remove_stylesheet();
+            // This is COW of the same attached sheet, not removal/replacement of
+            // its CSSOM. Keep its owner and live rule/declaration wrappers so
+            // update_style_stylesheet can retarget them to the owned contents.
+            self.remove_stylesheet_from_owner();
             if let Some(cssom_stylesheet) = self.cssom_stylesheet.get() {
                 let guard = stylesheet_with_owned_contents.shared_lock.read();
                 cssom_stylesheet.update_style_stylesheet(&stylesheet_with_owned_contents, &guard);
@@ -309,6 +312,11 @@ impl HTMLStyleElement {
 
     fn remove_stylesheet(&self) {
         self.clean_stylesheet_ownership();
+        self.remove_stylesheet_from_owner();
+    }
+
+    /// Detach the native sheet without discarding an attached CSSOM during COW.
+    fn remove_stylesheet_from_owner(&self) {
         if let Some(s) = self.stylesheet.borrow_mut().take() {
             self.stylesheet_list_owner()
                 .remove_stylesheet(StylesheetSource::Element(Dom::from_ref(self.upcast())), &s);
@@ -374,22 +382,22 @@ impl VirtualMethods for HTMLStyleElement {
         }
 
         let node = self.upcast::<Node>();
-        if !(node.is_in_a_document_tree() || node.is_in_a_shadow_tree()) ||
-            self.in_stack_of_open_elements.get()
+        if !(node.is_in_a_document_tree() || node.is_in_a_shadow_tree())
+            || self.in_stack_of_open_elements.get()
         {
             return;
         }
 
         if attr.name() == "type" {
-            if let AttributeMutation::Set(Some(old_value)) = mutation &&
-                **old_value == **attr.value()
+            if let AttributeMutation::Set(Some(old_value)) = mutation
+                && **old_value == **attr.value()
             {
                 return;
             }
             self.remove_stylesheet();
             self.update_a_style_block(cx);
-        } else if attr.name() == "media" &&
-            let Some(ref stylesheet) = *self.stylesheet.borrow_mut()
+        } else if attr.name() == "media"
+            && let Some(ref stylesheet) = *self.stylesheet.borrow_mut()
         {
             let shared_lock = node.owner_doc().style_shared_author_lock().clone();
             let mut guard = shared_lock.write();
@@ -436,8 +444,9 @@ impl StylesheetOwner for HTMLStyleElement {
         //
         // https://html.spec.whatwg.org/multipage/#the-style-element:implicitly-potentially-render-blocking
         // > A style element is implicitly potentially render-blocking if the element was created by its node document's parser.
-        self.parser_inserted() ||
-            self.blocking
+        self.parser_inserted()
+            || self
+                .blocking
                 .get()
                 .is_some_and(|list| list.Contains(DOMString::from_static("render")))
     }

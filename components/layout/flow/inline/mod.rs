@@ -2041,6 +2041,48 @@ impl InlineFormattingContext {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn certified_empty_for_testing(
+        style: ServoArc<ComputedValues>,
+        selected: ServoArc<ComputedValues>,
+    ) -> Self {
+        Self {
+            inline_items: Vec::new(),
+            inline_boxes: Default::default(),
+            text_content: Arc::new(OnceLock::new()),
+            shared_inline_styles: SharedInlineStyles {
+                style: SharedStyle::new(style),
+                selected: SharedStyle::new(selected),
+            },
+            default_font: None,
+            has_first_formatted_line: false,
+            contains_floats: false,
+            is_single_line_text_input: false,
+            has_right_to_left_content: false,
+            tab_size_multiplier: OnceLock::new(),
+        }
+    }
+
+    /// Return owned style handles only for a genuinely empty, non-widget IFC.
+    /// No borrow from this context survives certified-batch preparation.
+    pub(crate) fn certified_empty_styles(
+        &self,
+        primary: &ServoArc<ComputedValues>,
+        selection: &ServoArc<ComputedValues>,
+    ) -> Option<SharedInlineStyles> {
+        if !self.inline_items.is_empty()
+            || self.inline_boxes.len() != 0
+            || !self.text_content().is_empty()
+            || self.contains_floats
+            || self.is_single_line_text_input
+            || !ServoArc::ptr_eq(&self.shared_inline_styles.style.borrow(), primary)
+            || !ServoArc::ptr_eq(&self.shared_inline_styles.selected.borrow(), selection)
+        {
+            return None;
+        }
+        Some(self.shared_inline_styles.clone())
+    }
+
     pub(crate) fn text_content(&self) -> &str {
         self.text_content.get().map_or("", String::as_str)
     }

@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Held font-feature-values CSSOM survives shared stylesheet COW</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<style id="first">@font-feature-values LoomCow { @styleset { alternate: 1; } }
+#target { color:rgb(3,4,5) }</style>
+<div id="target" class="cow-target">unchanged target</div>
+<script>
+'use strict';
+test(()=>{
+ const first=document.querySelector('#first'),second=document.createElement('style');
+ second.textContent=first.textContent;document.head.append(second);
+ const sheet=first.sheet,other=second.sheet,rules=sheet.cssRules,otherRules=other.cssRules;
+ assert_equals(rules.length,2,'font-feature-values rule must really parse');
+ const held=rules[0],heldMap=held.styleset,oldText=held.cssText,oldFamily=held.fontFamily;
+ assert_true(held instanceof CSSFontFeatureValuesRule,'supported CSSOM wrapper must be materialized');
+ assert_array_equals(heldMap.get('alternate'),[1],'held map has actual parsed values');
+ const otherHeld=otherRules[0],otherText=Array.from(otherRules,r=>r.cssText);
+ sheet.insertRule('#target.cow-target { color:rgb(12,34,56) }',0);
+ assert_equals(first.sheet,sheet);assert_equals(sheet.ownerNode,first);
+ assert_equals(sheet.cssRules,rules);assert_equals(rules.length,3);
+ assert_equals(rules[1],held,'same pre-held font-feature-values CSSRule after COW');
+ assert_equals(held.parentStyleSheet,sheet);assert_equals(held.styleset,heldMap,'same pre-held map');
+ assert_equals(held.cssText,oldText);assert_equals(held.fontFamily,oldFamily);
+ assert_array_equals(heldMap.get('alternate'),[1]);
+ assert_equals(second.sheet,other);assert_equals(other.ownerNode,second);
+ assert_equals(other.cssRules,otherRules);assert_equals(otherRules[0],otherHeld);
+ assert_equals(otherHeld.parentStyleSheet,other);assert_array_equals(Array.from(otherRules,r=>r.cssText),otherText);
+ assert_equals(getComputedStyle(document.querySelector('#target')).color,'rgb(12, 34, 56)');
+ sheet.disabled=true;
+ assert_equals(getComputedStyle(document.querySelector('#target')).color,'rgb(3, 4, 5)','second sheet was not changed');
+ sheet.disabled=false;
+ assert_equals(getComputedStyle(document.querySelector('#target')).color,'rgb(12, 34, 56)');
+},'Held font-feature-values rule and map survive forced shared-sheet COW');
+</script>

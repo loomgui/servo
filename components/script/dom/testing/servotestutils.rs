@@ -65,6 +65,10 @@ impl ServoTestUtilsMethods<crate::DomTypeHolder> for ServoTestUtils {
             cx,
             global,
             phases,
+            statistics.inline_background_color_recascade_count,
+            statistics.certified_background_color_count,
+            statistics.certified_background_cached_leaf_count,
+            statistics.certified_background_cached_family_count,
             statistics.rebuilt_fragment_count,
             statistics.restyle_fragment_count,
             statistics.only_descendants_changed_count,
@@ -81,6 +85,14 @@ impl ServoTestUtilsMethods<crate::DomTypeHolder> for ServoTestUtils {
 
     fn InlineStylePreservationCloneCount(_: &GlobalScope) -> u32 {
         crate::dom::cssstyledeclaration::inline_style_preservation_clone_count()
+    }
+
+    fn CompactBackgroundMutationCount(_: &GlobalScope) -> u32 {
+        crate::dom::cssstyledeclaration::compact_background_mutation_count()
+    }
+
+    fn BackgroundParseAttemptCount(_: &GlobalScope) -> u32 {
+        crate::dom::cssstyledeclaration::background_parse_attempt_count()
     }
 
     fn Js_backtrace(_: &GlobalScope) {

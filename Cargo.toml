@@ -220,14 +220,14 @@ rustls-pki-types = "1.14"
 rustls-platform-verifier = "0.7.0"
 sea-query = { version = "1.0.1", default-features = false, features = ["backend-sqlite", "derive"] }
 sea-query-rusqlite = "0.8.0"
-selectors = { git = "https://github.com/loomgui/stylo", rev = "f058ef9527d5bfed23308c944ea2d7ecc934018c" }
+selectors = { git = "https://github.com/loomgui/stylo", rev = "d0d01f1c205b6675bc03fb6b107f8a9f0794f101" }
 serde = "1.0.228"
 serde_bytes = "0.11"
 serde_core = "1.0.226"
 serde_json = "1.0"
 serde_test = "1.0"
 serde_with = "3.13"
-servo_arc = { git = "https://github.com/loomgui/stylo", rev = "f058ef9527d5bfed23308c944ea2d7ecc934018c" }
+servo_arc = { git = "https://github.com/loomgui/stylo", rev = "d0d01f1c205b6675bc03fb6b107f8a9f0794f101" }
 sha1 = "0.11"
 sha2 = "0.11"
 sha3 = "0.12"
@@ -238,12 +238,12 @@ speexdsp-resampler = "0.1.0"
 sponge-cursor = "0.1"
 string_cache = "0.11"
 strum = { version = "0.28", features = ["derive"] }
-stylo = { git = "https://github.com/loomgui/stylo", rev = "f058ef9527d5bfed23308c944ea2d7ecc934018c" }
-stylo_atoms = { git = "https://github.com/loomgui/stylo", rev = "f058ef9527d5bfed23308c944ea2d7ecc934018c" }
-stylo_dom = { git = "https://github.com/loomgui/stylo", rev = "f058ef9527d5bfed23308c944ea2d7ecc934018c" }
-stylo_malloc_size_of = { git = "https://github.com/loomgui/stylo", rev = "f058ef9527d5bfed23308c944ea2d7ecc934018c" }
-stylo_static_prefs = { git = "https://github.com/loomgui/stylo", rev = "f058ef9527d5bfed23308c944ea2d7ecc934018c" }
-stylo_traits = { git = "https://github.com/loomgui/stylo", rev = "f058ef9527d5bfed23308c944ea2d7ecc934018c" }
+stylo = { git = "https://github.com/loomgui/stylo", rev = "d0d01f1c205b6675bc03fb6b107f8a9f0794f101" }
+stylo_atoms = { git = "https://github.com/loomgui/stylo", rev = "d0d01f1c205b6675bc03fb6b107f8a9f0794f101" }
+stylo_dom = { git = "https://github.com/loomgui/stylo", rev = "d0d01f1c205b6675bc03fb6b107f8a9f0794f101" }
+stylo_malloc_size_of = { git = "https://github.com/loomgui/stylo", rev = "d0d01f1c205b6675bc03fb6b107f8a9f0794f101" }
+stylo_static_prefs = { git = "https://github.com/loomgui/stylo", rev = "d0d01f1c205b6675bc03fb6b107f8a9f0794f101" }
+stylo_traits = { git = "https://github.com/loomgui/stylo", rev = "d0d01f1c205b6675bc03fb6b107f8a9f0794f101" }
 surfman = "0.14.0"
 swapper = "0.1"
 syn = { version = "2", default-features = false, features = ["clone-impls", "derive", "parsing"] }
@@ -279,8 +279,8 @@ warp = "0.4.2"
 web_atoms = "0.3.0"
 webdriver = "0.54.0"
 webpki-roots = "1.0"
-webrender = { git = "https://github.com/loomgui/webrender", rev = "82affc7e81013b6aec09ad43328d53710a77facd", features = ["serde"] }
-webrender_api = { git = "https://github.com/loomgui/webrender", rev = "82affc7e81013b6aec09ad43328d53710a77facd" }
+webrender = { git = "https://github.com/loomgui/webrender", rev = "587360913ab15d0c7da4f49190c79bdb659aa2a3", features = ["serde"] }
+webrender_api = { git = "https://github.com/loomgui/webrender", rev = "587360913ab15d0c7da4f49190c79bdb659aa2a3" }
 wgpu-core = "30"
 wgpu-types = "30"
 winapi = "0.3"
@@ -288,7 +288,7 @@ windows-sys = "0.61"
 winit = "0.30.13"
 winresource = "0.1"
 wio = "0.2"
-wr_malloc_size_of = { git = "https://github.com/loomgui/webrender", rev = "82affc7e81013b6aec09ad43328d53710a77facd" }
+wr_malloc_size_of = { git = "https://github.com/loomgui/webrender", rev = "587360913ab15d0c7da4f49190c79bdb659aa2a3" }
 x-wing = { version = "0.1.0", features = ["zeroize"] }
 x25519-dalek = { version = "3.0", features = ["getrandom", "static_secrets", "zeroize"] }
 x448 = { version = "=0.14.0-pre.12", features = ["static_secrets"] }

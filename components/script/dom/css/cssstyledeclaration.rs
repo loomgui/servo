@@ -40,11 +40,22 @@ use crate::dom::window::Window;
 #[cfg(feature = "testbinding")]
 thread_local! {
     static INLINE_STYLE_PRESERVATION_CLONES: Cell<u32> = const { Cell::new(0) };
+    static COMPACT_BACKGROUND_MUTATIONS: Cell<u32> = const { Cell::new(0) };
+    static BACKGROUND_PARSE_ATTEMPTS: Cell<u32> = const { Cell::new(0) };
 }
 
 #[cfg(feature = "testbinding")]
 pub(crate) fn inline_style_preservation_clone_count() -> u32 {
     INLINE_STYLE_PRESERVATION_CLONES.with(Cell::get)
+}
+
+#[cfg(feature = "testbinding")]
+pub(crate) fn compact_background_mutation_count() -> u32 {
+    COMPACT_BACKGROUND_MUTATIONS.with(Cell::get)
+}
+#[cfg(feature = "testbinding")]
+pub(crate) fn background_parse_attempt_count() -> u32 {
+    BACKGROUND_PARSE_ATTEMPTS.with(Cell::get)
 }
 
 // http://dev.w3.org/csswg/cssom/#the-cssstyledeclaration-interface
@@ -79,6 +90,18 @@ impl CSSStyleOwner {
     where
         F: FnOnce(&mut PropertyDeclarationBlock, &mut bool) -> R,
     {
+        self.mutate_associated_block_with_preservation(cx, None, f)
+    }
+
+    fn mutate_associated_block_with_preservation<F, R>(
+        &self,
+        cx: &mut JSContext,
+        preservation: Option<bool>,
+        f: F,
+    ) -> R
+    where
+        F: FnOnce(&mut PropertyDeclarationBlock, &mut bool) -> R,
+    {
         // TODO(emilio): This has some duplication just to avoid dummy clones.
         //
         // This is somewhat complex but the complexity is encapsulated.
@@ -95,7 +118,9 @@ impl CSSStyleOwner {
 
                 // Preserve the old PDB only when an observer or custom-element
                 // callback can request the old style attribute value.
-                if element.needs_preserved_style_attribute_after_change(cx.no_gc()) {
+                if preservation.unwrap_or_else(|| {
+                    element.needs_preserved_style_attribute_after_change(cx.no_gc())
+                }) {
                     attribute_pdb = attribute_pdb.map(|attribute_pdb| {
                         #[cfg(feature = "testbinding")]
                         INLINE_STYLE_PRESERVATION_CLONES.with(|count| {
@@ -255,8 +280,8 @@ impl CSSStyleDeclaration {
         // If creating a CSSStyleDeclaration with CSSSStyleOwner::Null, this should always
         // be in read-only mode.
         assert!(
-            !matches!(owner, CSSStyleOwner::Null) ||
-                modification_access == CSSModificationAccess::Readonly
+            !matches!(owner, CSSStyleOwner::Null)
+                || modification_access == CSSModificationAccess::Readonly
         );
 
         CSSStyleDeclaration {
@@ -345,6 +370,117 @@ impl CSSStyleDeclaration {
         self.set_property_inner(cx, PotentiallyParsedPropertyId::Parsed(id), value, priority)
     }
 
+    /// One callback-free, same-PDB update. Unknown inputs keep the original path.
+    fn try_compact_background_property(
+        &self,
+        cx: &mut JSContext,
+        id: &PropertyId,
+        value: &DOMString,
+        priority: &DOMString,
+        preservation: &mut Option<bool>,
+    ) -> bool {
+        if id != &PropertyId::NonCustom(LonghandId::BackgroundColor.into())
+            || value.is_empty()
+            || !priority.is_empty()
+        {
+            return false;
+        }
+        let CSSStyleOwner::Element(element) = &self.owner else {
+            return false;
+        };
+        // Before the first completed Layout proof, keep the ordinary startup path.
+        if !element
+            .owner_document()
+            .may_have_background_style_snapshot_lease()
+        {
+            return false;
+        }
+        let Some((epoch, block)) = element.compact_background_style_admission(cx.no_gc()) else {
+            return false;
+        };
+        let (records, old_value) = if element.owner_window().get_exists_mut_observer() {
+            crate::dom::mutationobserver::MutationObserver::attribute_interest(
+                cx.no_gc(),
+                element.upcast::<Node>(),
+                &local_name!("style"),
+                &html5ever::ns!(),
+            )
+        } else {
+            (false, false)
+        };
+        // The ordinary path reuses this fresh old-value result on observer hits.
+        *preservation = Some(old_value);
+        if records {
+            return false;
+        }
+        let document = element.owner_document();
+        let mut declarations =
+            if let Some(declaration) = document.cached_absolute_background(&value.str()) {
+                SourcePropertyDeclaration::with_one(declaration)
+            } else {
+                let mut parsed = SourcePropertyDeclaration::default();
+                #[cfg(feature = "testbinding")]
+                BACKGROUND_PARSE_ATTEMPTS.with(|count| count.set(count.get().saturating_add(1)));
+                if parse_one_declaration_into(
+                    &mut parsed,
+                    id.clone(),
+                    &value.str(),
+                    Origin::Author,
+                    &UrlExtraData(document.base_url().get_arc()),
+                    Some(element.owner_window().css_error_reporter()),
+                    ParsingMode::DEFAULT,
+                    document.quirks_mode(),
+                    CssRuleType::Style,
+                )
+                .is_err()
+                {
+                    return true;
+                } // Ordinary parse rejection: unchanged, one diagnostic only.
+                if parsed.declarations.len() != 1
+                    || style::properties::declaration_block::independent_background_color(
+                        &parsed.declarations[0],
+                    )
+                    .is_none()
+                {
+                    // Parsed once but not independently cacheable: perform the exact
+                    // ordinary mutation/install with this source declaration.
+                    self.owner.mutate_associated_block_with_preservation(
+                        cx,
+                        *preservation,
+                        |pdb, changed| {
+                            let mut updates = Default::default();
+                            *changed =
+                                pdb.prepare_for_update(&parsed, Importance::Normal, &mut updates);
+                            if *changed {
+                                pdb.update(parsed.drain(), Importance::Normal, &mut updates);
+                            }
+                        },
+                    );
+                    return true;
+                }
+                document.cache_absolute_background(&value.str(), parsed.declarations[0].clone());
+                parsed
+            };
+        let lock = document.style_shared_author_lock();
+        let changed = {
+            let mut guard = lock.write();
+            let pdb = block.write_with(&mut guard);
+            let mut updates = Default::default();
+            if !pdb.prepare_for_update(&declarations, Importance::Normal, &mut updates) {
+                false
+            } else {
+                pdb.update(declarations.drain(), Importance::Normal, &mut updates);
+                true
+            }
+        };
+        if changed {
+            element.complete_compact_background_style(cx, epoch, block);
+            #[cfg(feature = "testbinding")]
+            COMPACT_BACKGROUND_MUTATIONS.with(|count| count.set(count.get().saturating_add(1)));
+        }
+        true
+    }
+
     /// <https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-setproperty>
     ///
     /// This function receives a `PotentiallyParsedPropertyId` instead of a `DOMString` in case
@@ -378,64 +514,74 @@ impl CSSStyleDeclaration {
                 }
             },
         };
+        let mut preservation = None;
+        if self.try_compact_background_property(cx, &id, &value, &priority, &mut preservation) {
+            return Ok(());
+        }
         let base_url = UrlExtraData(self.owner.base_url().get_arc());
-        self.owner.mutate_associated_block(cx, |pdb, changed| {
-            // Step 3. If value is the empty string, invoke removeProperty()
-            // with property as argument and return.
-            if value.is_empty() {
-                *changed = remove_property(pdb, &id);
-                return Ok(());
-            }
-
-            // Step 4. If priority is not the empty string and is not an ASCII case-insensitive
-            // match for the string "important", then return.
-            let importance = match &*priority.str() {
-                "" => Importance::Normal,
-                p if p.eq_ignore_ascii_case("important") => Importance::Important,
-                _ => {
-                    *changed = false;
+        self.owner
+            .mutate_associated_block_with_preservation(cx, preservation, |pdb, changed| {
+                // Step 3. If value is the empty string, invoke removeProperty()
+                // with property as argument and return.
+                if value.is_empty() {
+                    *changed = remove_property(pdb, &id);
                     return Ok(());
-                },
-            };
+                }
 
-            // Step 5
-            let window = self.owner.window();
-            let quirks_mode = window.Document().quirks_mode();
-            let mut declarations = SourcePropertyDeclaration::default();
-            let result = parse_one_declaration_into(
-                &mut declarations,
-                id,
-                &value.str(),
-                Origin::Author,
-                &base_url,
-                Some(window.css_error_reporter()),
-                ParsingMode::DEFAULT,
-                quirks_mode,
-                CssRuleType::Style,
-            );
+                // Step 4. If priority is not the empty string and is not an ASCII case-insensitive
+                // match for the string "important", then return.
+                let importance = match &*priority.str() {
+                    "" => Importance::Normal,
+                    p if p.eq_ignore_ascii_case("important") => Importance::Important,
+                    _ => {
+                        *changed = false;
+                        return Ok(());
+                    },
+                };
 
-            // Step 6
-            match result {
-                Ok(()) => {},
-                Err(_) => {
-                    *changed = false;
+                // Step 5
+                let window = self.owner.window();
+                let quirks_mode = window.Document().quirks_mode();
+                let mut declarations = SourcePropertyDeclaration::default();
+                #[cfg(feature = "testbinding")]
+                if id == PropertyId::NonCustom(LonghandId::BackgroundColor.into()) {
+                    BACKGROUND_PARSE_ATTEMPTS
+                        .with(|count| count.set(count.get().saturating_add(1)));
+                }
+                let result = parse_one_declaration_into(
+                    &mut declarations,
+                    id,
+                    &value.str(),
+                    Origin::Author,
+                    &base_url,
+                    Some(window.css_error_reporter()),
+                    ParsingMode::DEFAULT,
+                    quirks_mode,
+                    CssRuleType::Style,
+                );
+
+                // Step 6
+                match result {
+                    Ok(()) => {},
+                    Err(_) => {
+                        *changed = false;
+                        return Ok(());
+                    },
+                }
+
+                let mut updates = Default::default();
+                *changed = pdb.prepare_for_update(&declarations, importance, &mut updates);
+
+                if !*changed {
                     return Ok(());
-                },
-            }
+                }
 
-            let mut updates = Default::default();
-            *changed = pdb.prepare_for_update(&declarations, importance, &mut updates);
+                // Step 7
+                // Step 8
+                pdb.update(declarations.drain(), importance, &mut updates);
 
-            if !*changed {
-                return Ok(());
-            }
-
-            // Step 7
-            // Step 8
-            pdb.update(declarations.drain(), importance, &mut updates);
-
-            Ok(())
-        })
+                Ok(())
+            })
     }
 }
 

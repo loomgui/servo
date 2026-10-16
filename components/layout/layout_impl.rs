@@ -8,6 +8,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use accesskit::ActionRequest;
@@ -177,6 +178,9 @@ pub struct LayoutThread {
     /// layout trees remain the same.
     need_new_display_list: Cell<bool>,
     background_colors: Mutex<crate::background_color_cache::BackgroundColorCache>,
+    // Checked global-input identity, independent of ordinary DOM-only mutations.
+    inline_background_epoch: Option<u64>,
+    inline_background_count: AtomicU32,
     previously_frame_focused: Cell<bool>,
 
     /// Whether or not cumulative containing blocks offsets have been set into the
@@ -681,6 +685,17 @@ impl Layout for LayoutThread {
     }
 
     fn reflow(&mut self, reflow_request: ReflowRequest) -> Option<ReflowResult> {
+        let _attribution =
+            style::inline_background::PreparedBackgroundStyle::begin_layout_attribution(
+                &self.id,
+                &reflow_request.reflow_goal,
+                &reflow_request.epoch,
+                reflow_request.restyle.is_some(),
+                reflow_request
+                    .restyle
+                    .as_ref()
+                    .map_or(0, |restyle| restyle.pending_restyles.len()),
+            );
         time_profile!(
             profile_time::ProfilerCategory::Layout,
             self.profiler_metadata(),
@@ -859,6 +874,8 @@ impl LayoutThread {
             need_containing_block_calculation: Cell::new(false),
             need_new_display_list: Cell::new(false),
             background_colors: Default::default(),
+            inline_background_epoch: Some(0),
+            inline_background_count: AtomicU32::new(0),
             previously_frame_focused: Cell::new(false),
             need_new_stacking_context_tree: Cell::new(false),
             box_tree: Default::default(),
@@ -899,6 +916,8 @@ impl LayoutThread {
             current_time_for_animations: animation_timeline_value,
             traversal_flags,
             snapshot_map,
+            inline_background_epoch: None,
+            inline_background_count: None,
         }
     }
 
@@ -1043,6 +1062,13 @@ impl LayoutThread {
         true
     }
 
+    fn completed_background_snapshot_lease(&self, request: &ReflowRequest) -> Option<u64> {
+        (request.allow_background_style_snapshot_lease
+            && self.stylist.document_style_snapshots_independent())
+        .then_some(self.inline_background_epoch)
+        .flatten()
+    }
+
     /// The high-level routine that performs layout.
     #[servo_tracing::instrument(
         skip_all,
@@ -1052,13 +1078,21 @@ impl LayoutThread {
         self.maybe_print_reflow_event(&reflow_request);
 
         if self.can_skip_reflow_request_entirely(&reflow_request) {
-            // We can skip layout, but we might need to update a scroll node.
-            return self
-                .handle_update_scroll_node_request(&reflow_request)
-                .then(|| ReflowResult {
-                    reflow_phases_run: ReflowPhasesRun::UpdatedScrollNodeOffset,
-                    ..Default::default()
-                });
+            // This branch has no pending restyle and an up-to-date existing tree.
+            // Return its freshly checked lease even when no scroll work occurs;
+            // None remains failure/unknown and must never revive a Script lease.
+            let scrolled = self.handle_update_scroll_node_request(&reflow_request);
+            return Some(ReflowResult {
+                completed_no_work: !scrolled,
+                background_style_snapshot_lease: self
+                    .completed_background_snapshot_lease(&reflow_request),
+                reflow_phases_run: if scrolled {
+                    ReflowPhasesRun::UpdatedScrollNodeOffset
+                } else {
+                    ReflowPhasesRun::empty()
+                },
+                ..Default::default()
+            });
         }
 
         let document = unsafe { ServoLayoutNode::new(&reflow_request.document) };
@@ -1080,7 +1114,13 @@ impl LayoutThread {
             animating_images: reflow_request.animating_images.clone(),
             animation_timeline_value: reflow_request.animation_timeline_value,
         });
-        let mut reflow_statistics = Default::default();
+        let mut reflow_statistics = ReflowStatistics::default();
+        let collect_inline_backgrounds = pref!(dom_servo_helpers_enabled)
+            || self.time_profiler_chan.0.is_some()
+            || GLOBAL_STYLE_DATA.options.dump_style_statistics;
+        if collect_inline_backgrounds {
+            self.inline_background_count.store(0, Ordering::Relaxed);
+        }
 
         let mut accessibility_damage =
             to_accessibility_damage_map(std::mem::take(&mut reflow_request.accessibility_damage));
@@ -1092,7 +1132,12 @@ impl LayoutThread {
                 root_element,
                 &image_resolver,
                 accessibility_damage.as_mut(),
+                &mut reflow_statistics,
             );
+        if collect_inline_backgrounds {
+            reflow_statistics.inline_background_color_recascade_count =
+                self.inline_background_count.load(Ordering::Relaxed);
+        }
 
         if self.build_stacking_context_tree_for_reflow(&reflow_request) {
             reflow_phases_run.insert(ReflowPhasesRun::BuiltStackingContextTree);
@@ -1102,6 +1147,8 @@ impl LayoutThread {
         if self.handle_update_scroll_node_request(&reflow_request) {
             reflow_phases_run.insert(ReflowPhasesRun::UpdatedScrollNodeOffset);
         }
+        let background_style_snapshot_lease =
+            self.completed_background_snapshot_lease(&reflow_request);
         let mut pending_accessibility_actions = vec![];
         if self.handle_accessibility_tree_update(
             &root_element.as_node(),
@@ -1134,6 +1181,8 @@ impl LayoutThread {
             .unwrap_or_default();
 
         Some(ReflowResult {
+            completed_no_work: false,
+            background_style_snapshot_lease,
             reflow_phases_run,
             pending_images,
             pending_rasterization_images,
@@ -1221,7 +1270,11 @@ impl LayoutThread {
         root_element: ServoLayoutElement<'dom>,
         image_resolver: &Arc<ImageResolver>,
         mut accessibility_damage: Option<&mut AccessibilityDamageMap<'dom>>,
+        reflow_statistics: &mut ReflowStatistics,
     ) -> (ReflowPhasesRun, IFrameSizes, WebFontSetDifference) {
+        let _attribution_exit =
+            style::inline_background::PreparedBackgroundStyle::layout_attribution_exit();
+        style::inline_background::PreparedBackgroundStyle::layout_attribution_mark("capture_begin");
         if reflow_request.restyle.as_ref().is_some_and(|restyle| {
             !(restyle.reason
                 - (layout_api::RestyleReason::DOMChanged
@@ -1230,67 +1283,299 @@ impl LayoutThread {
         }) {
             self.background_colors.lock().invalidate();
         }
+        let mut certified_input = reflow_request
+            .restyle
+            .as_ref()
+            .and_then(crate::certified_background::CertifiedBackgroundInput::capture);
+        // Inspect the explicit tags before SnapshotSetter consumes the list.
+        // A real snapshot on a tagged entry still has missing STYLE history.
+        let (had_omissions, tags_current) =
+            reflow_request
+                .restyle
+                .as_ref()
+                .map_or((false, true), |restyle| {
+                    restyle.pending_restyles.iter().fold(
+                        (false, true),
+                        |(had, valid), (_, pending)| match pending.style_snapshot_omitted {
+                            None => (had, valid),
+                            Some(_) => (
+                                true,
+                                valid
+                                    && crate::certified_background::omission_tag_is_current(
+                                        pending,
+                                        self.inline_background_epoch,
+                                    ),
+                            ),
+                        },
+                    )
+                });
         let mut snapshot_map = SnapshotMap::new();
         let _snapshot_setter = match reflow_request.restyle.as_mut() {
             Some(restyle) => SnapshotSetter::new(restyle, &mut snapshot_map),
             None => return Default::default(),
         };
 
+        let dangerous_root_element = unsafe { root_element.dangerous_style_element() };
+        // This scope performs ordinary environment preparation exactly once.
+        // The prepared result owns all values; no stylesheet, pool, PDB, cache,
+        // box or fragment guard may survive the painter reply wait below.
+        let (
+            stylist_update,
+            device_has_changed,
+            stable_environment,
+            no_active_effects,
+            omissions_valid,
+            prepared,
+        ) = {
+            let shared_locks = document.shared_style_locks();
+            let user_agent_stylesheets = get_ua_stylesheets(&shared_locks.ua_or_user);
+            let guards = StylesheetGuards {
+                author: &shared_locks.author.read(),
+                ua_or_user: &shared_locks.ua_or_user.read(),
+            };
+
+            let rayon_pool_guard = STYLE_THREAD_POOL.lock();
+            let _rayon_pool = rayon_pool_guard.pool();
+
+            let device_has_changed = std::mem::replace(&mut self.device_has_changed, false);
+            if device_has_changed {
+                let sheet_origins_affected_by_device_change = self
+                    .stylist
+                    .media_features_change_changed_style(&guards, self.device());
+                self.stylist
+                    .force_stylesheet_origins_dirty(sheet_origins_affected_by_device_change);
+
+                if let Some(mut data) = dangerous_root_element.mutate_data() {
+                    data.hint.insert(RestyleHint::recascade_subtree());
+                }
+            }
+
+            let stylist_update = self.prepare_stylist_for_reflow(
+                reflow_request,
+                document,
+                &guards,
+                &user_agent_stylesheets,
+            );
+            let omissions_valid = tags_current
+                && reflow_request.allow_background_style_snapshot_lease
+                && reflow_request.restyle.as_ref().is_some_and(|restyle| {
+                    restyle.reason == layout_api::RestyleReason::PendingRestyles
+                        && !restyle.stylesheets_changed
+                })
+                && !device_has_changed
+                && stylist_update.invalidation_set.is_empty()
+                && stylist_update.changed_web_fonts.is_empty()
+                && !stylist_update
+                    .changed_web_fonts
+                    .cascade_index_of_any_rule_changed
+                && self.stylist.document_style_snapshots_independent();
+            if had_omissions && !omissions_valid {
+                promote_omitted_snapshot_restyle(root_element);
+                certified_input = None;
+            }
+            stylist_update
+                .invalidation_set
+                .process_style(dangerous_root_element, Some(&snapshot_map));
+
+            if self.previously_highlighted_dom_node.get() != reflow_request.highlighted_dom_node
+                || self.previously_frame_focused.get() != reflow_request.frame_focused
+            {
+                // Need to manually force layout to build a new display list regardless of whether the box tree
+                // changed or not.
+                self.set_needs_new_display_list();
+            }
+
+            let dom_only = reflow_request.restyle.as_ref().is_some_and(|restyle| {
+                (restyle.reason
+                    - (layout_api::RestyleReason::DOMChanged
+                        | layout_api::RestyleReason::PendingRestyles))
+                    .is_empty()
+            });
+            let stable_environment = dom_only
+                && !device_has_changed
+                && !reflow_request.stylesheets_changed()
+                && stylist_update.invalidation_set.is_empty()
+                && stylist_update.changed_web_fonts.is_empty()
+                && !stylist_update
+                    .changed_web_fonts
+                    .cascade_index_of_any_rule_changed;
+            if !stable_environment {
+                self.inline_background_epoch = self
+                    .inline_background_epoch
+                    .and_then(|epoch| epoch.checked_add(1));
+            }
+            let no_active_effects = reflow_request.animations.sets.read().is_empty();
+            let prepared = if stable_environment
+                && no_active_effects
+                && matches!(reflow_request.reflow_goal, ReflowGoal::UpdateTheRendering)
+                && !self.need_new_display_list.get()
+                && !self.need_new_stacking_context_tree.get()
+                && self.fragment_tree.borrow().is_some()
+                && self
+                    .stacking_context_tree
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|tree| self.retained_backgrounds_eligible(reflow_request, tree))
+            {
+                let mut shared = self.build_shared_style_context(
+                    guards,
+                    &snapshot_map,
+                    reflow_request.animation_timeline_value,
+                    &reflow_request.animations,
+                    TraversalFlags::empty(),
+                );
+                shared.inline_background_epoch = self.inline_background_epoch;
+                if pref!(dom_servo_helpers_enabled)
+                    || self.time_profiler_chan.0.is_some()
+                    || GLOBAL_STYLE_DATA.options.dump_style_statistics
+                {
+                    // The existing helper/stat gate controls integer proof accounting;
+                    // no new production env, clock, atomic or per-target logging.
+                    shared.inline_background_count = Some(&self.inline_background_count);
+                }
+                certified_input.and_then(|input| {
+                    style::inline_background::PreparedBackgroundStyle::layout_attribution_mark(
+                        "prepare_begin",
+                    );
+                    let prepared = input.prepare(&shared, &mut self.background_colors.lock());
+                    style::inline_background::PreparedBackgroundStyle::layout_attribution_mark(
+                        "prepare_end",
+                    );
+                    prepared
+                })
+            } else {
+                None
+            };
+            (
+                stylist_update,
+                device_has_changed,
+                stable_environment,
+                no_active_effects,
+                omissions_valid,
+                prepared,
+            )
+        };
+        style::inline_background::PreparedBackgroundStyle::layout_attribution_mark(
+            "guards_released",
+        );
+        if let Some(prepared) = prepared {
+            let accepted = Self::submit_certified_background_update(
+                &self.background_colors,
+                &self.need_new_display_list,
+                reflow_statistics,
+                |statistics| {
+                    prepared.submit(statistics, |generation, colors| {
+                        style::inline_background::PreparedBackgroundStyle::layout_attribution_mark(
+                            "ack_begin",
+                        );
+                        let reply = profile_time::profile_if_active(
+                            profile_time::ProfilerCategory::LayoutBackgroundColorUpdate,
+                            || self.profiler_metadata(),
+                            &self.time_profiler_chan,
+                            || {
+                                self.paint_api.update_background_colors(
+                                    self.webview_id,
+                                    self.id,
+                                    reflow_request.epoch,
+                                    generation,
+                                    colors,
+                                )
+                            },
+                        );
+                        style::inline_background::PreparedBackgroundStyle::layout_attribution_ack(
+                            reply,
+                        );
+                        reply
+                    }, |reusable_styles| {
+                        self.background_colors.lock().publish_reusable_styles(reusable_styles);
+                    })
+                },
+            );
+            style::inline_background::PreparedBackgroundStyle::layout_attribution_mark(
+                "commit_end",
+            );
+            if let Some(count) = accepted {
+                style::inline_background::PreparedBackgroundStyle::layout_attribution_accepted(
+                    count,
+                );
+                reflow_statistics.certified_background_color_count = count;
+                if GLOBAL_STYLE_DATA.options.dump_style_statistics {
+                    let utc_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_micros())
+                        .unwrap_or(0);
+                    println!(
+                        "[PERF] CertifiedBackgroundBatch accepted_batches=1 accepted_nodes={count} utc_us={utc_us} pipeline={:?} epoch={:?}",
+                        self.id, reflow_request.epoch,
+                    );
+                }
+                if pref!(dom_servo_helpers_enabled)
+                    || self.time_profiler_chan.0.is_some()
+                    || GLOBAL_STYLE_DATA.options.dump_style_statistics
+                {
+                    self.inline_background_count
+                        .fetch_add(count, Ordering::Relaxed);
+                }
+                let mut tree = self.stacking_context_tree.borrow_mut();
+                self.finish_background_color_commit(reflow_request, tree.as_mut().unwrap());
+                return (
+                    ReflowPhasesRun::UpdatedBackgroundColors,
+                    IFrameSizes::default(),
+                    stylist_update.changed_web_fonts,
+                );
+            }
+            // No style, dirty-path, or fragment authority was consumed on false
+            // ACK/channel failure. Continue ordinary traversal in this call and
+            // force a complete current-epoch list after the rejected generation.
+        }
+
+        if had_omissions && !omissions_valid {
+            // Missing history with revoked/mixed/unknown proof requires genuine
+            // whole-tree matching. With a freshly valid negative dependency
+            // proof, SnapshotSetter already installed every target's exact
+            // STYLE_ATTRIBUTE hint: ordinary eager traversal can consume it even
+            // after a leaf miss, query or false ACK, without old STYLE selectors.
+            promote_omitted_snapshot_restyle(root_element);
+        }
+        // Any ordinary traversal can replace a primary/parent/pseudo/tree input.
+        // Retire the whole non-authoritative population synchronously before it.
+        self.background_colors.lock().clear_reusable_styles();
+
         let shared_locks = document.shared_style_locks();
-        let user_agent_stylesheets = get_ua_stylesheets(&shared_locks.ua_or_user);
         let guards = StylesheetGuards {
             author: &shared_locks.author.read(),
             ua_or_user: &shared_locks.ua_or_user.read(),
         };
-
         let rayon_pool = STYLE_THREAD_POOL.lock();
         let rayon_pool = rayon_pool.pool();
         let rayon_pool = rayon_pool.as_ref();
-
-        let device_has_changed = std::mem::replace(&mut self.device_has_changed, false);
-        let dangerous_root_element = unsafe { root_element.dangerous_style_element() };
-        if device_has_changed {
-            let sheet_origins_affected_by_device_change = self
-                .stylist
-                .media_features_change_changed_style(&guards, self.device());
-            self.stylist
-                .force_stylesheet_origins_dirty(sheet_origins_affected_by_device_change);
-
-            if let Some(mut data) = dangerous_root_element.mutate_data() {
-                data.hint.insert(RestyleHint::recascade_subtree());
-            }
-        }
-
-        let stylist_update = self.prepare_stylist_for_reflow(
-            reflow_request,
-            document,
-            &guards,
-            &user_agent_stylesheets,
+        let mut style_context = self.build_shared_style_context(
+            guards,
+            &snapshot_map,
+            reflow_request.animation_timeline_value,
+            &reflow_request.animations,
+            match reflow_request.stylesheets_changed() {
+                true => TraversalFlags::ForCSSRuleChanges,
+                false => TraversalFlags::empty(),
+            },
         );
-        stylist_update
-            .invalidation_set
-            .process_style(dangerous_root_element, Some(&snapshot_map));
-
-        if self.previously_highlighted_dom_node.get() != reflow_request.highlighted_dom_node
-            || self.previously_frame_focused.get() != reflow_request.frame_focused
+        // Query contexts deliberately keep None. Effects are conservatively
+        // excluded for the entire document, without per-element map locks.
+        if stable_environment
+            && no_active_effects
+            && matches!(reflow_request.reflow_goal, ReflowGoal::UpdateTheRendering)
         {
-            // Need to manually force layout to build a new display list regardless of whether the box tree
-            // changed or not.
-            self.set_needs_new_display_list();
+            style_context.inline_background_epoch = self.inline_background_epoch;
         }
-
+        if pref!(dom_servo_helpers_enabled)
+            || self.time_profiler_chan.0.is_some()
+            || GLOBAL_STYLE_DATA.options.dump_style_statistics
+        {
+            style_context.inline_background_count = Some(&self.inline_background_count);
+        }
         let layout_context = LayoutContext {
             background_colors: &self.background_colors,
-            style_context: self.build_shared_style_context(
-                guards,
-                &snapshot_map,
-                reflow_request.animation_timeline_value,
-                &reflow_request.animations,
-                match reflow_request.stylesheets_changed() {
-                    true => TraversalFlags::ForCSSRuleChanges,
-                    false => TraversalFlags::empty(),
-                },
-            ),
+            style_context,
             font_context: self.font_context.clone(),
             iframe_sizes: Mutex::default(),
             allow_parallel_layout: rayon_pool.is_some(),
@@ -1311,11 +1596,18 @@ impl LayoutThread {
         {
             let _span = profile_traits::trace_span!("Styling").entered();
 
-            let original_dirty_root = unsafe {
-                ServoLayoutNode::new(&restyle.dirty_root.unwrap())
-                    .as_element()
-                    .unwrap()
-                    .dangerous_style_element()
+            // OpaqueNode is a JS reflector identity, not a TrustedNodeAddress.
+            // Revoked or mixed omissions must start at the actual typed document
+            // element, including when the ordinary dirty root is absent/narrower.
+            let original_dirty_root = if had_omissions && !omissions_valid {
+                dangerous_root_element
+            } else {
+                unsafe {
+                    ServoLayoutNode::new(&restyle.dirty_root.unwrap())
+                        .as_element()
+                        .unwrap()
+                        .dangerous_style_element()
+                }
             };
 
             recalc_style_traversal = RecalcStyle::new(&layout_context);
@@ -1576,19 +1868,7 @@ impl LayoutThread {
 
         // Property-only transactions still run the ordinary script frame request,
         // including canvas delays and the embedder's exact FrameBuilt tag gate.
-        let eligible = stacking_context_tree
-            .paint_info
-            .snapshot_image_keys
-            .is_empty()
-            && self.previously_highlighted_dom_node.get() == reflow_request.highlighted_dom_node
-            && self.previously_frame_focused.get() == reflow_request.frame_focused
-            && self
-                .paint_timing_handler
-                .borrow()
-                .as_ref()
-                .is_some_and(|handler| {
-                    handler.can_retain_background_colors(reflow_request.paint_timing_eligible)
-                });
+        let eligible = self.retained_backgrounds_eligible(reflow_request, stacking_context_tree);
         // End the mutex borrow before waiting for the owner's validation ACK.
         let updates = if eligible {
             self.background_colors.lock().take_updates()
@@ -1627,23 +1907,67 @@ impl LayoutThread {
             },
         );
         if phase == ReflowPhasesRun::UpdatedBackgroundColors {
-            profile_time::profile_if_active(
-                profile_time::ProfilerCategory::LayoutBackgroundColorCommit,
-                || self.profiler_metadata(),
-                &self.time_profiler_chan,
-                || {
-                    if let Some(handler) = self.paint_timing_handler.borrow_mut().as_mut() {
-                        let report = handler.mark_paint_timing(
-                            reflow_request.paint_timing_eligible,
-                            reflow_request.halt_lcp,
-                        );
-                        debug_assert!(report.is_empty());
-                    }
-                    stacking_context_tree.paint_info.epoch = reflow_request.epoch;
-                },
-            );
+            self.finish_background_color_commit(reflow_request, stacking_context_tree);
         }
         phase
+    }
+
+    fn retained_backgrounds_eligible(
+        &self,
+        reflow_request: &ReflowRequest,
+        tree: &StackingContextTree,
+    ) -> bool {
+        tree.paint_info.snapshot_image_keys.is_empty()
+            && self.previously_highlighted_dom_node.get() == reflow_request.highlighted_dom_node
+            && self.previously_frame_focused.get() == reflow_request.frame_focused
+            && self
+                .paint_timing_handler
+                .borrow()
+                .as_ref()
+                .is_some_and(|handler| {
+                    handler.can_retain_background_colors(reflow_request.paint_timing_eligible)
+                })
+    }
+
+    fn finish_background_color_commit(
+        &self,
+        reflow_request: &ReflowRequest,
+        stacking_context_tree: &mut StackingContextTree,
+    ) {
+        profile_time::profile_if_active(
+            profile_time::ProfilerCategory::LayoutBackgroundColorCommit,
+            || self.profiler_metadata(),
+            &self.time_profiler_chan,
+            || {
+                if let Some(handler) = self.paint_timing_handler.borrow_mut().as_mut() {
+                    let report = handler.mark_paint_timing(
+                        reflow_request.paint_timing_eligible,
+                        reflow_request.halt_lcp,
+                    );
+                    debug_assert!(report.is_empty());
+                }
+                stacking_context_tree.paint_info.epoch = reflow_request.epoch;
+            },
+        );
+    }
+
+    /// The actual early-batch dispatch transition. Rejection leaves staged
+    /// styles untouched, invalidates the rejected generation, and requires a
+    /// fresh full list when this same reflow continues through normal traversal.
+    pub(crate) fn submit_certified_background_update(
+        cache: &Mutex<crate::background_color_cache::BackgroundColorCache>,
+        dirty: &Cell<bool>,
+        statistics: &mut ReflowStatistics,
+        submit_prepared: impl FnOnce(&mut ReflowStatistics) -> Option<u32>,
+    ) -> Option<u32> {
+        let count = submit_prepared(statistics);
+        if count.is_some() {
+            dirty.set(false);
+        } else {
+            cache.lock().invalidate();
+            dirty.set(true);
+        }
+        count
     }
 
     /// The production caller owns rejection recovery: the full list is built
@@ -2082,6 +2406,20 @@ impl FontMetricsProvider for LayoutFontMetricsProvider {
 impl Debug for LayoutFontMetricsProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("LayoutFontMetricsProvider").finish()
+    }
+}
+
+/// Full rematching, not just root dirtying or recascading an old rule node.
+/// Preserve every supplied generic snapshot; missing STYLE history is never made up.
+fn promote_omitted_snapshot_restyle(root: ServoLayoutElement<'_>) {
+    // The caller selects this already typed root for the actual traversal.
+    // Never reinterpret its OpaqueNode/JS reflector identity as a native address.
+    let dangerous = unsafe { root.dangerous_style_element() };
+    if let Some(mut data) = dangerous.mutate_data() {
+        data.hint.insert(RestyleHint::restyle_subtree());
+    }
+    unsafe {
+        dangerous.set_dirty_descendants();
     }
 }
 

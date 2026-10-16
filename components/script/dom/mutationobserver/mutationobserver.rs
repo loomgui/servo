@@ -108,6 +108,40 @@ impl MutationObserver {
         &self.callback
     }
 
+    /// Fresh matching interest for one attribute; no cross-write observer cache.
+    pub(crate) fn attribute_interest(
+        no_gc: &NoGC,
+        target: &Node,
+        name: &LocalName,
+        namespace: &Namespace,
+    ) -> (bool, bool) {
+        let mut records = false;
+        let mut old_value = false;
+        for node in target.inclusive_ancestors_unrooted(no_gc, ShadowIncluding::No) {
+            let Some(registered) = node.registered_mutation_observers() else {
+                continue;
+            };
+            for registration in &*registered {
+                let options = &registration.options;
+                if (*node == target || options.subtree)
+                    && options.observes_attribute(name, namespace)
+                {
+                    records = true;
+                    old_value |= options.attribute_old_value;
+                }
+            }
+        }
+        (records, old_value)
+    }
+
+    /// Preserve the ordinary empty notification microtask after a fresh negative
+    /// interest proof. No callbacks run between the proof and this transaction.
+    pub(crate) fn queue_unobserved_attribute_microtask(cx: &mut JSContext, target: &Node) {
+        if target.global().as_window().get_exists_mut_observer() {
+            ScriptThread::mutation_observers().queue_mutation_observer_microtask(cx);
+        }
+    }
+
     /// Whether queuing this attribute mutation can request its old value.
     /// Use the same observer lists, ancestry, and option matching as record
     /// delivery, including registered observers on a detached subtree.

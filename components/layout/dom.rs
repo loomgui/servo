@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use atomic_refcell::{AtomicRef, AtomicRefCell, AtomicRefMut};
 use layout_api::{
@@ -26,10 +27,12 @@ use crate::dom_traversal::{Contents, NodeAndStyleInfo};
 use crate::flexbox::FlexLevelBox;
 use crate::flow::inline::text_run::TextRun;
 use crate::flow::inline::{InlineItem, SharedInlineStyles, WeakInlineItem};
-use crate::flow::{BlockLevelBox, BlockLevelCreator};
-use crate::fragment_tree::{Fragment, FragmentFlags};
+use crate::flow::{BlockContainer, BlockLevelBox, BlockLevelCreator};
+use crate::formatting_contexts::IndependentFormattingContext;
+use crate::fragment_tree::{BoxFragment, Fragment, FragmentFlags, FragmentStatus};
 use crate::geom::PhysicalSize;
 use crate::layout_box_base::LayoutBoxBase;
+use crate::positioned::AbsolutelyPositionedBox;
 use crate::replaced::{CanvasInfo, IFrameInfo, ImageInfo, VideoInfo};
 use crate::style_ext::{
     ComputedValuesExt, Display, DisplayGeneratingBox, DisplayLayoutInternal, DisplayOutside,
@@ -88,14 +91,27 @@ impl InnerDOMLayoutData {
     }
 
     fn repair_style(&self, node: &ServoLayoutNode, context: &LayoutContext) {
+        // A witness belongs only to the primary element and is consumed even
+        // when its box has gone away. Never keep it across fragment repair or
+        // offer a primary-element proof to a pseudo-element.
+        let background_color_change = if node.pseudo_element_chain().is_empty() {
+            node.as_element().and_then(|element| {
+                element
+                    .element_data_mut()
+                    .take_background_color_change_witness()
+            })
+        } else {
+            None
+        };
         if let Some(layout_object) = &*self.self_box.borrow() {
             let new_style = node.style(&context.style_context);
             if layout_object
                 .with_base(|base| {
-                    context
-                        .background_colors
-                        .lock()
-                        .record_style_change(base, &new_style);
+                    context.background_colors.lock().record_style_change(
+                        base,
+                        &new_style,
+                        background_color_change.as_ref(),
+                    );
                 })
                 .is_none()
             {
@@ -128,6 +144,248 @@ impl InnerDOMLayoutData {
                 .data
                 .borrow()
                 .with_layout_box_base(&mut callback);
+        }
+    }
+}
+
+/// Owned repair handles for one certified empty flow leaf. Preparation changes
+/// no style or fragment state and retains no RefCell/style/cache guard.
+pub(crate) struct PreparedEmptyBackgroundLeaf {
+    owner: EmptyBackgroundOwner,
+    inline_styles: Option<SharedInlineStyles>,
+    fragment: Arc<BoxFragment>,
+    used_cached_proof: bool,
+    proof: EmptyBackgroundLeafProof,
+}
+
+/// Plain shape token carried in the existing per-binding reuse slot. Generation
+/// and exact current style/Selection are checked before this token is considered.
+/// No node or owner allocation is kept alive by these integer identities.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EmptyBackgroundLeafProof {
+    owner: (u8, usize),
+    fragment: usize,
+    base_flags: FragmentFlags,
+}
+
+impl PartialEq for EmptyBackgroundLeafProof {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner == other.owner
+            && self.fragment == other.fragment
+            // Compare every stored bit, including future/unknown flags.
+            && self.base_flags.bits() == other.base_flags.bits()
+    }
+}
+impl Eq for EmptyBackgroundLeafProof {}
+
+enum EmptyBackgroundOwner {
+    Block(ArcRefCell<BlockLevelBox>),
+    Positioned(ArcRefCell<AbsolutelyPositionedBox>),
+    Atomic(ArcRefCell<IndependentFormattingContext>),
+}
+
+impl EmptyBackgroundOwner {
+    fn identity(&self) -> (u8, usize) {
+        match self {
+            Self::Block(value) => (0, &**value as *const _ as usize),
+            Self::Positioned(value) => (1, &**value as *const _ as usize),
+            Self::Atomic(value) => (2, &**value as *const _ as usize),
+        }
+    }
+
+    fn repair(&self, style: &ServoArc<ComputedValues>) {
+        match self {
+            Self::Block(block) => block
+                .borrow_mut()
+                .with_base_mut(|base| base.repair_style(style)),
+            Self::Positioned(positioned) => {
+                positioned.borrow_mut().context.base.repair_style(style)
+            },
+            Self::Atomic(atomic) => atomic.borrow_mut().base.repair_style(style),
+        }
+    }
+}
+
+impl PreparedEmptyBackgroundLeaf {
+    pub(crate) fn prepare(
+        node: ServoLayoutNode<'_>,
+        primary: &ServoArc<ComputedValues>,
+        selection: &ServoArc<ComputedValues>,
+    ) -> Option<Self> {
+        Self::prepare_with_cached(node, primary, selection, |_| None)
+    }
+
+    pub(crate) fn prepare_with_cached(
+        node: ServoLayoutNode<'_>,
+        primary: &ServoArc<ComputedValues>,
+        selection: &ServoArc<ComputedValues>,
+        mut cached: impl FnMut(&Arc<BoxFragment>) -> Option<EmptyBackgroundLeafProof>,
+    ) -> Option<Self> {
+        if !node.pseudo_element_chain().is_empty() {
+            return None;
+        }
+        let data = node.inner_layout_data()?;
+        if !data.pseudo_boxes.is_empty() {
+            return None;
+        }
+        let slot = data.self_box.borrow();
+        match slot.as_ref()? {
+            LayoutBox::BlockLevel(block) => {
+                let owner = EmptyBackgroundOwner::Block(block.clone());
+                let block = block.borrow();
+                match &*block {
+                    BlockLevelBox::Independent(context) => Self::from_base(
+                        owner,
+                        &context.base,
+                        context.certified_flow_contents()?,
+                        primary,
+                        selection,
+                        &mut cached,
+                    ),
+                    BlockLevelBox::SameFormattingContextBlock(block) if !block.contains_floats => {
+                        Self::from_base(
+                            owner,
+                            &block.base,
+                            &block.contents,
+                            primary,
+                            selection,
+                            &mut cached,
+                        )
+                    },
+                    BlockLevelBox::OutOfFlowAbsolutelyPositionedBox(positioned) => {
+                        let positioned = positioned.borrow();
+                        Self::from_base(
+                            owner,
+                            &positioned.context.base,
+                            positioned.context.certified_flow_contents()?,
+                            primary,
+                            selection,
+                            &mut cached,
+                        )
+                    },
+                    _ => None,
+                }
+            },
+            LayoutBox::InlineLevel(InlineItem::OutOfFlowAbsolutelyPositionedBox(
+                positioned,
+                ..,
+            )) => {
+                let owner = EmptyBackgroundOwner::Positioned(positioned.clone());
+                let positioned = positioned.borrow();
+                Self::from_base(
+                    owner,
+                    &positioned.context.base,
+                    positioned.context.certified_flow_contents()?,
+                    primary,
+                    selection,
+                    &mut cached,
+                )
+            },
+            LayoutBox::InlineLevel(InlineItem::Atomic(atomic, ..)) => {
+                let owner = EmptyBackgroundOwner::Atomic(atomic.clone());
+                let atomic = atomic.borrow();
+                Self::from_base(
+                    owner,
+                    &atomic.base,
+                    atomic.certified_flow_contents()?,
+                    primary,
+                    selection,
+                    &mut cached,
+                )
+            },
+            _ => None,
+        }
+    }
+
+    fn from_base(
+        owner: EmptyBackgroundOwner,
+        base: &LayoutBoxBase,
+        contents: &BlockContainer,
+        primary: &ServoArc<ComputedValues>,
+        selection: &ServoArc<ComputedValues>,
+        cached: &mut impl FnMut(&Arc<BoxFragment>) -> Option<EmptyBackgroundLeafProof>,
+    ) -> Option<Self> {
+        let fragments = base.fragments();
+        if fragments.len() != 1 {
+            return None;
+        }
+        let fragment = fragments[0].retrieve_box_fragment()?;
+        let proof = EmptyBackgroundLeafProof {
+            owner: owner.identity(),
+            fragment: Arc::as_ptr(&fragment) as usize,
+            base_flags: base.base_fragment_info.flags,
+        };
+        let same_shape = cached(&fragment).is_some_and(|old| old == proof);
+        let effects = primary.get_effects();
+        if !same_shape
+            && (primary.establishes_stacking_context(base.base_fragment_info.flags)
+                || effects.opacity != 1.0
+                || !effects.filter.0.is_empty()
+                || !effects.backdrop_filter.0.is_empty()
+                || !effects.box_shadow.0.is_empty()
+                || !primary.get_inherited_text().text_shadow.0.is_empty()
+                || primary.has_effective_transform_or_perspective(FragmentFlags::empty()))
+        {
+            return None;
+        }
+        if !ServoArc::ptr_eq(&base.style, primary)
+            || base.base_fragment_info.flags.intersects(
+                FragmentFlags::IS_ROOT_ELEMENT
+                    | FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT,
+            )
+        {
+            return None;
+        }
+        let inline_styles = match contents {
+            BlockContainer::BlockLevelBoxes(boxes) if boxes.is_empty() => None,
+            BlockContainer::InlineFormattingContext(context) => {
+                Some(context.certified_empty_styles(primary, selection)?)
+            },
+            _ => return None,
+        };
+        if !fragment.children.is_empty()
+            || fragment.base.flags.intersects(
+                FragmentFlags::IS_ROOT_ELEMENT
+                    | FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT,
+            )
+            || fragment.base.status() != FragmentStatus::Clean
+            || !ServoArc::ptr_eq(&fragment.style(), primary)
+        {
+            return None;
+        }
+        Some(Self {
+            owner,
+            inline_styles,
+            fragment: Arc::clone(&fragment),
+            used_cached_proof: same_shape,
+            proof,
+        })
+    }
+
+    pub(crate) fn used_cached_proof(&self) -> bool {
+        self.used_cached_proof
+    }
+
+    pub(crate) fn proof(&self) -> EmptyBackgroundLeafProof {
+        self.proof
+    }
+
+    pub(crate) fn fragment(&self) -> &Arc<BoxFragment> {
+        &self.fragment
+    }
+
+    /// Called only after positive painter ACK while the layout owner still has
+    /// exclusive document access. All objects were validated before submission.
+    pub(crate) fn commit(
+        self,
+        primary: &ServoArc<ComputedValues>,
+        _selection: &ServoArc<ComputedValues>,
+    ) {
+        self.owner.repair(primary);
+        if let Some(styles) = self.inline_styles {
+            *styles.style.borrow_mut() = primary.clone();
+            // Exact Selection identity was validated during preparation. Keep
+            // that unchanged reference in place instead of retiring/recloning it.
         }
     }
 }
@@ -935,5 +1193,170 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                 .clone_position()
                 .is_absolutely_positioned()
         })
+    }
+}
+
+#[cfg(test)]
+mod certified_background_tests {
+    use super::*;
+    use crate::flow::SameFormattingContextBlock;
+    use crate::flow::inline::InlineFormattingContext;
+    use crate::fragment_tree::BaseFragmentInfo;
+    use crate::geom::PhysicalRect;
+    use style::properties::style_structs::Font;
+    use style::values::computed::Color;
+
+    fn style(color: Color) -> ServoArc<ComputedValues> {
+        let mut values =
+            (*ComputedValues::initial_values_with_font_override(Font::initial_values())).clone();
+        values.mutate_background().background_color = color;
+        ServoArc::new(values)
+    }
+
+    #[test]
+    fn certified_empty_leaf_repairs_base_fragment_and_empty_inline_style_references() {
+        let old = style(Color::BLACK);
+        let new = style(Color::WHITE);
+        let selected = style(Color::BLACK);
+        let info = BaseFragmentInfo::new_for_testing(601);
+        let base = LayoutBoxBase::new(info, old.clone());
+        let fragment = Arc::new(BoxFragment::new(
+            info,
+            old.clone(),
+            Vec::new(),
+            PhysicalRect::zero(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            None,
+        ));
+        fragment.base.set_status(FragmentStatus::Clean);
+        base.set_fragment(Fragment::Box(fragment.clone()));
+        let ifc =
+            InlineFormattingContext::certified_empty_for_testing(old.clone(), selected.clone());
+        let handles = ifc.certified_empty_styles(&old, &selected).unwrap();
+        let block = ArcRefCell::new(BlockLevelBox::SameFormattingContextBlock(
+            SameFormattingContextBlock::new(
+                base,
+                BlockContainer::InlineFormattingContext(ifc),
+                false,
+            ),
+        ));
+        let prepare = || {
+            let borrowed = block.borrow();
+            let BlockLevelBox::SameFormattingContextBlock(value) = &*borrowed else {
+                unreachable!()
+            };
+            PreparedEmptyBackgroundLeaf::from_base(
+                EmptyBackgroundOwner::Block(block.clone()),
+                &value.base,
+                &value.contents,
+                &old,
+                &selected,
+                &mut |_| None,
+            )
+        };
+        drop(prepare().unwrap());
+        assert!(ServoArc::ptr_eq(&fragment.style(), &old));
+        assert!(ServoArc::ptr_eq(&handles.style.borrow(), &old));
+        let prepared = prepare().unwrap();
+        // Selection is certified unchanged: commit must not even borrow it for
+        // mutation or replace its Arc while repairing the primary.
+        let unchanged_selection = handles.selected.borrow();
+        prepared.commit(&new, &selected);
+        assert!(ServoArc::ptr_eq(&unchanged_selection, &selected));
+        drop(unchanged_selection);
+        assert!(ServoArc::ptr_eq(&fragment.style(), &new));
+        assert!(ServoArc::ptr_eq(&handles.style.borrow(), &new));
+        assert!(ServoArc::ptr_eq(&handles.selected.borrow(), &selected));
+        assert!(
+            block
+                .borrow()
+                .with_base(|base| ServoArc::ptr_eq(&base.style, &new))
+        );
+        assert_eq!(fragment.base.status(), FragmentStatus::StyleChanged);
+        assert!(
+            prepare().is_none(),
+            "a stale baseline cannot stage already changed references"
+        );
+    }
+    #[test]
+    fn unified_background_cached_leaf_checks_owner_fragment_base_flags_and_live_fragment_flags() {
+        for fragment_root in [false, true] {
+            let old = style(Color::BLACK);
+            let selected = style(Color::BLACK);
+            let info = BaseFragmentInfo::new_for_testing(905);
+            let base = LayoutBoxBase::new(info, old.clone());
+            let mut fragment_info = info;
+            if fragment_root {
+                fragment_info.flags.insert(FragmentFlags::IS_ROOT_ELEMENT);
+            }
+            let fragment = Arc::new(BoxFragment::new(
+                fragment_info,
+                old.clone(),
+                Vec::new(),
+                PhysicalRect::zero(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                None,
+            ));
+            fragment.base.set_status(FragmentStatus::Clean);
+            base.set_fragment(Fragment::Box(fragment.clone()));
+            let block = ArcRefCell::new(BlockLevelBox::SameFormattingContextBlock(
+                SameFormattingContextBlock::new(
+                    base,
+                    BlockContainer::InlineFormattingContext(
+                        InlineFormattingContext::certified_empty_for_testing(
+                            old.clone(),
+                            selected.clone(),
+                        ),
+                    ),
+                    false,
+                ),
+            ));
+            let prepare = |proof| {
+                let borrowed = block.borrow();
+                let BlockLevelBox::SameFormattingContextBlock(value) = &*borrowed else {
+                    unreachable!()
+                };
+                PreparedEmptyBackgroundLeaf::from_base(
+                    EmptyBackgroundOwner::Block(block.clone()),
+                    &value.base,
+                    &value.contents,
+                    &old,
+                    &selected,
+                    &mut |_| proof,
+                )
+            };
+            if fragment_root {
+                assert!(prepare(None).is_none());
+                continue;
+            }
+            let cold = prepare(None).unwrap();
+            assert!(!cold.used_cached_proof());
+            let proof = cold.proof();
+            drop(cold);
+            assert!(prepare(Some(proof)).unwrap().used_cached_proof());
+            for wrong in [
+                EmptyBackgroundLeafProof {
+                    owner: (9, proof.owner.1),
+                    ..proof
+                },
+                EmptyBackgroundLeafProof {
+                    fragment: proof.fragment.wrapping_add(1),
+                    ..proof
+                },
+                EmptyBackgroundLeafProof {
+                    base_flags: proof.base_flags
+                        | FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT,
+                    ..proof
+                },
+            ] {
+                assert!(!prepare(Some(wrong)).unwrap().used_cached_proof());
+            }
+            fragment.base.set_status(FragmentStatus::StyleChanged);
+            assert!(prepare(Some(proof)).is_none());
+        }
     }
 }

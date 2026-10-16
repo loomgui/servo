@@ -196,6 +196,7 @@ bitflags! {
 
 impl Paint {
     pub fn new(state: InitialPaintState) -> Rc<RefCell<Self>> {
+        crate::preparation_probe::install_hooks_before_painters();
         let registration = state.mem_profiler_chan.prepare_memory_reporting(
             "paint".into(),
             state.paint_proxy.clone(),
@@ -810,8 +811,13 @@ impl Paint {
     /// Consume pending WebRender updates for an embedder-tagged frame without
     /// drawing into the rendering context.
     pub fn prepare_for_render(&self, webview_id: WebViewId, frame_tag: u64) -> bool {
-        self.painter_mut(webview_id.into())
-            .prepare_for_render(frame_tag, &self.time_profiler_chan)
+        let result = {
+            let mut painter = self.painter_mut(webview_id.into());
+            painter.prepare_for_render(frame_tag, &self.time_profiler_chan)
+        };
+        // Diagnostic I/O occurs only after the painter RefMut has dropped.
+        crate::preparation_probe::flush_completed();
+        result
     }
 
     /// Draw only the scene prepared for `frame_tag`.

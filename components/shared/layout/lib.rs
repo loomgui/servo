@@ -629,6 +629,13 @@ impl RestyleReason {
 /// Information derived from a layout pass that needs to be returned to the script thread.
 #[derive(Default)]
 pub struct ReflowResult {
+    /// A proven existing-tree no-work completion. Only its fresh snapshot lease
+    /// is consumed; Script preserves its original early return before handlers.
+    pub completed_no_work: bool,
+    /// A completed negative style-attribute dependency proof for this layout epoch.
+    /// Script may omit STYLE snapshots only while its document remains ordinary;
+    /// Layout always revalidates the epoch and dependencies before consuming one.
+    pub background_style_snapshot_lease: Option<u64>,
     /// The phases that were run during this reflow.
     pub reflow_phases_run: ReflowPhasesRun,
     pub reflow_statistics: ReflowStatistics,
@@ -684,6 +691,14 @@ impl ReflowPhasesRun {
 
 #[derive(Debug, Default)]
 pub struct ReflowStatistics {
+    /// Accepted narrow style recascades, collected only for tests/profiling.
+    pub inline_background_color_recascade_count: u32,
+    /// Leaf styles committed by the certified batch only after painter acknowledgment.
+    pub certified_background_color_count: u32,
+    /// Cached leaf proofs, collected under the existing helper/stat gates after ACK.
+    pub certified_background_cached_leaf_count: u32,
+    /// Inductive family proofs; not allocation-recycling or rendering authority.
+    pub certified_background_cached_family_count: u32,
     /// A count of the number of fragments that have been completely rebuilt.
     pub rebuilt_fragment_count: u32,
     /// A count of the number of fragments that are reused, but have had their style change.
@@ -716,11 +731,18 @@ pub struct ReflowRequestRestyle {
     pub stylesheets_changed: bool,
     /// Restyle snapshot map.
     pub pending_restyles: Vec<(TrustedNodeAddress, PendingRestyle)>,
+    /// Unique normal ancestors certified clean before the ordinary pending-restyle
+    /// drain marked their paths. Targets remain in `pending_restyles`. Absence
+    /// requires the ordinary full traversal; presence alone proves no style eligibility.
+    pub certified_background_paths: Option<Vec<TrustedNodeAddress>>,
 }
 
 /// Information needed for a script-initiated reflow.
 #[derive(Debug)]
 pub struct ReflowRequest {
+    /// Script has no shadow roots and permits a document-origin snapshot lease.
+    /// This is an optimization request, never frame or rendering authority.
+    pub allow_background_style_snapshot_lease: bool,
     /// The document node.
     pub document: TrustedNodeAddress,
     /// The current layout [`Epoch`] managed by the script thread.
@@ -775,6 +797,16 @@ impl ReflowRequest {
 /// A pending restyle.
 #[derive(Debug, Default, MallocSizeOf)]
 pub struct PendingRestyle {
+    /// True only when this entry began with a null-namespace style-attribute
+    /// mutation and no generic or other-namespace mutation has touched it since.
+    /// Defaults false; an uncertified entry can never become certified in place.
+    pub style_attribute_only: bool,
+
+    /// STYLE history was deliberately omitted under this exact negative lease.
+    /// This remains explicit even after mixed mutations add a real snapshot.
+    /// Any unvalidated omission requires full rematching, never guessed history.
+    pub style_snapshot_omitted: Option<u64>,
+
     /// If this element had a state or attribute change since the last restyle, track
     /// the original condition of the element.
     pub snapshot: Option<Snapshot>,
