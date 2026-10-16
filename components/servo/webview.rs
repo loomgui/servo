@@ -746,16 +746,6 @@ impl WebView {
             .discard_prepared_render(self.id(), frame_tag)
     }
 
-    /// Tag the next WebRender scene generated after this call. A non-zero tag
-    /// is returned by [`Self::take_ready_scene_frame`] only when that exact
-    /// generated frame has completed.
-    pub fn arm_next_scene_frame(&self, frame_tag: u64) -> bool {
-        self.inner()
-            .servo
-            .paint()
-            .arm_next_scene_frame(self.id(), frame_tag)
-    }
-
     /// Ask the script event loop to run an update-the-rendering opportunity for
     /// this `WebView` as soon as possible.
     ///
@@ -764,23 +754,34 @@ impl WebView {
     /// timer-based fallback rendering opportunity.
     pub fn request_rendering_update(&self) {
         self.inner().servo.constellation_proxy().send(
-            EmbedderToConstellationMessage::TickAnimation(vec![self.id()], None),
+            EmbedderToConstellationMessage::TickAnimation(vec![self.id()], None, None),
         );
     }
 
-    /// Request a rendering opportunity and report whether it produced a new
-    /// scene for the supplied external-frame tag.
-    pub fn request_rendering_update_for_frame(&self, frame_tag: u64) -> bool {
-        let Some(callback) = self
+    /// Correlate a specific rendering opportunity with an already-applied seal.
+    /// The tag is issued only after all source-loop Paint FIFO barriers.
+    pub fn request_rendering_update_for_frame(
+        &self,
+        frame_tag: u64,
+        state_sequence: u64,
+        force_external_images: bool,
+    ) -> bool {
+        let seal = paint_api::AppliedSeal {
+            webview_id: self.id(),
+            frame_id: frame_tag,
+            state_sequence,
+            force_external_images,
+        };
+        if !self
             .inner()
             .servo
             .paint()
-            .rendering_update_callback(self.id(), frame_tag)
-        else {
+            .register_applied_seal(seal.clone())
+        {
             return false;
-        };
+        }
         self.inner().servo.constellation_proxy().send(
-            EmbedderToConstellationMessage::TickAnimation(vec![self.id()], Some(callback)),
+            EmbedderToConstellationMessage::TickAnimation(vec![self.id()], None, Some(seal)),
         );
         true
     }

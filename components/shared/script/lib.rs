@@ -256,7 +256,11 @@ pub enum ScriptThreadMessage {
     /// Passes a webdriver command to the script thread for execution
     WebDriverScriptCommand(PipelineId, WebDriverScriptCommand),
     /// Notifies script thread that all animations are done
-    TickAllAnimations(Vec<WebViewId>, Option<GenericCallback<bool>>),
+    TickAllAnimations(
+        Vec<WebViewId>,
+        Option<GenericCallback<bool>>,
+        Option<paint_api::AppliedSealOpportunity>,
+    ),
     /// Notifies the script thread that a web font has finished loading.
     ///
     /// This is sent if either the web font loaded successfully, or to notify the script thread

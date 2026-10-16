@@ -220,14 +220,14 @@ rustls-pki-types = "1.14"
 rustls-platform-verifier = "0.7.0"
 sea-query = { version = "1.0.1", default-features = false, features = ["backend-sqlite", "derive"] }
 sea-query-rusqlite = "0.8.0"
-selectors = { git = "https://github.com/loomgui/stylo", rev = "d0d01f1c205b6675bc03fb6b107f8a9f0794f101" }
+selectors = { git = "https://github.com/loomgui/stylo", rev = "c7781e3a06e5eb460f2b0562bc1c65092f1d1f88" }
 serde = "1.0.228"
 serde_bytes = "0.11"
 serde_core = "1.0.226"
 serde_json = "1.0"
 serde_test = "1.0"
 serde_with = "3.13"
-servo_arc = { git = "https://github.com/loomgui/stylo", rev = "d0d01f1c205b6675bc03fb6b107f8a9f0794f101" }
+servo_arc = { git = "https://github.com/loomgui/stylo", rev = "c7781e3a06e5eb460f2b0562bc1c65092f1d1f88" }
 sha1 = "0.11"
 sha2 = "0.11"
 sha3 = "0.12"
@@ -238,12 +238,12 @@ speexdsp-resampler = "0.1.0"
 sponge-cursor = "0.1"
 string_cache = "0.11"
 strum = { version = "0.28", features = ["derive"] }
-stylo = { git = "https://github.com/loomgui/stylo", rev = "d0d01f1c205b6675bc03fb6b107f8a9f0794f101" }
-stylo_atoms = { git = "https://github.com/loomgui/stylo", rev = "d0d01f1c205b6675bc03fb6b107f8a9f0794f101" }
-stylo_dom = { git = "https://github.com/loomgui/stylo", rev = "d0d01f1c205b6675bc03fb6b107f8a9f0794f101" }
-stylo_malloc_size_of = { git = "https://github.com/loomgui/stylo", rev = "d0d01f1c205b6675bc03fb6b107f8a9f0794f101" }
-stylo_static_prefs = { git = "https://github.com/loomgui/stylo", rev = "d0d01f1c205b6675bc03fb6b107f8a9f0794f101" }
-stylo_traits = { git = "https://github.com/loomgui/stylo", rev = "d0d01f1c205b6675bc03fb6b107f8a9f0794f101" }
+stylo = { git = "https://github.com/loomgui/stylo", rev = "c7781e3a06e5eb460f2b0562bc1c65092f1d1f88" }
+stylo_atoms = { git = "https://github.com/loomgui/stylo", rev = "c7781e3a06e5eb460f2b0562bc1c65092f1d1f88" }
+stylo_dom = { git = "https://github.com/loomgui/stylo", rev = "c7781e3a06e5eb460f2b0562bc1c65092f1d1f88" }
+stylo_malloc_size_of = { git = "https://github.com/loomgui/stylo", rev = "c7781e3a06e5eb460f2b0562bc1c65092f1d1f88" }
+stylo_static_prefs = { git = "https://github.com/loomgui/stylo", rev = "c7781e3a06e5eb460f2b0562bc1c65092f1d1f88" }
+stylo_traits = { git = "https://github.com/loomgui/stylo", rev = "c7781e3a06e5eb460f2b0562bc1c65092f1d1f88" }
 surfman = "0.14.0"
 swapper = "0.1"
 syn = { version = "2", default-features = false, features = ["clone-impls", "derive", "parsing"] }

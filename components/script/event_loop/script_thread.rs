@@ -409,6 +409,8 @@ pub struct ScriptThread {
     /// an external frame clock to finish.
     #[no_trace]
     pending_rendering_update_callbacks: RefCell<Vec<GenericCallback<bool>>>,
+    #[no_trace]
+    pending_applied_seal_updates: RefCell<Vec<paint_api::AppliedSealOpportunity>>,
 
     /// Whether an animation tick or ScriptThread-triggered rendering update is pending. This might
     /// either be because the Servo renderer is managing animations and the [`ScriptThread`] has
@@ -987,6 +989,7 @@ impl ScriptThread {
                     layout_factory,
                     scheduled_update_the_rendering: Default::default(),
                     pending_rendering_update_callbacks: Default::default(),
+                    pending_applied_seal_updates: Default::default(),
                     needs_rendering_update: Arc::new(AtomicBool::new(false)),
                     debugger_global: debugger_global.as_traced(),
                     debugger_paused: Cell::new(false),
@@ -1081,13 +1084,16 @@ impl ScriptThread {
     /// actually updated.
     ///
     /// Returns true if any reflows produced a new display list.
-    pub(crate) fn update_the_rendering(&self, cx: &mut js::context::JSContext) -> bool {
+    pub(crate) fn update_the_rendering(
+        &self,
+        cx: &mut js::context::JSContext,
+    ) -> Option<FxHashSet<servo_base::id::PainterId>> {
         self.last_render_opportunity_time.set(Some(Instant::now()));
         self.cancel_scheduled_update_the_rendering();
         self.needs_rendering_update.store(false, Ordering::Relaxed);
 
         if !self.can_continue_running_inner() {
-            return false;
+            return None;
         }
 
         // TODO(#31242): the filtering of docs is extended to not exclude the ones that
@@ -1257,16 +1263,29 @@ impl ScriptThread {
             // https://drafts.csswg.org/css-position-4/#process-top-layer-removals.
         }
 
-        let should_generate_frame = !painters_generating_frames.is_empty();
-        if should_generate_frame {
-            self.paint_api
-                .generate_frame(painters_generating_frames.into_iter().collect());
+        // Correlated targets are generated only by Painter after every participant's
+        // ordered completion. Ordinary/older SCENE messages carry no current seal.
+        let ordinary_painters = painters_generating_frames
+            .iter()
+            .copied()
+            .filter(|painter| {
+                !self
+                    .pending_applied_seal_updates
+                    .borrow()
+                    .iter()
+                    .any(|request| {
+                        servo_base::id::PainterId::from(request.seal.webview_id) == *painter
+                    })
+            })
+            .collect::<Vec<_>>();
+        if !ordinary_painters.is_empty() {
+            self.paint_api.generate_frame(ordinary_painters);
         }
 
         // Perform a microtask checkpoint as the specifications says that *update the rendering*
         // should be run in a task and a microtask checkpoint is always done when running tasks.
         self.perform_a_microtask_checkpoint(cx);
-        should_generate_frame
+        Some(painters_generating_frames)
     }
 
     /// Schedule a rendering update ("update the rendering"), if necessary. This
@@ -1511,8 +1530,16 @@ impl ScriptThread {
                 .perform_a_dom_garbage_collection_checkpoint();
         }
 
-        let built_any_display_lists =
-            self.needs_rendering_update.load(Ordering::Relaxed) && self.update_the_rendering(cx);
+        let changed_painters = if self.needs_rendering_update.load(Ordering::Relaxed) {
+            self.update_the_rendering(cx)
+        } else {
+            None
+        };
+        // Preserve legacy bool callbacks, but absence of an actual running
+        // opportunity is never an applied-seal no-work completion.
+        let built_any_display_lists = changed_painters
+            .as_ref()
+            .is_some_and(|painters| !painters.is_empty());
 
         for callback in self
             .pending_rendering_update_callbacks
@@ -1520,6 +1547,17 @@ impl ScriptThread {
             .drain(..)
         {
             let _ = callback.send(built_any_display_lists);
+        }
+
+        if let Some(changed_painters) = changed_painters {
+            for opportunity in self.pending_applied_seal_updates.borrow_mut().drain(..) {
+                let changed = changed_painters.contains(&servo_base::id::PainterId::from(
+                    opportunity.seal.webview_id,
+                ));
+                // This same sender already sent this loop's DL/color updates above.
+                self.paint_api
+                    .complete_applied_seal_rendering_update(opportunity, changed);
+            }
         }
 
         self.maybe_fulfill_font_ready_promises(cx);
@@ -1891,7 +1929,12 @@ impl ScriptThread {
             ScriptThreadMessage::SetWebGPUPort(port) => {
                 *self.receivers.webgpu_receiver.borrow_mut() = port.route_preserving_errors();
             },
-            ScriptThreadMessage::TickAllAnimations(_webviews, callback) => {
+            ScriptThreadMessage::TickAllAnimations(_webviews, callback, opportunity) => {
+                if let Some(opportunity) = opportunity {
+                    self.pending_applied_seal_updates
+                        .borrow_mut()
+                        .push(opportunity);
+                }
                 if let Some(callback) = callback {
                     self.pending_rendering_update_callbacks
                         .borrow_mut()

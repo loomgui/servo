@@ -1,0 +1,65 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Stable viewport background batches preserve eager geometry and invalidation</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<body><script>
+'use strict';
+setup({explicit_done:true});
+const RED='rgb(255, 0, 0)', BLUE='rgb(0, 0, 255)';
+async function fixture(t) {
+  const frame=document.createElement('iframe');frame.width=400;frame.height=240;
+  const loaded=new Promise(resolve=>frame.onload=resolve);
+  frame.srcdoc='<!doctype html><style>html,body{margin:0;font-size:16px}#cell{position:absolute;left:10vw;top:10vh;width:20vw;height:25vh}@media(min-width:500px){#cell{width:30vw;height:30vh}}</style><div id="cell" style="background-color:red"></div>';
+  document.body.append(frame);t.add_cleanup(()=>frame.remove());await loaded;
+  const w=frame.contentWindow,d=w.document,u=w.ServoTestUtils,cell=d.querySelector('#cell');
+  ServoTestUtils.forceLayout();u.forceLayout();
+  const f={frame,w,d,u,cell};warm(f,'initial');return f;
+}
+function hot(f,value,label,cached=true) {
+  f.cell.style.backgroundColor=value;const r=f.u.forceLayout();
+  assert_equals(r.certifiedBackgroundColorCount,1,label+' actual positive painter batch');
+  if(cached){assert_equals(r.certifiedBackgroundCachedLeafCount,1,label+' cached leaf');assert_equals(r.certifiedBackgroundCachedFamilyCount,1,label+' cached family');}
+  assert_true(r.phases.includes('UpdatedBackgroundColors'),label+' property transaction executed');
+  return r;
+}
+function warm(f,label) {
+  for(const value of ['green','blue','red']) {f.cell.style.backgroundColor=value;var r=f.u.forceLayout();}
+  assert_equals(r.certifiedBackgroundColorCount,1,label+' warm actual positive batch');
+  assert_equals(r.certifiedBackgroundCachedLeafCount,1,label+' warm cached leaf');
+  assert_equals(r.certifiedBackgroundCachedFamilyCount,1,label+' warm cached family');
+}
+function geometry(f,width,height,left,top,color) {
+  const s=f.w.getComputedStyle(f.cell);
+  assert_equals(s.width,width);assert_equals(s.height,height);assert_equals(s.left,left);assert_equals(s.top,top);assert_equals(s.backgroundColor,color);
+}
+window.onload=()=>{
+ promise_test(async t=>{
+  const f=await fixture(t);geometry(f,'80px','60px','40px','24px',RED);
+  for(const [value,color] of [['blue',BLUE],['red',RED],['blue',BLUE]]) {
+   hot(f,value,'unchanged viewport '+value);geometry(f,'80px','60px','40px','24px',color);
+  }
+ },'Stable vw/vh leaves actually use complete cached batches while keeping current geometry');
+ promise_test(async t=>{
+  const f=await fixture(t);hot(f,'blue','before resize');
+  const resized=new Promise(resolve=>f.w.addEventListener('resize',resolve,{once:true}));
+  f.cell.style.backgroundColor='red';f.frame.width=600;f.frame.height=320;
+  ServoTestUtils.forceLayout();await resized;
+  const fallback=f.u.forceLayout();assert_equals(fallback.certifiedBackgroundColorCount,0,'resize/media change cannot consume the old batch');
+  geometry(f,'180px','96px','60px','32px',RED);
+  // Queries above must be current before any replacement baseline is warmed.
+  warm(f,'after resized media recascade');hot(f,'blue','renewed resized viewport');
+  geometry(f,'180px','96px','60px','32px',BLUE);
+ },'Viewport resize and existing media rule eagerly fall back before a fresh viewport batch can commit');
+ promise_test(async t=>{
+  const f=await fixture(t);hot(f,'blue','before dependency change');
+  f.cell.style.width='calc(20vw + 1em)';f.u.forceLayout();
+  f.cell.style.backgroundColor='red';const fallback=f.u.forceLayout();
+  assert_equals(fallback.certifiedBackgroundColorCount,0,'font-relative dependency stays outside viewport-only admission');
+  geometry(f,'96px','60px','40px','24px',RED);
+  f.cell.style.width='20vw';f.u.forceLayout();warm(f,'after non-background replacement');
+  hot(f,'blue','renewed independent viewport style');geometry(f,'80px','60px','40px','24px',BLUE);
+ },'Other relative dependencies and mixed non-background changes retain ordinary eager fallback');
+ done();
+};
+</script>

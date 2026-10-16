@@ -35,9 +35,6 @@ mod from_constellation {
                 Self::SetThrottled(..) => target!("SetThrottled"),
                 Self::NewWebRenderFrameReady(..) => target!("NewWebRenderFrameReady"),
                 Self::EmbedderSceneFrameReady(..) => target!("EmbedderSceneFrameReady"),
-                Self::EmbedderRenderingUpdateReady(..) => {
-                    target!("EmbedderRenderingUpdateReady")
-                },
                 Self::PipelineExited(..) => target!("PipelineExited"),
                 Self::SendInitialTransaction(..) => target!("SendInitialTransaction"),
                 Self::ScrollNodeByDelta(..) => target!("ScrollNodeByDelta"),
@@ -46,6 +43,7 @@ mod from_constellation {
                 Self::SendDisplayList { .. } => target!("SendDisplayList"),
                 Self::UpdateBackgroundColors { .. } => target!("UpdateBackgroundColors"),
                 Self::GenerateFrame { .. } => target!("GenerateFrame"),
+                Self::AppliedSealRenderingComplete(..) => target!("AppliedSealRenderingComplete"),
                 Self::GenerateImageKey(..) => target!("GenerateImageKey"),
                 Self::UpdateImages(..) => target!("UpdateImages"),
                 Self::GenerateFontKeys(..) => target!("GenerateFontKeys"),

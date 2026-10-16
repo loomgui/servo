@@ -15,7 +15,7 @@ use malloc_size_of_derive::MallocSizeOf;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use servo_base::Epoch;
-use servo_base::id::{PainterId, PipelineId, WebViewId};
+use servo_base::id::{PainterId, PipelineId, ScriptEventLoopId, WebViewId};
 use smallvec::SmallVec;
 use strum::IntoStaticStr;
 use style_traits::CSSPixel;
@@ -82,6 +82,30 @@ impl PaintProxy {
     }
 }
 
+/// Correlation of one already-applied embedder seal; this is not readiness.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AppliedSeal {
+    /// The exact target whose script loops must finish.
+    pub webview_id: WebViewId,
+    /// The existing nonzero embedder frame identity.
+    pub frame_id: u64,
+    /// The existing acknowledged model-state sequence.
+    pub state_sequence: u64,
+    /// Existing live-image demand forces a current paint even without DOM damage.
+    pub force_external_images: bool,
+}
+
+/// One distinct script loop's completion on the same FIFO as its paint updates.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AppliedSealOpportunity {
+    /// The applied seal assigned to this rendering opportunity.
+    pub seal: AppliedSeal,
+    /// The exact deduplicated participants captured before constellation dispatch.
+    pub participants: Vec<ScriptEventLoopId>,
+    /// The source loop that completed this opportunity.
+    pub participant: ScriptEventLoopId,
+}
+
 /// Messages from (or via) the constellation thread to `Paint`.
 #[derive(Deserialize, IntoStaticStr, Serialize)]
 pub enum PaintMessage {
@@ -98,9 +122,6 @@ pub enum PaintMessage {
     /// A WebRender scene transaction carrying an embedder-provided tag reached
     /// `FrameBuilt`. The bool is false if WebRender dropped the transaction instead.
     EmbedderSceneFrameReady(PainterId, u64, bool),
-    /// The script rendering opportunity requested for an embedder frame
-    /// completed. The bool says whether it generated a new display list.
-    EmbedderRenderingUpdateReady(PainterId, u64, bool),
     /// Script or the Constellation is notifying the renderer that a Pipeline has finished
     /// shutting down. The renderer will not discard the Pipeline until both report that
     /// they have fully shut it down, to avoid recreating it due to any subsequent
@@ -153,6 +174,8 @@ pub enum PaintMessage {
     /// Ask the renderer to generate a frame for the current set of display lists
     /// from the given `PainterId`s that have been sent to the renderer.
     GenerateFrame(Vec<PainterId>),
+    /// A per-loop barrier after every DL/color message from this rendering opportunity.
+    AppliedSealRenderingComplete(AppliedSealOpportunity, bool),
     /// Create a new image key. The result will be returned via the
     /// provided channel sender.
     GenerateImageKey(WebViewId, GenericSender<ImageKey>),
@@ -410,6 +433,20 @@ impl CrossProcessPaintApi {
     pub fn generate_frame(&self, painter_ids: Vec<PainterId>) {
         if let Err(error) = self.0.send(PaintMessage::GenerateFrame(painter_ids)) {
             warn!("Error generating frame: {error}");
+        }
+    }
+
+    /// Complete only the supplied applied-seal opportunity, on this same paint FIFO.
+    pub fn complete_applied_seal_rendering_update(
+        &self,
+        opportunity: AppliedSealOpportunity,
+        changed: bool,
+    ) {
+        if let Err(error) = self.0.send(PaintMessage::AppliedSealRenderingComplete(
+            opportunity,
+            changed,
+        )) {
+            warn!("Error completing applied-seal rendering: {error}");
         }
     }
 
