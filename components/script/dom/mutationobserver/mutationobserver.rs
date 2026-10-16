@@ -11,6 +11,7 @@ use js::rust::HandleObject;
 use rustc_hash::FxHashMap;
 use script_bindings::callback::{OwnerWindow, RootedCallback, TracedCallback};
 use script_bindings::cell::DomRefCell;
+use script_bindings::inheritance::Castable;
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use style::attr::AttrValue;
 
@@ -26,7 +27,7 @@ use crate::dom::iterators::ShadowIncluding;
 use crate::dom::mutationrecord::MutationRecord;
 use crate::dom::node::Node;
 use crate::dom::window::Window;
-use crate::event_loop::script_thread::ScriptThread;
+use crate::event_loop::script_thread::{ScriptThread, with_script_thread};
 
 #[dom_struct]
 pub(crate) struct MutationObserver {
@@ -108,6 +109,35 @@ impl MutationObserver {
         &self.callback
     }
 
+    /// A negative is usable only for DOM owned by this live script agent.
+    /// Both the reflector's window and the current owner-document window must
+    /// resolve to those exact windows in this ScriptThread. Unknown/foreign or
+    /// no-longer-tracked windows fall back to the original observer-list walk.
+    pub(crate) fn attribute_observers_cannot_match(target: &Node, name: &LocalName) -> bool {
+        let Some(observers) = with_script_thread(|_| Some(ScriptThread::mutation_observers()))
+        else {
+            return false;
+        };
+        let global = target.global();
+        let Some(window) = global.downcast::<Window>() else {
+            return false;
+        };
+        if !ScriptThread::find_window(window.pipeline_id())
+            .is_some_and(|current| std::ptr::eq(&*current, window))
+        {
+            return false;
+        }
+        let document = target.owner_doc();
+        let owner_window = document.window();
+        if !std::ptr::eq(window, owner_window)
+            && !ScriptThread::find_window(owner_window.pipeline_id())
+                .is_some_and(|current| std::ptr::eq(&*current, owner_window))
+        {
+            return false;
+        }
+        observers.attribute_observers_cannot_match(name)
+    }
+
     /// Fresh matching interest for one attribute; no cross-write observer cache.
     pub(crate) fn attribute_interest(
         no_gc: &NoGC,
@@ -115,6 +145,9 @@ impl MutationObserver {
         name: &LocalName,
         namespace: &Namespace,
     ) -> (bool, bool) {
+        if Self::attribute_observers_cannot_match(target, name) {
+            return (false, false);
+        }
         let mut records = false;
         let mut old_value = false;
         for node in target.inclusive_ancestors_unrooted(no_gc, ShadowIncluding::No) {
@@ -151,6 +184,9 @@ impl MutationObserver {
         name: &LocalName,
         namespace: &Namespace,
     ) -> bool {
+        if Self::attribute_observers_cannot_match(target, name) {
+            return false;
+        }
         for node in target.inclusive_ancestors_unrooted(no_gc, ShadowIncluding::No) {
             let Some(registered) = node.registered_mutation_observers() else {
                 continue;
@@ -362,6 +398,11 @@ impl MutationObserverMethods<crate::DomTypeHolder> for MutationObserver {
                 c"characterDataOldValue is true but characterData is false".into(),
             ));
         }
+
+        // Publish the conservative union only after all option validation and
+        // before either replacing options or publishing a new registration.
+        // This state belongs to the script agent, not a particular Window.
+        ScriptThread::mutation_observers().record_attribute_observer(attributes, &attribute_filter);
 
         // Step 7
         let add_new_observer = {

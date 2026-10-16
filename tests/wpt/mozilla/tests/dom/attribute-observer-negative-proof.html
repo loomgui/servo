@@ -1,0 +1,217 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Conservative agent-wide MutationObserver attribute-interest negatives</title>
+<link rel="help" href="https://dom.spec.whatwg.org/#mutation-observers">
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<body>
+<script>
+'use strict';
+const task = () => new Promise(resolve => step_timeout(resolve, 0));
+
+test(t => {
+  const target = document.createElement('div');
+  target.style.color = 'red';
+  const observer = new MutationObserver(() => {});
+  t.add_cleanup(() => observer.disconnect());
+  observer.observe(target, {attributes: true, attributeFilter: ['data-loom-image-kind']});
+  target.style.width = '12px';
+  target.style.color = 'blue';
+  target.setAttribute('data-loom-image-kind', 'static');
+  const records = observer.takeRecords();
+  assert_equals(records.length, 1);
+  assert_equals(records[0].attributeName, 'data-loom-image-kind');
+  assert_equals(records[0].oldValue, null);
+}, 'An unrelated filtered observer does not acquire style records');
+
+test(t => {
+  const stylesheet = document.createElement('style');
+  stylesheet.textContent = '#attribute-negative-selector { outline: 0px solid; } #attribute-negative-selector[style*="blue"] { outline: 7px solid; }';
+  document.head.appendChild(stylesheet);
+  const target = document.createElement('div');
+  target.id = 'attribute-negative-selector';
+  target.style.color = 'red';
+  document.body.appendChild(target);
+  const observer = new MutationObserver(() => {});
+  t.add_cleanup(() => { observer.disconnect(); target.remove(); stylesheet.remove(); });
+  observer.observe(document, {subtree: true, attributes: true,
+                              attributeFilter: ['data-loom-image-kind']});
+  assert_equals(getComputedStyle(target).outlineWidth, '0px');
+  target.style.color = 'blue';
+  assert_true(target.getAttribute('style').includes('blue'));
+  assert_equals(getComputedStyle(target).outlineWidth, '7px');
+  target.style.color = 'red';
+  assert_equals(getComputedStyle(target).outlineWidth, '0px');
+  assert_array_equals(observer.takeRecords(), []);
+}, 'Unrelated attribute interest does not bypass CSS style-attribute selector snapshots');
+
+test(t => {
+  const target = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+  const observer = new MutationObserver(() => {});
+  t.add_cleanup(() => observer.disconnect());
+  observer.observe(target, {attributes: true, attributeFilter: ['data-WATCH']});
+  target.setAttribute('data-watch', 'lower');
+  assert_array_equals(observer.takeRecords(), []);
+  target.setAttribute('data-WATCH', 'upper');
+  const records = observer.takeRecords();
+  assert_equals(records.length, 1);
+  assert_equals(records[0].attributeName, 'data-WATCH');
+}, 'Case-sensitive XML attribute-filter matching remains exact even if Bloom positions collide');
+
+test(t => {
+  const parent = document.createElement('div');
+  const target = parent.appendChild(document.createElement('div'));
+  target.style.color = 'red';
+  const observer = new MutationObserver(() => {});
+  t.add_cleanup(() => observer.disconnect());
+  observer.observe(parent, {subtree: true, attributes: true, attributeOldValue: true,
+                            attributeFilter: ['style']});
+  const before = target.getAttribute('style');
+  target.style.width = '12px';
+  const middle = target.getAttribute('style');
+  target.style.backgroundColor = 'blue';
+  const records = observer.takeRecords();
+  assert_equals(records.length, 2);
+  assert_equals(records[0].target, target);
+  assert_equals(records[0].oldValue, before);
+  assert_equals(records[1].oldValue, middle);
+}, 'Detached subtree attributeOldValue preserves each original style declaration');
+
+test(t => {
+  const target = document.createElement('div');
+  const observer = new MutationObserver(() => {});
+  t.add_cleanup(() => observer.disconnect());
+  observer.observe(target, {attributes: true, attributeFilter: ['data-first']});
+  target.setAttribute('data-first', 'one');
+  assert_equals(observer.takeRecords().length, 1);
+  observer.observe(target, {attributes: true, attributeOldValue: true,
+                            attributeFilter: ['data-second']});
+  target.setAttribute('data-first', 'two');
+  target.setAttribute('data-second', 'one');
+  target.setAttribute('data-second', 'two');
+  const records = observer.takeRecords();
+  assert_equals(records.length, 2);
+  assert_equals(records[0].attributeName, 'data-second');
+  assert_equals(records[0].oldValue, null);
+  assert_equals(records[1].oldValue, 'one');
+}, 'Re-observe replaces exact matching while the conservative union remains monotonic');
+
+promise_test(async t => {
+  const target = document.createElement('div');
+  let callbacks = 0;
+  const observer = new MutationObserver(() => callbacks++);
+  t.add_cleanup(() => observer.disconnect());
+  observer.observe(target, {attributes: true, attributeFilter: ['data-first']});
+  target.setAttribute('data-first', 'one');
+  observer.disconnect();
+  target.setAttribute('data-first', 'two');
+  await task();
+  assert_equals(callbacks, 0);
+  assert_array_equals(observer.takeRecords(), []);
+  observer.observe(target, {attributes: true, attributeFilter: ['data-second']});
+  target.setAttribute('data-first', 'three');
+  target.setAttribute('data-second', 'one');
+  const records = observer.takeRecords();
+  assert_equals(records.length, 1);
+  assert_equals(records[0].attributeName, 'data-second');
+}, 'Disconnect clears delivery without allowing stale union state to route records');
+
+promise_test(async t => {
+  const target = document.createElement('div');
+  target.style.color = 'red';
+  const order = [];
+  const observer = new MutationObserver(() => order.push('observer'));
+  t.add_cleanup(() => observer.disconnect());
+  observer.observe(target, {attributes: true, attributeFilter: ['data-loom-image-kind']});
+  await task(); // Drain setup notifications before testing the empty-notify ordering.
+  target.style.color = 'blue';
+  Promise.resolve().then(() => order.push('promise'));
+  target.setAttribute('data-loom-image-kind', 'static');
+  await task();
+  assert_array_equals(order, ['observer', 'promise']);
+}, 'An unobserved style write preserves the existing empty-notification microtask order');
+
+test(t => {
+  const calls = [];
+  const tag = 'attribute-negative-proof-custom';
+  customElements.define(tag, class extends HTMLElement {
+    static get observedAttributes() { return ['style']; }
+    attributeChangedCallback(name, oldValue, newValue) {
+      calls.push({name, oldValue, newValue});
+    }
+  });
+  const target = document.createElement(tag);
+  const unrelated = new MutationObserver(() => {});
+  t.add_cleanup(() => unrelated.disconnect());
+  unrelated.observe(target, {attributes: true, attributeFilter: ['data-loom-image-kind']});
+  target.style.color = 'red';
+  const before = target.getAttribute('style');
+  calls.length = 0;
+  target.style.width = '12px';
+  assert_equals(calls.length, 1);
+  assert_equals(calls[0].name, 'style');
+  assert_equals(calls[0].oldValue, before);
+  assert_equals(calls[0].newValue, target.getAttribute('style'));
+}, 'Custom-element oldValue remains independent of the MutationObserver negative proof');
+
+promise_test(async t => {
+  const frame = document.createElement('iframe');
+  frame.srcdoc = '<!doctype html><body>';
+  const loaded = new Promise(resolve => frame.onload = resolve);
+  document.body.appendChild(frame);
+  t.add_cleanup(() => frame.remove());
+  await loaded;
+  const target = frame.contentDocument.createElement('div');
+  target.style.color = 'red';
+  const observer = new frame.contentWindow.MutationObserver(() => {});
+  t.add_cleanup(() => observer.disconnect());
+  observer.observe(target, {attributes: true, attributeOldValue: true,
+                            attributeFilter: ['style']});
+  document.adoptNode(target);
+  const before = target.getAttribute('style');
+  target.style.width = '13px';
+  let records = observer.takeRecords();
+  assert_equals(records.length, 1);
+  assert_equals(records[0].oldValue, before);
+  const middle = target.getAttribute('style');
+  frame.remove(); // A no-longer-tracked reflector window must force the original walk.
+  target.style.height = '17px';
+  records = observer.takeRecords();
+  assert_equals(records.length, 1);
+  assert_equals(records[0].target, target);
+  assert_equals(records[0].oldValue, middle);
+}, 'Cross-window adoption and removal of the reflector window keep registered oldValue records');
+
+test(t => {
+  const target = document.createElement('div');
+  const observer = new MutationObserver(() => {});
+  t.add_cleanup(() => observer.disconnect());
+  assert_throws_js(TypeError, () => observer.observe(target,
+    {attributes: false, attributeOldValue: true}));
+  target.setAttribute('data-watch', 'before');
+  assert_array_equals(observer.takeRecords(), []);
+  observer.observe(target, {attributeFilter: ['data-watch'], attributeOldValue: true});
+  target.setAttributeNS('urn:negative-proof', 'p:data-watch', 'namespaced');
+  assert_array_equals(observer.takeRecords(), []);
+  target.setAttribute('data-watch', 'after');
+  const records = observer.takeRecords();
+  assert_equals(records.length, 1);
+  assert_equals(records[0].attributeNamespace, null);
+  assert_equals(records[0].oldValue, 'before');
+}, 'Invalid observe options publish nothing and filtered attributes keep exact namespace matching');
+
+test(t => {
+  const target = document.createElement('div');
+  const observer = new MutationObserver(() => {});
+  t.add_cleanup(() => observer.disconnect());
+  observer.observe(target, {attributes: true, attributeOldValue: true});
+  target.setAttribute('data-unfiltered', 'one');
+  target.setAttribute('data-unfiltered', 'two');
+  const records = observer.takeRecords();
+  assert_equals(records.length, 2);
+  assert_equals(records[0].oldValue, null);
+  assert_equals(records[1].oldValue, 'one');
+}, 'Unfiltered attribute observers conservatively retain the original exact delivery path');
+// Explicit empty attributeFilter behavior is intentionally not asserted here:
+// the internal union mirrors existing ObserverOptions matching conservatively.
+</script>

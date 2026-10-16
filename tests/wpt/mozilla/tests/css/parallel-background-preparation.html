@@ -1,0 +1,111 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Parallel eager background preparation preserves ordered complete styles and whole-batch fallback</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<body><script>
+'use strict';
+setup({explicit_done:true});
+const COUNT=128;
+const CSS_COLORS={red:'rgb(255, 0, 0)',green:'rgb(0, 128, 0)',blue:'rgb(0, 0, 255)'};
+async function fixture(t) {
+  const frame=document.createElement('iframe');
+  frame.width=400;frame.height=240;frame.style.border='0';
+  const loaded=new Promise(resolve=>frame.onload=resolve);
+  frame.srcdoc='<!doctype html><style>html,body{margin:0;overflow:hidden}</style><body>';
+  document.body.append(frame);t.add_cleanup(()=>frame.remove());await loaded;
+  const w=frame.contentWindow,d=w.document,u=w.ServoTestUtils,cells=[];
+  const fragment=d.createDocumentFragment();
+  for(let i=0;i<COUNT;i++) {
+    const cell=d.createElement('div');
+    cell.style.cssText=`position:${i%2?'fixed':'absolute'};left:${2+(i%16)*10}px;top:${2+Math.floor(i/16)*10}px;width:6px;height:6px;background-color:red`;
+    cells.push(cell);fragment.append(cell);
+  }
+  d.body.append(fragment);
+  ServoTestUtils.forceLayout();u.forceLayout();
+  const f={frame,w,d,u,cells,trace:[]};
+  setColors(f,'green');ack(f,render(f,'setup green'),false);
+  setColors(f,'blue');ack(f,render(f,'setup blue'),true);
+  setColors(f,'red');ack(f,render(f,'setup red'),true);
+  current(f,'red');geometry(f);
+  return f;
+}
+function setColors(f,value) {
+  f.cells.forEach((cell,index)=>cell.style.backgroundColor=typeof value==='function'?value(index):value);
+}
+function render(f,label) {
+  const result=f.u.forceLayout();
+  f.trace.push({label,phases:Array.from(result.phases),ack:result.certifiedBackgroundColorCount,leaf:result.certifiedBackgroundCachedLeafCount,family:result.certifiedBackgroundCachedFamilyCount});
+  return result;
+}
+function detail(f,message) {return message+'; trace='+JSON.stringify(f.trace);}
+function ack(f,result,cached) {
+  assert_equals(result.certifiedBackgroundColorCount,COUNT,detail(f,'complete actual Painter ACK'));
+  assert_true(result.phases.includes('UpdatedBackgroundColors'),detail(f,'real update phase'));
+  assert_false(result.phases.includes('RanLayout'),detail(f,'accepted update preserves layout'));
+  assert_false(result.phases.includes('BuiltDisplayList'),detail(f,'accepted update preserves display list'));
+  if(cached) {
+    assert_equals(result.certifiedBackgroundCachedLeafCount,COUNT,detail(f,'every cached leaf'));
+    assert_equals(result.certifiedBackgroundCachedFamilyCount,COUNT,detail(f,'every cached family'));
+  }
+}
+function fallback(f,result,label) {
+  assert_equals(result.certifiedBackgroundColorCount,0,detail(f,label+': whole batch falls back'));
+  assert_equals(result.certifiedBackgroundCachedLeafCount,0,detail(f,label+': no leaf success'));
+  assert_equals(result.certifiedBackgroundCachedFamilyCount,0,detail(f,label+': no family success'));
+}
+function current(f,value) {
+  f.cells.forEach((cell,index)=> {
+    const color=typeof value==='function'?value(index):value;
+    assert_equals(f.w.getComputedStyle(cell).backgroundColor,CSS_COLORS[color],detail(f,'current complete style '+index));
+  });
+}
+function geometry(f,lastWidth=6) {
+  assert_equals(f.w.innerWidth,400);assert_equals(f.w.innerHeight,240);
+  f.cells.forEach((cell,index)=> {
+    const rect=cell.getBoundingClientRect();
+    assert_equals(rect.left,2+(index%16)*10,'left '+index);
+    assert_equals(rect.top,2+Math.floor(index/16)*10,'top '+index);
+    assert_equals(rect.width,index===COUNT-1?lastWidth:6,'width '+index);
+    assert_equals(rect.height,6,'height '+index);
+  });
+}
+window.onload=()=> {
+  promise_test(async t=> {
+    const f=await fixture(t),pattern=index=>index%2?'green':'blue';
+    setColors(f,pattern);ack(f,render(f,'ordered mixed colors'),true);current(f,pattern);geometry(f);
+    setColors(f,'red');ack(f,render(f,'strict warm red'),true);current(f,'red');geometry(f);
+    setColors(f,pattern);ack(f,render(f,'strict warm mixed colors'),true);current(f,pattern);geometry(f);
+  },'Parallel background preparation preserves ordered current colors and geometry across 128 absolute and fixed leaves');
+  promise_test(async t=> {
+    const f=await fixture(t);
+    setColors(f,'blue');f.cells[COUNT-1].style.width='7px';
+    fallback(f,render(f,'late width mutation'),'late width mutation');current(f,'blue');geometry(f,7);
+    setColors(f,'red');f.cells[COUNT-1].style.width='6px';
+    fallback(f,render(f,'restore width'),'restore width');current(f,'red');geometry(f);
+    setColors(f,'green');ack(f,render(f,'recovery seed'),false);current(f,'green');geometry(f);
+    for(const color of ['blue','red']) {
+      setColors(f,color);ack(f,render(f,'recovery warm '+color),true);current(f,color);geometry(f);
+    }
+  },'One late non-background declaration rejects the whole parallel batch and ordinary layout permits strict warm recovery');
+  promise_test(async t=> {
+    const f=await fixture(t);
+    setColors(f,'blue');current(f,'blue');
+    fallback(f,render(f,'query pending-paint settlement'),'an eager query does not mint a Painter ACK');
+    current(f,'blue');geometry(f);
+    setColors(f,'red');ack(f,render(f,'post-query seed'),false);current(f,'red');geometry(f);
+    for(const color of ['green','blue']) {
+      setColors(f,color);ack(f,render(f,'post-query warm '+color),true);current(f,color);geometry(f);
+    }
+  },'Synchronous queries eagerly publish all 128 current styles without a paint certificate and preserve later real warm ACKs');
+  promise_test(async t=> {
+    const f=await fixture(t),sheet=f.d.createElement('style');
+    sheet.textContent='div::selection{background-color:yellow}';f.d.head.append(sheet);
+    setColors(f,'blue');fallback(f,render(f,'authored Selection stylesheet'),'authored Selection stylesheet');
+    assert_equals(sheet.sheet.cssRules.length,1,'the real stylesheet was installed');
+    assert_equals(f.w.getComputedStyle(f.cells[COUNT-1],'::selection').backgroundColor,'rgb(255, 255, 0)','current authored Selection style');
+    current(f,'blue');geometry(f);
+  },'A dynamic authored Selection stylesheet revokes parallel background admission before any partial commit');
+  done();
+};
+</script>

@@ -2963,9 +2963,13 @@ impl Element {
             return false;
         }
 
-        // Keep detached-node preservation conservative: subtree removals can
-        // leave transient observer registrations until the next delivery.
         let node = self.upcast::<Node>();
+        if MutationObserver::attribute_observers_cannot_match(node, &local_name!("style")) {
+            return false;
+        }
+
+        // Keep detached-node preservation conservative whenever the agent-wide
+        // union cannot rule out even copied/transient attribute registrations.
         if !node.is_connected() {
             return true;
         }

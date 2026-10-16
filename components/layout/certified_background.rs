@@ -11,19 +11,25 @@
 use layout_api::{
     LayoutElement, LayoutNode, ReflowRequestRestyle, RestyleReason, TrustedNodeAddress,
 };
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use script::layout_dom::{ServoDangerousStyleElement, ServoLayoutElement, ServoLayoutNode};
+use servo_config::pref;
 use style::context::{SharedStyleContext, StyleContext, ThreadLocalStyleContext};
+use style::data::ElementDataRef;
 use style::dom::{TElement, TNode};
 use style::inline_background::{
-    BackgroundBatchProof, BackgroundParentProof, PreparedBackgroundStyle, commit_background_style,
+    BackgroundBatchProof, BackgroundParentProof, BackgroundStyleReuse, CapturedBackgroundStyle,
+    PreparedBackgroundStyle, capture_background_style_in_batch, commit_background_style,
     prepare_background_style_in_batch,
 };
 use style::invalidation::element::restyle_hints::RestyleHint;
+use style::shared_lock::StylesheetGuards;
 use web_atoms::local_name;
 
 use crate::background_color_cache::{
     BackgroundColorCache, BackgroundColorUpdates, BackgroundLeafReuse, BackgroundStyleReuseStore,
+    CertifiedBackgroundBinding,
 };
 use crate::dom::PreparedEmptyBackgroundLeaf;
 
@@ -104,6 +110,7 @@ impl CertifiedBackgroundInput {
         self,
         shared: &SharedStyleContext,
         cache: &mut BackgroundColorCache,
+        pool: Option<&rayon::ThreadPool>,
     ) -> Option<PreparedBackgroundBatch<'dom>> {
         let mut reusable_styles = cache.detach_reusable_styles();
         if !cache.can_prepare_certified_updates() {
@@ -134,14 +141,14 @@ impl CertifiedBackgroundInput {
         let collect = shared.inline_background_count.is_some();
         let mut cached_leaf_count = 0usize;
         let mut cached_family_count = 0usize;
-        let mut entries = Vec::with_capacity(self.targets.len());
-        let mut colors = Vec::with_capacity(self.targets.len());
-        let mut changed_fragments = Vec::with_capacity(self.targets.len());
+        // Only this serial capture touches DOM, layout ownership or cache slots.
+        // Retain each ElementData read guard until all pure workers have joined.
+        let mut targets = Vec::with_capacity(self.targets.len());
         for address in self.targets {
             let node = unsafe { ServoLayoutNode::new(&address) };
             let element = node.as_element()?;
             let dangerous = unsafe { element.dangerous_style_element() };
-            let data = element.element_data();
+            let data = element.style_data()?.element_data.borrow();
             let primary = data.styles.primary.as_ref()?;
             // Validate every actual owner/base/fragment/IFC/Selection reference
             // before consuming scratch. The complete current Stylo proof still
@@ -179,15 +186,71 @@ impl CertifiedBackgroundInput {
                     *entry.insert(BackgroundParentProof::prepare(dangerous)?)
                 },
             };
-            let style = prepare_background_style_in_batch(
-                &context,
-                dangerous,
-                &data,
-                RestyleHint::RESTYLE_STYLE_ATTRIBUTE,
+            targets.push(BackgroundPreparationTarget {
+                element,
+                data,
+                layout,
+                binding,
+                parent,
                 reuse,
-                &batch,
-                &parent,
-            )?;
+            });
+        }
+        let parallel = should_parallelize_background_styles(
+            pool.is_some(),
+            targets.len(),
+            pref!(layout_parallelism_job_count_minimum) as usize,
+            pref!(layout_parallelism_job_size_minimum) as usize,
+        );
+        let styles = if parallel {
+            PreparedBackgroundStyle::layout_attribution_mark("parallel_prepare");
+            // Tokens borrow only immutable style data, never the target's DOM
+            // or layout fields. Author and ElementData read guards cover join.
+            let captured = targets
+                .iter_mut()
+                .map(|target| {
+                    capture_background_style_in_batch(
+                        &context,
+                        unsafe { target.element.dangerous_style_element() },
+                        &target.data,
+                        RestyleHint::RESTYLE_STYLE_ATTRIBUTE,
+                        target.reuse.take(),
+                        &batch,
+                        &target.parent,
+                    )
+                })
+                .collect::<Option<Vec<_>>>()?;
+            prepare_captured_background_styles(captured, &shared.guards, pool.unwrap())?
+        } else {
+            // Preserve the original fused proof/materialization and its caller
+            // TLS diagnostic sampling for small batches and missing pools.
+            targets
+                .iter_mut()
+                .map(|target| {
+                    prepare_background_style_in_batch(
+                        &context,
+                        unsafe { target.element.dangerous_style_element() },
+                        &target.data,
+                        RestyleHint::RESTYLE_STYLE_ATTRIBUTE,
+                        target.reuse.take(),
+                        &batch,
+                        &target.parent,
+                    )
+                })
+                .collect::<Option<Vec<_>>>()?
+        };
+        let mut entries = Vec::with_capacity(targets.len());
+        let mut colors = Vec::with_capacity(targets.len());
+        let mut changed_fragments = Vec::with_capacity(targets.len());
+        for (target, style) in targets.into_iter().zip(styles) {
+            let BackgroundPreparationTarget {
+                element,
+                data,
+                layout,
+                binding,
+                ..
+            } = target;
+            // No read guard may survive into the ACK/atomic mutable commit.
+            drop(data);
             if collect {
                 cached_leaf_count += usize::from(layout.used_cached_proof());
                 cached_family_count += usize::from(style.used_cached_family());
@@ -216,6 +279,40 @@ impl CertifiedBackgroundInput {
             cached_family_count,
         })
     }
+}
+
+/// DOM/layout/cache-bearing state stays on the calling Layout thread.
+struct BackgroundPreparationTarget<'dom> {
+    element: ServoLayoutElement<'dom>,
+    data: ElementDataRef<'dom>,
+    layout: PreparedEmptyBackgroundLeaf,
+    binding: CertifiedBackgroundBinding,
+    parent: BackgroundParentProof,
+    reuse: Option<BackgroundStyleReuse>,
+}
+
+fn should_parallelize_background_styles(
+    has_pool: bool,
+    count: usize,
+    minimum_jobs: usize,
+    minimum_job_size: usize,
+) -> bool {
+    has_pool && count >= minimum_jobs.saturating_mul(minimum_job_size.max(1))
+}
+
+fn prepare_captured_background_styles(
+    captured: Vec<CapturedBackgroundStyle<'_>>,
+    guards: &StylesheetGuards,
+    pool: &rayon::ThreadPool,
+) -> Option<Vec<PreparedBackgroundStyle>> {
+    // Indexed Rayon collection retains target order; a single failed proof
+    // drops every candidate and takes the original whole-batch fallback.
+    pool.install(|| {
+        captured
+            .into_par_iter()
+            .map(|input| input.prepare(guards))
+            .collect()
+    })
 }
 
 struct PreparedEntry<'dom> {
@@ -302,6 +399,28 @@ impl PreparedBackgroundBatch<'_> {
 #[cfg(test)]
 mod unified_background_tests {
     use super::*;
+    #[test]
+    fn parallel_background_preparation_respects_pool_and_coarsened_threshold() {
+        assert!(!should_parallelize_background_styles(false, 10_000, 4, 16));
+        assert!(!should_parallelize_background_styles(true, 63, 4, 16));
+        assert!(should_parallelize_background_styles(true, 64, 4, 16));
+        assert!(should_parallelize_background_styles(true, 10_000, 4, 16));
+    }
+
+    #[test]
+    fn parallel_background_preparation_handles_zero_and_overflow_preferences() {
+        assert!(!should_parallelize_background_styles(false, 0, 0, 0));
+        assert!(should_parallelize_background_styles(true, 0, 0, 16));
+        assert!(!should_parallelize_background_styles(true, 3, 4, 0));
+        assert!(should_parallelize_background_styles(true, 4, 4, 0));
+        assert!(!should_parallelize_background_styles(
+            true,
+            10_000,
+            usize::MAX,
+            16
+        ));
+    }
+
     #[test]
     fn unified_background_omission_tag_rejects_stale_epoch_mixed_history_and_unknown_provenance() {
         let mut pending = layout_api::PendingRestyle {

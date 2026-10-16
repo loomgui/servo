@@ -1375,7 +1375,7 @@ impl LayoutThread {
             };
 
             let rayon_pool_guard = STYLE_THREAD_POOL.lock();
-            let _rayon_pool = rayon_pool_guard.pool();
+            let rayon_pool = rayon_pool_guard.pool();
 
             let device_has_changed = std::mem::replace(&mut self.device_has_changed, false);
             if device_has_changed {
@@ -1477,7 +1477,11 @@ impl LayoutThread {
                     style::inline_background::PreparedBackgroundStyle::layout_attribution_mark(
                         "prepare_begin",
                     );
-                    let prepared = input.prepare(&shared, &mut self.background_colors.lock());
+                    let prepared = input.prepare(
+                        &shared,
+                        &mut self.background_colors.lock(),
+                        rayon_pool.as_ref(),
+                    );
                     style::inline_background::PreparedBackgroundStyle::layout_attribution_mark(
                         "prepare_end",
                     );
