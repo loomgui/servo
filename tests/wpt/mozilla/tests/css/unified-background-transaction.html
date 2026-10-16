@@ -20,12 +20,26 @@ async function fixture(t, beforeWarm) {
   // Establish the real embedding/viewport before the subdocument warm-up.
   ServoTestUtils.forceLayout();
   u.forceLayout();
-  let warm;
-  for(const value of ['green','blue','red']) { cell.style.backgroundColor=value; warm=u.forceLayout(); }
+  let cold,warm;
+  for(const value of ['green','blue','red']) { cell.style.backgroundColor=value; warm=u.forceLayout(); if(cold===undefined)cold=warm; }
   assert_equals(warm.certifiedBackgroundColorCount,1,'actual painter ACK before every negative');
   assert_equals(warm.certifiedBackgroundCachedLeafCount,1,'actual cached leaf path, not ordinary fallback');
   assert_equals(warm.certifiedBackgroundCachedFamilyCount,1,'actual inductive family path, not cold reconstruction');
-  return {w,d,u,cell,host};
+  return {w,d,u,cell,host,cold,warm};
+}
+async function fixedFixture(t,beforeWarm) {
+  return fixture(t,async f=>{
+    f.cell.style.cssText='position:fixed;left:8vw;top:50vh;width:6vw;height:10vh;background-color:red';
+    if(beforeWarm)await beforeWarm(f);
+  });
+}
+function admitted(f,value,cached) {
+  f.cell.style.backgroundColor=value;
+  const r=f.u.forceLayout();
+  assert_equals(r.certifiedBackgroundColorCount,1,'real painter ACK for the fixed leaf');
+  assert_equals(r.certifiedBackgroundCachedLeafCount,cached,'fixed leaf shape proof');
+  assert_equals(r.certifiedBackgroundCachedFamilyCount,cached,'fixed eager style family proof');
+  return r;
 }
 function compact(f,value='blue') {
   const before=f.u.compactBackgroundMutationCount(); f.cell.style.backgroundColor=value;
@@ -168,6 +182,81 @@ window.onload=()=>{
   assert_equals(f.w.getComputedStyle(f.cell,'::selection').color,'rgb(33, 44, 55)');color(f);
   const n=f.u.compactBackgroundMutationCount();f.cell.style.backgroundColor='inherit';assert_equals(f.u.compactBackgroundMutationCount(),n);color(f,'rgba(0, 0, 0, 0)');
  },'Selection pseudo and CSS-wide fallback stay eager after omitted primary mutation');
+ promise_test(async t=>{
+  const f=await fixedFixture(t);
+  assert_equals(f.cold.certifiedBackgroundColorCount,1,'cold fixed-vw leaf uses its actual retained primitive');
+  assert_equals(f.cold.certifiedBackgroundCachedLeafCount,0,'cold acceptance cannot bootstrap from a cached shape');
+  assert_equals(f.cold.certifiedBackgroundCachedFamilyCount,0);
+  assert_equals(f.warm.certifiedBackgroundCachedLeafCount,1);
+  const before=f.cell.getBoundingClientRect(); admitted(f,'blue',1); color(f);
+  const after=f.cell.getBoundingClientRect();
+  assert_equals(after.x,before.x);assert_equals(after.y,before.y);
+  assert_equals(after.width,before.width);assert_equals(after.height,before.height);
+  assert_equals(f.w.getComputedStyle(f.cell).position,'fixed');
+ },'Fixed viewport-unit leaf gets cold and cached true ACKs while preserving its stacking context and geometry');
+ promise_test(async t=>{
+  const f=await fixedFixture(t);compact(f);f.cell.style.width='7vw';
+  const r=f.u.forceLayout();assert_equals(r.certifiedBackgroundColorCount,0,'mixed width change must take ordinary layout');
+  assert_approx_equals(f.cell.getBoundingClientRect().width,f.w.innerWidth*.07,.05);color(f);
+  admitted(f,'red',0);admitted(f,'blue',1);color(f);
+ },'Fixed-vw width change rejects the entire color batch and reacquires only after the new full display list');
+ promise_test(async t=>{
+  const f=await fixedFixture(t),old=f.cell,replacement=old.cloneNode();
+  old.replaceWith(replacement);f.cell=replacement;f.cell.style.backgroundColor='blue';
+  const r=f.u.forceLayout();assert_equals(r.certifiedBackgroundColorCount,0,'replacement cannot reuse an old fragment binding');
+  assert_false(old.isConnected);assert_true(replacement.isConnected);color(f);
+  assert_approx_equals(f.cell.getBoundingClientRect().width,f.w.innerWidth*.06,.05);
+  admitted(f,'red',0);admitted(f,'blue',1);color(f);
+ },'Fixed-vw node replacement cannot reuse the old owner, fragment, style or display-list generation');
+ promise_test(async t=>{
+  const f=await fixedFixture(t);
+  f.cell.style.backgroundColor='transparent';f.u.forceLayout();
+  f.cell.style.backgroundColor='blue';
+  const r=f.u.forceLayout();assert_equals(r.certifiedBackgroundColorCount,0,'a fixed fragment without a retained opaque rectangle has no admission capability');color(f);
+  admitted(f,'red',0);admitted(f,'blue',1);color(f);
+ },'Fixed-vw transparent-to-opaque change needs a fresh actual binding before cold and cached color updates');
+ promise_test(async t=>{
+  const f=await fixedFixture(t);
+  const resized=new Promise(resolve=>f.w.addEventListener('resize',()=>{
+    f.cell.style.backgroundColor='blue';resolve(f.u.forceLayout());
+  },{once:true}));
+  f.w.frameElement.width=500;f.w.frameElement.height=300;
+  const r=await resized;
+  assert_equals(r.certifiedBackgroundCachedLeafCount,0,'old viewport shape/family cannot survive resize');
+  assert_equals(r.certifiedBackgroundCachedFamilyCount,0);
+  const rect=f.cell.getBoundingClientRect();
+  assert_approx_equals(rect.x,f.w.innerWidth*.08,.05);assert_approx_equals(rect.y,f.w.innerHeight*.5,.05);
+  assert_approx_equals(rect.width,f.w.innerWidth*.06,.05);assert_approx_equals(rect.height,f.w.innerHeight*.1,.05);color(f);
+  // A resize may finish a fresh full list before dispatching this event. In both
+  // event orders, two further writes must reach the actual cached ACK path.
+  f.cell.style.backgroundColor='red';f.u.forceLayout();admitted(f,'blue',1);color(f);
+ },'Fixed-vw resize never reuses the prior viewport proof and preserves current physical geometry before warm recovery');
+ promise_test(async t=>{
+  const f=await fixedFixture(t);
+  compact(f);f.host.style.transform='translateX(20px)';
+  const r=f.u.forceLayout();assert_equals(r.certifiedBackgroundColorCount,0,'changed containing-block ancestor cannot retain old spatial ids');
+  const hostRect=f.host.getBoundingClientRect(),left=parseFloat(f.w.getComputedStyle(f.cell).left);
+  assert_approx_equals(f.cell.getBoundingClientRect().x,hostRect.x+f.host.clientLeft+left,.05);color(f);
+  admitted(f,'red',0);admitted(f,'blue',1);color(f);
+ },'Fixed-vw ancestor transform change falls back and reacquires the real transformed spatial tree');
+ for(const [property,value] of [
+  ['position','sticky'],['z-index','1'],['opacity','.5'],['filter','blur(1px)'],
+  ['backdrop-filter','blur(1px)'],['transform','translateX(1px)'],['perspective','10px'],
+  ['transform-style','preserve-3d'],['will-change','position'],['will-change','opacity'],
+  ['will-change','transform'],['isolation','isolate'],['mix-blend-mode','multiply'],
+  ['clip-path','inset(0)'],['background-clip','text'],['box-shadow','0 0 1px black'],
+  ['text-shadow','0 0 1px black'],
+ ]) promise_test(async t=>{
+  const f=await fixedFixture(t);
+  const initial=f.w.getComputedStyle(f.cell).getPropertyValue(property);
+  assert_not_equals(initial,'','negative case uses a supported computed property');
+  f.cell.style.setProperty(property,value);f.u.forceLayout();
+  const applied=f.w.getComputedStyle(f.cell).getPropertyValue(property);
+  assert_not_equals(applied,initial,'the requested independent stacking/effect cause actually applies');
+  if(property==='position')assert_equals(applied,'sticky');
+  f.cell.style.backgroundColor='blue';
+  const r=f.u.forceLayout();assert_equals(r.certifiedBackgroundColorCount,0,'other stacking/effect cause must keep the ordinary path');color(f);
+ },'Fixed leaf retains ordinary fallback with '+property+':'+value);
  done();
 };
 </script>

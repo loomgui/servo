@@ -150,7 +150,6 @@ impl CertifiedBackgroundInput {
                 .styles
                 .pseudos
                 .get(&style::selector_parser::PseudoElement::Selection)?;
-            let mut binding = None;
             let mut reuse = None;
             let layout = PreparedEmptyBackgroundLeaf::prepare_with_cached(
                 node,
@@ -158,8 +157,7 @@ impl CertifiedBackgroundInput {
                 selection,
                 |fragment| {
                     let (bound, retired) = cache.take_bound_leaf(&mut reusable_styles, fragment)?;
-                    binding = Some(bound);
-                    retired
+                    let proof = retired
                         .map(|retired| {
                             let same = retired.style.matches_primary_selection(
                                 primary,
@@ -169,10 +167,11 @@ impl CertifiedBackgroundInput {
                             reuse = Some(retired.style);
                             same.then_some(retired.proof)
                         })
-                        .flatten()
+                        .flatten();
+                    Some((bound, proof))
                 },
             )?;
-            let binding = binding?;
+            let binding = layout.binding()?;
             let parent_id = dangerous.traversal_parent()?.as_node().opaque();
             let parent = match parents.entry(parent_id) {
                 std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),

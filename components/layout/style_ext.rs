@@ -352,6 +352,10 @@ pub(crate) trait ComputedValuesExt {
     fn used_transform_style(&self, fragment_flags: FragmentFlags) -> ComputedTransformStyle;
     fn establishes_block_formatting_context(&self, fragment_flags: FragmentFlags) -> bool;
     fn establishes_stacking_context(&self, fragment_flags: FragmentFlags) -> bool;
+    /// The complete stacking-context predicate except the unconditional fixed/sticky
+    /// position cause. Fixed-position background repair uses this only with a live
+    /// retained primitive binding; ordinary classification always uses the wrapper.
+    fn establishes_stacking_context_without_position(&self, fragment_flags: FragmentFlags) -> bool;
     fn establishes_scroll_container(&self, fragment_flags: FragmentFlags) -> bool;
     fn establishes_containing_block_for_absolute_descendants(
         &self,
@@ -765,6 +769,15 @@ impl ComputedValuesExt for ComputedValues {
 
     /// Returns true if this fragment establishes a new stacking context and false otherwise.
     fn establishes_stacking_context(&self, fragment_flags: FragmentFlags) -> bool {
+        // Fixed position and sticky position always create stacking contexts.
+        // Keep their ordinary classification, including for retained color repair.
+        matches!(
+            self.get_box().position,
+            ComputedPosition::Fixed | ComputedPosition::Sticky
+        ) || self.establishes_stacking_context_without_position(fragment_flags)
+    }
+
+    fn establishes_stacking_context_without_position(&self, fragment_flags: FragmentFlags) -> bool {
         // From <https://www.w3.org/TR/css-will-change/#valdef-will-change-custom-ident>:
         // > If any non-initial value of a property would create a stacking context on the element,
         // > specifying that property in will-change must create a stacking context on the element.
@@ -781,15 +794,6 @@ impl ComputedValuesExt for ComputedValues {
             && (!self.get_position().z_index.is_auto()
                 || will_change_bits.intersects(WillChangeBits::Z_INDEX))
         {
-            return true;
-        }
-
-        // Fixed position and sticky position always create stacking contexts.
-        // Note `will-change: position` is handled above by `STACKING_CONTEXT_UNCONDITIONAL`.
-        if matches!(
-            self.get_box().position,
-            ComputedPosition::Fixed | ComputedPosition::Sticky
-        ) {
             return true;
         }
 
@@ -1404,5 +1408,90 @@ impl TransformExt for LayoutTransform {
         let pre_translation = Self::translation(x, y, z);
         let post_translation = Self::translation(-x, -y, -z);
         post_translation.then(self).then(&pre_translation)
+    }
+}
+
+#[cfg(test)]
+mod fixed_background_stacking_context_tests {
+    use super::*;
+    use style::properties::style_structs::Font;
+    use style::values::computed::ZIndex;
+
+    fn values(position: ComputedPosition) -> ComputedValues {
+        let mut values =
+            (*ComputedValues::initial_values_with_font_override(Font::initial_values())).clone();
+        values.mutate_box().position = position;
+        values.mutate_box().display = stylo::Display::Block;
+        values
+    }
+
+    #[test]
+    fn fixed_background_split_keeps_fixed_sticky_and_root_stacking_contexts() {
+        for (position, creates_context) in [
+            (ComputedPosition::Static, false),
+            (ComputedPosition::Absolute, false),
+            (ComputedPosition::Fixed, true),
+            (ComputedPosition::Sticky, true),
+        ] {
+            let values = values(position);
+            assert_eq!(
+                values.establishes_stacking_context(FragmentFlags::empty()),
+                creates_context
+            );
+            assert!(!values.establishes_stacking_context_without_position(FragmentFlags::empty()));
+            assert!(values.establishes_stacking_context(FragmentFlags::IS_ROOT_ELEMENT));
+            assert!(
+                values
+                    .establishes_stacking_context_without_position(FragmentFlags::IS_ROOT_ELEMENT)
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_background_split_keeps_independent_stacking_context_causes() {
+        let cases: [(&str, fn(&mut ComputedValues)); 8] = [
+            ("opacity", |s| s.mutate_effects().opacity = 0.5),
+            ("z-index", |s| {
+                s.mutate_position().z_index = ZIndex::Integer(1)
+            }),
+            ("isolation", |s| {
+                s.mutate_box().isolation = ComputedIsolation::Isolate
+            }),
+            ("blend", |s| {
+                s.mutate_effects().mix_blend_mode = ComputedMixBlendMode::Multiply
+            }),
+            ("will-change position", |s| {
+                s.mutate_box().will_change.bits.insert(
+                    WillChangeBits::STACKING_CONTEXT_UNCONDITIONAL | WillChangeBits::POSITION,
+                );
+            }),
+            ("will-change opacity", |s| {
+                s.mutate_box()
+                    .will_change
+                    .bits
+                    .insert(WillChangeBits::OPACITY);
+            }),
+            ("will-change transform", |s| {
+                s.mutate_box()
+                    .will_change
+                    .bits
+                    .insert(WillChangeBits::TRANSFORM);
+            }),
+            ("preserve-3d", |s| {
+                s.mutate_box().transform_style = ComputedTransformStyle::Preserve3d
+            }),
+        ];
+        for (name, change) in cases {
+            let mut values = values(ComputedPosition::Fixed);
+            change(&mut values);
+            assert!(
+                values.establishes_stacking_context(FragmentFlags::empty()),
+                "{name}"
+            );
+            assert!(
+                values.establishes_stacking_context_without_position(FragmentFlags::empty()),
+                "{name} must remain a separate stacking-context cause"
+            );
+        }
     }
 }
