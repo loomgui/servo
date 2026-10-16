@@ -227,9 +227,38 @@ window.onload=()=>{
   const rect=f.cell.getBoundingClientRect();
   assert_approx_equals(rect.x,f.w.innerWidth*.08,.05);assert_approx_equals(rect.y,f.w.innerHeight*.5,.05);
   assert_approx_equals(rect.width,f.w.innerWidth*.06,.05);assert_approx_equals(rect.height,f.w.innerHeight*.1,.05);color(f);
-  // A resize may finish a fresh full list before dispatching this event. In both
-  // event orders, two further writes must reach the actual cached ACK path.
-  f.cell.style.backgroundColor='red';f.u.forceLayout();admitted(f,'blue',1);color(f);
+  // The first post-resize write can settle a pending full display list. Its
+  // result is diagnostic only; a real positive ACK must seed the warm assertions.
+  const viewport={width:f.w.innerWidth,height:f.w.innerHeight};
+  const recovery=[];
+  const update=value=>{
+    f.cell.style.backgroundColor=value;
+    const next=f.u.forceLayout();
+    recovery.push({color:value,phases:Array.from(next.phases),
+      ack:next.certifiedBackgroundColorCount,leaf:next.certifiedBackgroundCachedLeafCount,
+      family:next.certifiedBackgroundCachedFamilyCount,rebuilt:next.rebuiltFragmentCount,
+      restyled:next.restyleFragmentCount});
+    return next;
+  };
+  const unchanged=expected=>{
+    const current=f.cell.getBoundingClientRect(),detail=JSON.stringify(recovery);
+    assert_equals(f.w.innerWidth,viewport.width,'recovery viewport width '+detail);
+    assert_equals(f.w.innerHeight,viewport.height,'recovery viewport height '+detail);
+    assert_equals(current.x,rect.x,'recovery x '+detail);assert_equals(current.y,rect.y,'recovery y '+detail);
+    assert_equals(current.width,rect.width,'recovery width '+detail);assert_equals(current.height,rect.height,'recovery height '+detail);
+    assert_equals(f.w.getComputedStyle(f.cell).backgroundColor,expected,'recovery current color '+detail);
+  };
+  update('red'); // Capture settlement phases/counts without assuming an ACK.
+  const seed=update('blue');
+  assert_equals(seed.certifiedBackgroundColorCount,1,'actual current-viewport ACK seed '+JSON.stringify(recovery));
+  unchanged(BLUE);
+  for(const [value,expected] of [['red',RED],['blue',BLUE]]){
+    const hot=update(value),detail=JSON.stringify(recovery);
+    assert_equals(hot.certifiedBackgroundColorCount,1,'consecutive actual warm ACK '+detail);
+    assert_equals(hot.certifiedBackgroundCachedLeafCount,1,'consecutive cached fixed leaf '+detail);
+    assert_equals(hot.certifiedBackgroundCachedFamilyCount,1,'consecutive cached eager family '+detail);
+    unchanged(expected);
+  }
  },'Fixed-vw resize never reuses the prior viewport proof and preserves current physical geometry before warm recovery');
  promise_test(async t=>{
   const f=await fixedFixture(t);
