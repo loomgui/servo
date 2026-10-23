@@ -375,6 +375,27 @@ impl AttributeStorage {
         unsafe { self.0.borrow_for_layout() }
     }
 
+    /// Invalidate the existing raw or materialized STYLE value without replacing
+    /// its live Attr/PDB identity. Admission precedes any PDB mutation.
+    pub(crate) fn invalidate_style_serialization(
+        &self,
+        block: &servo_arc::Arc<
+            style::shared_lock::Locked<style::properties::PropertyDeclarationBlock>,
+        >,
+    ) -> bool {
+        let mut entries = self.0.borrow_mut();
+        let Some(entry) = entries.iter_mut().find(|entry| {
+            let attr = entry.as_ref();
+            attr.local_name() == &html5ever::local_name!("style") && attr.namespace() == &ns!()
+        }) else {
+            return false;
+        };
+        match entry {
+            AttributeEntry::Raw(data) => data.value.invalidate_declaration_serialization(block),
+            AttributeEntry::Dom(attr) => attr.invalidate_declaration_serialization(block),
+        }
+    }
+
     /// Reserve room for at least `additional` more attributes.
     #[inline]
     pub(crate) fn reserve_exact(&self, additional: usize) {

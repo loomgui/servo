@@ -17,6 +17,17 @@ namespace ServoTestUtils {
   [Exposed=Window]
   LayoutResult forceLayout();
 
+  [Exposed=Window]
+  LayoutResult? automaticRenderingObservation();
+
+  unsigned long inlineStylePreservationCloneCount();
+  unsigned long compactBackgroundMutationCount();
+  unsigned long backgroundParseAttemptCount();
+
+  unsigned long dependentAbortSignalCount();
+
+  unsigned long abortSignalFollowerCount(AbortSignal signal);
+
   undefined js_backtrace();
 
   undefined panic();
@@ -29,7 +40,12 @@ namespace ServoTestUtils {
 
 [Exposed=Window, Pref="dom_servo_helpers_enabled"]
 interface LayoutResult {
+    readonly attribute unsigned long long observationSequence;
     readonly attribute /* FrozenArray<DOMString> */ any phases;
+    readonly attribute unsigned long inlineBackgroundColorRecascadeCount;
+  readonly attribute unsigned long certifiedBackgroundColorCount;
+    readonly attribute unsigned long certifiedBackgroundCachedLeafCount;
+    readonly attribute unsigned long certifiedBackgroundCachedFamilyCount;
     readonly attribute unsigned long rebuiltFragmentCount;
     readonly attribute unsigned long restyleFragmentCount;
     readonly attribute unsigned long onlyDescendantsChangedCount;

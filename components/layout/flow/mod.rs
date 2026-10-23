@@ -25,7 +25,7 @@ use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
 use crate::dom::WeakLayoutBox;
 use crate::flow::float::{Clear, FloatBox, FloatSide, PlacementAmongFloats, SequentialLayoutState};
-use crate::flow::same_formatting_context_block::SameFormattingContextBlock;
+pub(crate) use crate::flow::same_formatting_context_block::SameFormattingContextBlock;
 use crate::formatting_contexts::{Baselines, IndependentFormattingContext};
 use crate::fragment_tree::{
     BaseFragmentInfo, BlockLevelLayoutInfo, BoxFragment, CollapsedBlockMargins, CollapsedMargin,

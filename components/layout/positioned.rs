@@ -420,6 +420,39 @@ impl Zero for PositioningContextLength {
     }
 }
 
+// Estimate parallel work in adjacent sibling groups, rather than requiring each
+// individual sibling to exceed the minimum. A large subtree still contributes
+// only one job; the existing indexed Rayon iterator splits the actual work and
+// preserves fragment order. Other layout scheduling keeps its current policy.
+fn should_parallelize_absolute_positioning(
+    allow_parallel_layout: bool,
+    job_count_minimum: usize,
+    job_size_minimum: usize,
+    job_sizes: impl Iterator<Item = usize>,
+) -> bool {
+    if !allow_parallel_layout {
+        return false;
+    }
+    if job_count_minimum == 0 {
+        return true;
+    }
+
+    let mut job_count = 0;
+    let mut accumulated_size = 0usize;
+    for size in job_sizes {
+        accumulated_size = accumulated_size.saturating_add(size);
+        if accumulated_size < job_size_minimum {
+            continue;
+        }
+        job_count += 1;
+        if job_count >= job_count_minimum {
+            return true;
+        }
+        accumulated_size = 0;
+    }
+    false
+}
+
 impl HoistedAbsolutelyPositionedBox {
     fn position(&self) -> Position {
         let position = self
@@ -450,7 +483,12 @@ impl HoistedAbsolutelyPositionedBox {
                 .context
                 .subtree_size()
         });
-        if layout_context.should_parallelize_layout(job_sizes) {
+        if should_parallelize_absolute_positioning(
+            layout_context.allow_parallel_layout,
+            layout_context.parallelism_job_count_minimum,
+            layout_context.parallelism_job_size_minimum,
+            job_sizes,
+        ) {
             let mut new_fragments = Vec::new();
             let mut new_hoisted_boxes = Vec::new();
 
@@ -533,8 +571,8 @@ impl HoistedAbsolutelyPositionedBox {
         // For all other containers, the containing block is just the padding box.
         let fully_adjusted_static_position_rect = {
             let mut static_position_rect = self.static_position_rect().translate(
-                PhysicalVec::new(containing_block_padding.left, containing_block_padding.top) -
-                    containing_block_origin,
+                PhysicalVec::new(containing_block_padding.left, containing_block_padding.top)
+                    - containing_block_origin,
             );
             static_position_rect.size = static_position_rect.size.max(PhysicalSize::zero());
             static_position_rect.to_logical(&(&containing_block).into())
@@ -652,8 +690,8 @@ impl IndependentFormattingContext {
             box_offsets: inline_box_offsets,
             static_position_rect_axis: static_position_rect.get_axis(Direction::Inline),
             alignment: inline_alignment,
-            flip_anchor: original_parent_writing_mode.is_bidi_ltr() !=
-                containing_block_writing_mode.is_bidi_ltr(),
+            flip_anchor: original_parent_writing_mode.is_bidi_ltr()
+                != containing_block_writing_mode.is_bidi_ltr(),
             is_table_or_replaced,
         };
 
@@ -802,12 +840,12 @@ impl IndependentFormattingContext {
         .as_physical(Some(containing_block))
         .translate(containing_block_origin);
 
-        if is_cached &&
-            let Some(old_fragment) = self.base.fragments().first() &&
-            let Some(old_box_fragment) = old_fragment
+        if is_cached
+            && let Some(old_fragment) = self.base.fragments().first()
+            && let Some(old_box_fragment) = old_fragment
                 .retrieve_box_fragment()
-                .map(|fragment| fragment.clone()) &&
-            content_rect == old_box_fragment.content_rect()
+                .map(|fragment| fragment.clone())
+            && content_rect == old_box_fragment.content_rect()
         {
             // Drain the nested absolutes for which we are a containing block.
             // However, we are reusing the fragment, so no need to lay them out again.
@@ -882,9 +920,9 @@ impl AbsoluteAxisSolver {
         ) {
             (None, None) => {
                 if self.flip_anchor {
-                    self.containing_size -
-                        self.static_position_rect_axis.origin -
-                        self.static_position_rect_axis.length
+                    self.containing_size
+                        - self.static_position_rect_axis.origin
+                        - self.static_position_rect_axis.length
                 } else {
                     self.static_position_rect_axis.origin
                 }
@@ -915,10 +953,10 @@ impl AbsoluteAxisSolver {
     #[inline]
     fn stretch_size(&self) -> Au {
         Au::zero().max(
-            self.available_space() -
-                self.padding_border_sum -
-                self.computed_margin_start.auto_is(Au::zero) -
-                self.computed_margin_end.auto_is(Au::zero),
+            self.available_space()
+                - self.padding_border_sum
+                - self.computed_margin_start.auto_is(Au::zero)
+                - self.computed_margin_end.auto_is(Au::zero),
         )
     }
 
@@ -1001,8 +1039,8 @@ impl AbsoluteAxisSolver {
             "Mixed horizontal and vertical writing modes are not supported yet"
         );
         let self_value_matches_container = || {
-            self.axis == Direction::Block ||
-                self_writing_mode.is_bidi_ltr() == alignment_container_writing_mode.is_bidi_ltr()
+            self.axis == Direction::Block
+                || self_writing_mode.is_bidi_ltr() == alignment_container_writing_mode.is_bidi_ltr()
         };
 
         // Here we resolve the alignment to either start, center, or end.
@@ -1058,8 +1096,8 @@ impl AbsoluteAxisSolver {
             AlignFlags::END => alignment_container.origin + free_space,
             _ => unreachable!(),
         };
-        if matches!(flags, AlignFlags::SAFE | AlignFlags::UNSAFE) ||
-            matches!(
+        if matches!(flags, AlignFlags::SAFE | AlignFlags::UNSAFE)
+            || matches!(
                 self.alignment,
                 AlignFlags::NORMAL | AlignFlags::AUTO | AlignFlags::STRETCH
             )
@@ -1177,5 +1215,112 @@ impl LayoutRootLayoutInputs {
 
         shared_fragment.borrow_mut().fragment = Some(Fragment::Box(box_fragment));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod coarsened_absolute_positioning_tests {
+    use super::should_parallelize_absolute_positioning;
+
+    fn enabled(sizes: impl IntoIterator<Item = usize>) -> bool {
+        should_parallelize_absolute_positioning(true, 4, 16, sizes.into_iter())
+    }
+
+    #[test]
+    fn adjacent_small_siblings_meet_the_existing_work_threshold() {
+        assert!(!enabled([1; 63]));
+        assert!(enabled([1; 64]));
+        assert!(enabled([1; 10_000]));
+    }
+
+    #[test]
+    fn mixed_subtrees_form_complete_ordered_work_groups() {
+        assert!(!enabled([8, 8, 32, 4, 12, 15]));
+        assert!(enabled([8, 8, 32, 4, 12, 16]));
+        assert!(enabled([1, 16, 1, 16, 1, 16, 1, 16]));
+    }
+
+    #[test]
+    fn one_large_subtree_never_counts_as_multiple_jobs() {
+        assert!(!enabled([usize::MAX]));
+        assert!(!enabled([usize::MAX, usize::MAX, usize::MAX]));
+        assert!(enabled([usize::MAX; 4]));
+    }
+
+    #[test]
+    fn no_pool_keeps_both_small_and_large_work_serial() {
+        assert!(!should_parallelize_absolute_positioning(
+            false,
+            4,
+            16,
+            [1; 10_000].into_iter(),
+        ));
+        assert!(!should_parallelize_absolute_positioning(
+            false,
+            0,
+            0,
+            [usize::MAX; 4].into_iter(),
+        ));
+    }
+
+    #[test]
+    fn empty_small_and_unknown_work_remain_serial() {
+        assert!(!enabled([]));
+        assert!(!enabled([16; 3]));
+        assert!(!enabled([1; 16]));
+        assert!(!enabled([0; 10_000]));
+    }
+
+    #[test]
+    fn zero_preferences_preserve_the_previous_eligibility_contract() {
+        assert!(should_parallelize_absolute_positioning(
+            true,
+            0,
+            16,
+            [].into_iter(),
+        ));
+        assert!(should_parallelize_absolute_positioning(
+            true,
+            4,
+            0,
+            [0; 4].into_iter(),
+        ));
+        assert!(!should_parallelize_absolute_positioning(
+            true,
+            4,
+            0,
+            [usize::MAX; 3].into_iter(),
+        ));
+    }
+
+    #[test]
+    fn accumulated_work_saturates_without_inventing_independent_jobs() {
+        assert!(!should_parallelize_absolute_positioning(
+            true,
+            2,
+            usize::MAX,
+            [usize::MAX - 1, usize::MAX].into_iter(),
+        ));
+        assert!(should_parallelize_absolute_positioning(
+            true,
+            2,
+            usize::MAX,
+            [usize::MAX - 1, 1, usize::MAX].into_iter(),
+        ));
+    }
+
+    #[test]
+    fn all_previously_parallel_large_job_combinations_stay_parallel() {
+        let samples = [0, 1, 15, 16, usize::MAX];
+        for a in samples {
+            for b in samples {
+                for c in samples {
+                    for d in samples {
+                        let sizes = [a, b, c, d, 16, 16, 16, 16];
+                        assert!(enabled(sizes));
+                    }
+                }
+            }
+        }
     }
 }

@@ -8,13 +8,16 @@
 //! painted.
 
 mod accessibility;
+mod background_color_cache;
 mod cell;
+mod certified_background;
 mod context;
 mod display_list;
 mod dom;
 mod dom_traversal;
 mod flexbox;
 pub mod flow;
+mod focus_style;
 mod formatting_contexts;
 mod fragment_tree;
 pub mod geom;

@@ -171,6 +171,17 @@ impl AttrMethods<crate::DomTypeHolder> for Attr {
 
 impl Attr {
     /// Used to swap the attribute's value without triggering mutation events
+    pub(crate) fn invalidate_declaration_serialization(
+        &self,
+        block: &servo_arc::Arc<
+            style::shared_lock::Locked<style::properties::PropertyDeclarationBlock>,
+        >,
+    ) -> bool {
+        self.value
+            .borrow_mut()
+            .invalidate_declaration_serialization(block)
+    }
+
     pub(crate) fn swap_value(&self, value: &mut AttrValue) {
         mem::swap(&mut *self.value.borrow_mut(), value);
     }
@@ -200,8 +211,8 @@ impl Attr {
                 // Already gone from the list of attributes of old owner.
                 assert!(
                     old.get_attribute_with_namespace(cx, ns, &self.identifier.local_name)
-                        .as_deref() !=
-                        Some(self)
+                        .as_deref()
+                        != Some(self)
                 )
             },
             (Some(old), Some(new)) => assert_eq!(&*old, new),

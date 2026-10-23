@@ -25,19 +25,17 @@ use paint_api::display_list::{
 use paint_api::rendering_context::RenderingContext;
 use paint_api::viewport_description::ViewportDescription;
 use paint_api::{
-    ImageUpdate, PaintMessage, PipelineExitSource, SendableFrameTree,
-    SerializableDisplayListPayload, SerializableImageData, WebRenderExternalImageHandlers,
-    WebRenderImageHandlerType, WebViewTrait,
+    AppliedSeal, AppliedSealOpportunity, ImageUpdate, PaintMessage, PipelineExitSource,
+    SendableFrameTree, SerializableDisplayListPayload, SerializableImageData,
+    WebRenderExternalImageHandlers, WebRenderImageHandlerType, WebViewTrait,
 };
 use profile_traits::time::{ProfilerCategory, ProfilerChan};
 use profile_traits::time_profile;
 use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::Epoch;
 use servo_base::cross_process_instant::CrossProcessInstant;
-use servo_base::generic_channel::{
-    GenericCallback, GenericReceiver, GenericSharedMemory, SendError,
-};
-use servo_base::id::{PainterId, PipelineId, WebViewId};
+use servo_base::generic_channel::{GenericReceiver, GenericSharedMemory, SendError};
+use servo_base::id::{PainterId, PipelineId, ScriptEventLoopId, WebViewId};
 use servo_base::threadboost::{BoostAffinity, ThreadPriority};
 use servo_config::{opts, pref};
 use servo_constellation_traits::{EmbedderToConstellationMessage, PaintMetricEvent};
@@ -54,12 +52,12 @@ use webrender_api::units::{
 };
 use webrender_api::{
     self, BuiltDisplayList, BuiltDisplayListDescriptor, Checkpoint, ColorF, DirtyRect,
-    DisplayListPayload, DocumentId, DynamicProperties, Epoch as WebRenderEpoch, ExternalImageData,
-    ExternalScrollId, FontInstanceFlags, FontInstanceKey, FontInstanceOptions,
-    FontInstancePlatformOptions, FontKey, FontVariation, ImageData, ImageDescriptor, ImageKey,
-    NativeFontHandle, NotificationHandler, NotificationRequest, PipelineId as WebRenderPipelineId,
-    PropertyBinding, ReferenceFrameKind, RenderReasons, SampledScrollOffset, SnapshotImageKey,
-    SpaceAndClipInfo, SpatialId, TransformStyle,
+    DisplayListPayload, DocumentId, Epoch as WebRenderEpoch, ExternalImageData, ExternalScrollId,
+    FontInstanceFlags, FontInstanceKey, FontInstanceOptions, FontInstancePlatformOptions, FontKey,
+    FontVariation, ImageData, ImageDescriptor, ImageKey, NativeFontHandle, NotificationHandler,
+    NotificationRequest, PipelineId as WebRenderPipelineId, PropertyBinding, PropertyValue,
+    ReferenceFrameKind, RenderReasons, SampledScrollOffset, SnapshotImageKey, SpaceAndClipInfo,
+    SpatialId, TransformStyle,
 };
 use wr_malloc_size_of::MallocSizeOfOps;
 
@@ -72,6 +70,72 @@ use crate::web_content_animation::WebContentAnimator;
 #[cfg(feature = "webgl")]
 use crate::webrender_external_images::WebGLExternalImages;
 use crate::webview_renderer::{PinchZoomResult, ScrollResult, UnknownWebView, WebViewRenderer};
+
+struct AppliedSealJoin {
+    seal: AppliedSeal,
+    participants: Option<FxHashSet<ScriptEventLoopId>>,
+    seen: FxHashSet<ScriptEventLoopId>,
+    changed: bool,
+    finished: bool,
+    invalid: bool,
+}
+
+impl AppliedSealJoin {
+    fn new(seal: AppliedSeal) -> Self {
+        Self {
+            seal,
+            participants: None,
+            seen: FxHashSet::default(),
+            changed: false,
+            finished: false,
+            invalid: false,
+        }
+    }
+
+    fn complete(
+        &mut self,
+        opportunity: &AppliedSealOpportunity,
+        changed: bool,
+    ) -> Result<Option<bool>, ()> {
+        // Old/session-cancelled completions neither qualify nor poison a newer seal.
+        if opportunity.seal != self.seal {
+            return Err(());
+        }
+        if self.invalid || self.finished {
+            return Err(());
+        }
+        let participants: FxHashSet<_> = opportunity.participants.iter().copied().collect();
+        if participants.is_empty()
+            || participants.len() != opportunity.participants.len()
+            || !participants.contains(&opportunity.participant)
+            || self
+                .participants
+                .as_ref()
+                .is_some_and(|expected| *expected != participants)
+            || !self.seen.insert(opportunity.participant)
+        {
+            self.invalid = true;
+            return Err(());
+        }
+        let expected = self.participants.get_or_insert(participants);
+        self.changed |= changed;
+        if self.seen.len() != expected.len() {
+            return Ok(None);
+        }
+        self.finished = true;
+        Ok(Some(self.changed))
+    }
+}
+
+fn applied_seal_needs_scene(
+    seal: &AppliedSeal,
+    changed: bool,
+    repaint: bool,
+    pending: bool,
+    canvas: bool,
+) -> bool {
+    changed || seal.force_external_images || repaint || pending || canvas
+}
 
 struct EmbedderSceneFrameNotifier {
     sender: Sender<Result<PaintMessage, SendError>>,
@@ -132,22 +196,24 @@ pub(crate) struct Painter {
     /// display list or pipeline exit. Keyed per pipeline since a WebView's
     /// iframes each send their own.
     prev_snapshot_image_keys: FxHashMap<(WebViewId, PipelineId), Vec<SnapshotImageKey>>,
+    retained_colors: crate::retained_colors::RetainedColors,
 
     /// The active webrender document.
     pub(crate) webrender_document: DocumentId,
 
     /// The webrender renderer.
     pub(crate) webrender_renderer: Option<webrender::Renderer>,
+    shader_program_cache: Option<crate::shader_program_cache::ShaderProgramCache>,
 
     /// Embedder tag whose WebRender updates have been consumed but whose
     /// framebuffer render has not run yet. A single rendering context can
     /// safely hold one prepared scene at a time.
     prepared_frame_tag: Option<u64>,
 
-    /// Non-zero embedder tag applied to the next scene-generated WebRender
-    /// frame. An exact transaction notification proves that readiness belongs
-    /// to the scene the embedder armed.
-    next_scene_frame_tag: Cell<Option<u64>>,
+    /// Registered applied seal and exact distinct-loop completion join.
+    applied_seal_join: Option<AppliedSealJoin>,
+    /// A completed request delayed by the existing canvas-image gate.
+    pending_applied_scene: Option<AppliedSeal>,
 
     /// Completed non-zero scene tags not yet consumed by the embedder.
     ready_scene_frame_tags: RefCell<VecDeque<u64>>,
@@ -155,10 +221,6 @@ pub(crate) struct Painter {
     /// External rendering opportunities that completed without producing or
     /// waiting on any visual update.
     ready_unchanged_frame_tags: RefCell<VecDeque<u64>>,
-
-    /// An unchanged external rendering opportunity waiting for an older
-    /// WebRender frame to finish before it can safely be classified.
-    pending_unchanged_frame_tag: Cell<Option<u64>>,
 
     /// Routes exact scene-transaction notifications back to this painter.
     scene_frame_notification_sender: Sender<Result<PaintMessage, SendError>>,
@@ -294,6 +356,15 @@ impl Painter {
                 .expect("Unable to initialize WebRender worker pool."),
         ));
 
+        // Empty cache is installed immediately; IO never blocks initialization.
+        // Existing precache modes may create Programs during construction and
+        // cannot safely admit a later binary import through the pinned API.
+        let shader_program_cache = if pref!(gfx_precache_shaders) {
+            None
+        } else {
+            crate::shader_program_cache::ShaderProgramCache::new(&*webrender_gl)
+        };
+        let cached_programs = shader_program_cache.as_ref().map(|cache| cache.cache());
         let painter_id = PainterId::next();
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
             webrender_gl.clone(),
@@ -316,6 +387,7 @@ impl Painter {
                 allow_texture_swizzling: pref!(gfx_texture_swizzling_enabled),
                 enable_dithering: true,
                 clear_color,
+                cached_programs,
                 upload_method,
                 workers,
                 size_of_op: Some(servo_allocator::usable_size),
@@ -351,15 +423,17 @@ impl Painter {
             refresh_driver,
             animation_refresh_driver_observer,
             webrender_renderer: Some(webrender_renderer),
+            shader_program_cache,
             prepared_frame_tag: None,
-            next_scene_frame_tag: Cell::new(None),
+            applied_seal_join: None,
+            pending_applied_scene: None,
             ready_scene_frame_tags: RefCell::new(VecDeque::new()),
             ready_unchanged_frame_tags: RefCell::new(VecDeque::new()),
-            pending_unchanged_frame_tag: Cell::new(None),
             scene_frame_notification_sender: paint.paint_proxy.sender.clone(),
             scene_frame_notification_waker: paint.paint_proxy.event_loop_waker.clone(),
             webrender_api,
             prev_snapshot_image_keys: FxHashMap::default(),
+            retained_colors: Default::default(),
             webrender_document,
             webrender_gl,
             last_mouse_move_position: None,
@@ -376,7 +450,7 @@ impl Painter {
         painter
     }
 
-    pub(crate) fn perform_updates(&mut self) {
+    pub(crate) fn perform_updates(&mut self, profiler_chan: &ProfilerChan) {
         let mut need_zoom = false;
         let scroll_offset_updates: Vec<_> = self
             .webview_renderers
@@ -392,15 +466,18 @@ impl Painter {
         self.send_zoom_and_scroll_offset_updates(need_zoom, scroll_offset_updates);
 
         if let Some(colors) = self.web_content_animator.update(&self.webview_renderers) {
-            let mut transaction = Transaction::new();
-            transaction.reset_dynamic_properties();
-            transaction.append_dynamic_properties(DynamicProperties {
-                transforms: Vec::new(),
-                floats: Vec::new(),
-                colors,
-            });
-            self.generate_frame(&mut transaction, RenderReasons::ANIMATED_PROPERTY);
-            self.send_transaction(transaction);
+            profile_traits::time::profile_if_active(
+                ProfilerCategory::PaintCaretColorReset,
+                || None,
+                profiler_chan,
+                || {
+                    self.retained_colors.sample_carets(colors);
+                    let mut transaction = Transaction::new();
+                    self.reset_dynamic_colors(&mut transaction);
+                    self.generate_frame(&mut transaction, RenderReasons::ANIMATED_PROPERTY);
+                    self.send_transaction(transaction);
+                },
+            );
         }
     }
 
@@ -480,23 +557,31 @@ impl Painter {
         }
     }
 
-    /// Apply `frame_tag` to the next scene frame generated by this painter.
-    /// Promise continuations run before the next rendering update, so an
-    /// embedder can await this arm, mutate the DOM, and then wait for the exact
-    /// tag to return from WebRender.
-    pub(crate) fn arm_next_scene_frame(&self, frame_tag: u64) -> bool {
-        if frame_tag == 0 || self.next_scene_frame_tag.get().is_some() {
+    /// Register only an already-applied seal. Ordinary SCENE cannot consume it.
+    pub(crate) fn register_applied_seal(&mut self, seal: AppliedSeal) -> bool {
+        if seal.frame_id == 0 || PainterId::from(seal.webview_id) != self.painter_id {
             return false;
         }
-        self.next_scene_frame_tag.set(Some(frame_tag));
+        if self
+            .applied_seal_join
+            .as_ref()
+            .is_some_and(|old| old.seal.frame_id >= seal.frame_id)
+            || self
+                .pending_applied_scene
+                .as_ref()
+                .is_some_and(|old| old.frame_id >= seal.frame_id)
+        {
+            return false;
+        }
+        // Process-monotonic frame IDs retire abandoned prior-session requests.
+        // Late old completions cannot match the new full frame/sequence token.
+        self.pending_applied_scene = None;
+        self.applied_seal_join = Some(AppliedSealJoin::new(seal));
         true
     }
 
     pub(crate) fn mark_scene_frame_ready(&self, frame_tag: u64) {
         if frame_tag != 0 {
-            if self.pending_unchanged_frame_tag.get() == Some(frame_tag) {
-                self.pending_unchanged_frame_tag.set(None);
-            }
             self.ready_scene_frame_tags
                 .borrow_mut()
                 .push_back(frame_tag);
@@ -507,64 +592,93 @@ impl Painter {
         self.ready_scene_frame_tags.borrow_mut().pop_front()
     }
 
-    pub(crate) fn rendering_update_callback(
-        &self,
-        frame_tag: u64,
-    ) -> Option<GenericCallback<bool>> {
-        if frame_tag == 0 {
-            return None;
-        }
-        let sender = self.scene_frame_notification_sender.clone();
-        let waker = self.scene_frame_notification_waker.clone();
-        let painter_id = self.painter_id;
-        GenericCallback::new(move |result| {
-            let Ok(changed) = result else {
-                warn!("Embedder rendering update callback was disconnected");
-                return;
-            };
-            if let Err(error) = sender.send(Ok(PaintMessage::EmbedderRenderingUpdateReady(
-                painter_id, frame_tag, changed,
-            ))) {
-                warn!("Failed to send embedder rendering update result: {error:?}");
-            }
-            waker.wake();
-        })
-        .ok()
-    }
-
-    pub(crate) fn mark_rendering_update_complete(&self, frame_tag: u64, changed: bool) {
-        if changed || self.next_scene_frame_tag.get() != Some(frame_tag) {
+    pub(crate) fn complete_applied_seal(
+        &mut self,
+        opportunity: AppliedSealOpportunity,
+        changed: bool,
+    ) {
+        let Some(join) = self.applied_seal_join.as_mut() else {
             return;
-        }
-
-        if self.needs_repaint() {
-            self.next_scene_frame_tag.take();
-            self.mark_scene_frame_ready(frame_tag);
-        } else if self.has_pending_frames() {
-            self.pending_unchanged_frame_tag.set(Some(frame_tag));
-        } else {
+        };
+        let Ok(Some(changed)) = join.complete(&opportunity, changed) else {
+            return;
+        };
+        let seal = join.seal.clone();
+        if !applied_seal_needs_scene(
+            &seal,
+            changed,
+            self.needs_repaint(),
+            self.has_pending_frames(),
+            !self.frame_delayer.pending_canvas_images.is_empty(),
+        ) {
             self.ready_unchanged_frame_tags
                 .borrow_mut()
-                .push_back(frame_tag);
+                .push_back(seal.frame_id);
+            return;
         }
+        self.pending_applied_scene = Some(seal);
+        self.try_generate_applied_scene();
     }
 
-    pub(crate) fn take_unchanged_rendering_update(&self) -> Option<u64> {
+    pub(crate) fn take_unchanged_rendering_update(&mut self) -> Option<u64> {
         let frame_tag = self.ready_unchanged_frame_tags.borrow_mut().pop_front()?;
-        if self.next_scene_frame_tag.get() != Some(frame_tag) {
+        let seal = self
+            .applied_seal_join
+            .as_ref()
+            .filter(|join| join.seal.frame_id == frame_tag && join.finished && !join.invalid)?
+            .seal
+            .clone();
+        // Recheck damage after the same owner-loop spin. Fresh damage gets a
+        // correlated FrameBuilt transaction, never an unrelated completed scene.
+        if applied_seal_needs_scene(
+            &seal,
+            false,
+            self.needs_repaint(),
+            self.has_pending_frames(),
+            !self.frame_delayer.pending_canvas_images.is_empty(),
+        ) {
+            self.pending_applied_scene = Some(seal);
+            self.try_generate_applied_scene();
             return None;
         }
-        if self.needs_repaint() {
-            self.next_scene_frame_tag.take();
-            self.mark_scene_frame_ready(frame_tag);
-            return None;
-        }
-        if self.has_pending_frames() {
-            self.pending_unchanged_frame_tag.set(Some(frame_tag));
-            return None;
-        }
-        self.next_scene_frame_tag.take();
+        self.applied_seal_join = None;
         Some(frame_tag)
+    }
+
+    fn try_generate_applied_scene(&mut self) {
+        if self.pending_applied_scene.is_none() {
+            return;
+        }
+        self.frame_delayer.set_pending_frame(true);
+        if !self.frame_delayer.needs_new_frame() {
+            return;
+        }
+        let seal = self.pending_applied_scene.take().unwrap();
+        let mut transaction = Transaction::new();
+        if seal.force_external_images {
+            for (key, (descriptor, image)) in &self.external_image_cache {
+                transaction.update_image(
+                    *key,
+                    descriptor.clone(),
+                    ImageData::External(image.clone()),
+                    &DirtyRect::All,
+                );
+            }
+        }
+        // The only nonzero-tag producer: every distinct source loop's current
+        // DL/color messages preceded its completion on the same Paint FIFO.
+        self.generate_frame_tagged(&mut transaction, RenderReasons::SCENE, seal.frame_id);
+        self.send_transaction(transaction);
+        self.applied_seal_join = None;
+        self.frame_delayer.set_pending_frame(false);
+        let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
+        self.send_to_constellation(
+            EmbedderToConstellationMessage::NoLongerWaitingOnAsynchronousImageUpdates(
+                waiting_pipelines,
+            ),
+        );
+        self.screenshot_taker
+            .prepare_screenshot_requests_for_render(self);
     }
 
     /// Consume pending WebRender transactions without drawing into the
@@ -581,16 +695,24 @@ impl Painter {
             return false;
         }
 
+        let mut probe = crate::preparation_probe::PreparationSpan::begin(frame_tag);
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
+        probe.checkpoint();
 
         if let Err(error) = self.rendering_context.make_current() {
+            probe.checkpoint();
             error!("Failed to make the rendering context current: {error:?}");
             return false;
         }
         self.assert_no_gl_error();
+        probe.checkpoint();
 
         self.rendering_context.prepare_for_rendering();
+        if let Some(cache) = self.shader_program_cache.as_mut() {
+            cache.import_before_first_program();
+        }
+        probe.checkpoint();
 
         time_profile!(
             ProfilerCategory::Painting,
@@ -600,10 +722,20 @@ impl Painter {
                 if let Some(renderer) = self.webrender_renderer.as_mut() {
                     renderer.update();
                 }
+                if crate::shader_program_cache::gl_error_probe_enabled() {
+                    // glGetError consumes the observed error. Keep it fatal and
+                    // do not change preparation/FIFO decisions or clear a batch.
+                    let error = self.webrender_gl.get_error();
+                    if error != gleam::gl::NO_ERROR {
+                        error!("[Loom shader cache] FATAL post-update GL error 0x{error:x}");
+                    }
+                }
             }
         );
 
+        probe.checkpoint();
         self.prepared_frame_tag = Some(frame_tag);
+        probe.finish(true);
         true
     }
 
@@ -809,11 +941,15 @@ impl Painter {
 
     /// Queue a new frame in the transaction and increase the pending frames count.
     pub(crate) fn generate_frame(&self, transaction: &mut Transaction, reason: RenderReasons) {
-        let frame_tag = if reason.contains(RenderReasons::SCENE) {
-            self.next_scene_frame_tag.take().unwrap_or(0)
-        } else {
-            0
-        };
+        self.generate_frame_tagged(transaction, reason, 0);
+    }
+
+    fn generate_frame_tagged(
+        &self,
+        transaction: &mut Transaction,
+        reason: RenderReasons,
+        frame_tag: u64,
+    ) {
         if frame_tag != 0 {
             transaction.notify(NotificationRequest::new(
                 Checkpoint::FrameBuilt,
@@ -1123,8 +1259,11 @@ impl Painter {
         // WebRender as well. Without this, `Scene.pipelines` accumulates one
         // entry per navigation for the lifetime of the process.
         if fully_exited {
+            self.retained_colors
+                .remove_pipeline(webview_id, pipeline_id);
             let mut transaction = Transaction::new();
             transaction.remove_pipeline(pipeline_id.into());
+            self.reset_dynamic_colors(&mut transaction);
             if let Some(keys) = self
                 .prev_snapshot_image_keys
                 .remove(&(webview_id, pipeline_id))
@@ -1229,6 +1368,49 @@ impl Painter {
             .display_list_epoch = Some(Epoch(epoch.0));
     }
 
+    fn reset_dynamic_colors(&self, transaction: &mut Transaction) {
+        self.retained_colors.reset_transaction(transaction);
+    }
+
+    #[servo_tracing::instrument(skip_all)]
+    pub(crate) fn update_background_colors(
+        &mut self,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        epoch: Epoch,
+        generation: u64,
+        colors: Vec<PropertyValue<ColorF>>,
+    ) -> bool {
+        if !self
+            .retained_colors
+            .update(webview_id, pipeline_id, generation, epoch, &colors)
+        {
+            warn!("Received background colors from an obsolete display list");
+            return false;
+        }
+        self.update_epoch(webview_id, pipeline_id, epoch);
+        if let Some(renderer) = self.webview_renderers.get_mut(&webview_id) {
+            // A retained update represents the same content activity as the
+            // full DL it replaces. Keep the baseline caret timeout refreshed.
+            renderer
+                .ensure_pipeline_details(pipeline_id)
+                .animations
+                .handle_new_display_list(
+                    self.retained_colors.caret_binding(webview_id, pipeline_id),
+                    &self.web_content_animator,
+                );
+        }
+        let mut transaction = Transaction::new();
+        transaction.update_epoch(pipeline_id.into(), epoch.into());
+        // WebRender appends retain history until a reset. Reinstall the latest
+        // value for every live binding so transaction storage stays bounded.
+        self.reset_dynamic_colors(&mut transaction);
+        // GenerateFrame arrives through the same ordered script channel as this
+        // update and performs normal SCENE tagging and asynchronous-image gating.
+        self.send_transaction(transaction);
+        true
+    }
+
     #[servo_tracing::instrument(skip_all)]
     pub(crate) fn handle_new_display_list(
         &mut self,
@@ -1305,6 +1487,20 @@ impl Painter {
             self.send_root_pipeline_display_list_in_transaction(&mut transaction);
         }
 
+        let colors: Vec<_> = display_list_info
+            .background_colors
+            .into_iter()
+            .map(|(key, color)| key.with(color))
+            .collect();
+        self.retained_colors.install(
+            webview_id,
+            pipeline_id.into(),
+            display_list_info.background_color_generation,
+            display_list_info.epoch,
+            colors,
+            display_list_info.caret_property_binding,
+        );
+        self.reset_dynamic_colors(&mut transaction);
         transaction.set_display_list(epoch, (pipeline_id, built_display_list));
 
         // Register clip:text snapshot keys. Diff against the previous set rather
@@ -1458,6 +1654,7 @@ impl Painter {
         }
 
         self.send_transaction(txn);
+        self.try_generate_applied_scene();
     }
 
     pub(crate) fn delay_new_frames_for_canvas(
@@ -1574,6 +1771,7 @@ impl Painter {
             return;
         };
         let mut transaction = Transaction::new();
+        self.retained_colors.remove_webview(webview_id);
         self.prev_snapshot_image_keys
             .retain(|(other_webview, _), keys| {
                 if *other_webview != webview_id {
@@ -1587,6 +1785,7 @@ impl Painter {
         for pipeline_id in webview_renderer.pipelines.keys() {
             transaction.remove_pipeline(pipeline_id.into());
         }
+        self.reset_dynamic_colors(&mut transaction);
         self.send_transaction(transaction);
 
         self.send_root_pipeline_display_list();
@@ -1821,25 +2020,6 @@ impl Painter {
             self.screenshot_taker
                 .maybe_trigger_paint_for_screenshot(self);
         }
-
-        let Some(frame_tag) = self.pending_unchanged_frame_tag.get() else {
-            return;
-        };
-        if self.has_pending_frames() {
-            return;
-        }
-        self.pending_unchanged_frame_tag.set(None);
-        if self.next_scene_frame_tag.get() != Some(frame_tag) {
-            return;
-        }
-        self.next_scene_frame_tag.take();
-        if self.needs_repaint() {
-            self.mark_scene_frame_ready(frame_tag);
-        } else {
-            self.ready_unchanged_frame_tags
-                .borrow_mut()
-                .push_back(frame_tag);
-        }
     }
 
     pub(crate) fn webviews_needing_repaint(&self) -> Vec<WebViewId> {
@@ -1991,4 +2171,167 @@ impl SceneBuilderHooks for BoostWebRenderThread {
     fn poke(&self) {}
 
     fn deregister(&self) {}
+}
+
+#[cfg(test)]
+mod applied_seal_tests {
+    use super::*;
+    use servo_base::id::TEST_WEBVIEW_ID;
+
+    fn seal() -> AppliedSeal {
+        AppliedSeal {
+            webview_id: TEST_WEBVIEW_ID,
+            frame_id: 193,
+            state_sequence: 7,
+            force_external_images: false,
+        }
+    }
+    fn opportunity(
+        seal: &AppliedSeal,
+        all: &[ScriptEventLoopId],
+        source: ScriptEventLoopId,
+    ) -> AppliedSealOpportunity {
+        AppliedSealOpportunity {
+            seal: seal.clone(),
+            participants: all.to_vec(),
+            participant: source,
+        }
+    }
+
+    #[test]
+    fn applied_seal_old_scene_cannot_complete_missing_source_barriers() {
+        let seal = seal();
+        let a = ScriptEventLoopId::new();
+        let b = ScriptEventLoopId::new();
+        let mut join = AppliedSealJoin::new(seal.clone());
+        // An old/ordinary SCENE carries no AppliedSealOpportunity at all.
+        assert!(!join.finished);
+        assert_eq!(
+            join.complete(&opportunity(&seal, &[a, b], a), true),
+            Ok(None)
+        );
+        assert!(!join.finished);
+        assert_eq!(
+            join.complete(&opportunity(&seal, &[a, b], b), false),
+            Ok(Some(true))
+        );
+    }
+
+    #[test]
+    fn applied_seal_duplicate_unknown_and_mismatched_participants_fail_closed() {
+        let seal = seal();
+        let a = ScriptEventLoopId::new();
+        let b = ScriptEventLoopId::new();
+        let c = ScriptEventLoopId::new();
+        for bad in [
+            opportunity(&seal, &[], a),
+            opportunity(&seal, &[a, a], a),
+            opportunity(&seal, &[a, b], c),
+        ] {
+            let mut join = AppliedSealJoin::new(seal.clone());
+            assert_eq!(join.complete(&bad, false), Err(()));
+            assert!(join.invalid);
+        }
+        let mut join = AppliedSealJoin::new(seal.clone());
+        assert_eq!(
+            join.complete(&opportunity(&seal, &[a, b], a), false),
+            Ok(None)
+        );
+        assert_eq!(
+            join.complete(&opportunity(&seal, &[a, b], a), true),
+            Err(())
+        );
+        assert_eq!(
+            join.complete(&opportunity(&seal, &[a, b], b), false),
+            Err(())
+        );
+        let mut join = AppliedSealJoin::new(seal.clone());
+        assert_eq!(
+            join.complete(&opportunity(&seal, &[a, b], a), false),
+            Ok(None)
+        );
+        assert_eq!(
+            join.complete(&opportunity(&seal, &[a, c], c), false),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn applied_seal_old_frame_or_sequence_never_qualifies_or_poisons_current_request() {
+        let seal = seal();
+        let a = ScriptEventLoopId::new();
+        let mut join = AppliedSealJoin::new(seal.clone());
+        let mut old = seal.clone();
+        old.frame_id -= 1;
+        assert_eq!(join.complete(&opportunity(&old, &[a], a), true), Err(()));
+        let mut wrong_sequence = seal.clone();
+        wrong_sequence.state_sequence -= 1;
+        assert_eq!(
+            join.complete(&opportunity(&wrong_sequence, &[a], a), true),
+            Err(())
+        );
+        assert!(!join.finished && !join.invalid);
+        assert_eq!(
+            join.complete(&opportunity(&seal, &[a], a), false),
+            Ok(Some(false))
+        );
+    }
+
+    #[test]
+    fn applied_seal_all_false_waits_for_every_loop_before_no_work_reuse() {
+        let seal = seal();
+        let a = ScriptEventLoopId::new();
+        let b = ScriptEventLoopId::new();
+        let mut join = AppliedSealJoin::new(seal.clone());
+        assert_eq!(
+            join.complete(&opportunity(&seal, &[a, b], b), false),
+            Ok(None)
+        );
+        assert_eq!(
+            join.complete(&opportunity(&seal, &[a, b], a), false),
+            Ok(Some(false))
+        );
+        assert!(!applied_seal_needs_scene(&seal, false, false, false, false));
+    }
+
+    #[test]
+    fn applied_seal_current_pre_ack_cached_scene_is_explicitly_regenerated_without_layout() {
+        let seal = seal();
+        assert!(applied_seal_needs_scene(&seal, false, true, false, false));
+        assert!(applied_seal_needs_scene(&seal, false, false, true, false));
+        assert!(applied_seal_needs_scene(&seal, true, false, false, false));
+    }
+
+    #[test]
+    fn applied_seal_canvas_gate_holds_until_the_actual_image_epoch_arrives() {
+        let seal = seal();
+        let mut delay = FrameDelayer::default();
+        let key = ImageKey(webrender_api::IdNamespace(77), 9);
+        delay.pending_canvas_images.insert(key, Epoch(5));
+        delay.set_pending_frame(true);
+        assert!(applied_seal_needs_scene(&seal, false, false, false, true));
+        assert!(!delay.needs_new_frame());
+        delay.update_image(key, Epoch(4));
+        assert!(!delay.needs_new_frame());
+        delay.update_image(key, Epoch(5));
+        assert!(delay.needs_new_frame());
+    }
+
+    #[test]
+    fn applied_seal_live_image_demand_forces_paint_only_after_source_join() {
+        let mut seal = seal();
+        seal.force_external_images = true;
+        let a = ScriptEventLoopId::new();
+        let b = ScriptEventLoopId::new();
+        let mut join = AppliedSealJoin::new(seal.clone());
+        assert_eq!(
+            join.complete(&opportunity(&seal, &[a, b], a), false),
+            Ok(None)
+        );
+        assert_eq!(
+            join.complete(&opportunity(&seal, &[a, b], b), false),
+            Ok(Some(false))
+        );
+        assert!(applied_seal_needs_scene(&seal, false, false, false, false));
+    }
 }

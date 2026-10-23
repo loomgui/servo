@@ -181,6 +181,7 @@ use crate::dom::html::htmlhtmlelement::HTMLHtmlElement;
 use crate::dom::html::htmliframeelement::HTMLIFrameElement;
 use crate::dom::html::htmlimageelement::HTMLImageElement;
 use crate::dom::html::htmlscriptelement::{HTMLScriptElement, ScriptResult};
+use crate::dom::html::htmlslotelement::HTMLSlotElement;
 use crate::dom::html::htmltitleelement::HTMLTitleElement;
 use crate::dom::htmldetailselement::DetailsNameGroups;
 use crate::dom::intersectionobserver::IntersectionObserver;
@@ -291,8 +292,8 @@ impl RefreshRedirectDue {
         // automatic features browsing context flag set,
         // then navigate document's node navigable to urlRecord using document,
         // with historyHandling set to "replace".
-        if self.from_meta_element &&
-            window.Document().has_active_sandboxing_flag(
+        if self.from_meta_element
+            && window.Document().has_active_sandboxing_flag(
                 SandboxingFlagSet::SANDBOXED_AUTOMATIC_FEATURES_BROWSING_CONTEXT_FLAG,
             )
         {
@@ -499,6 +500,25 @@ pub(crate) struct Document {
     /// Information on elements needing restyle to ship over to layout when the
     /// time comes.
     pending_restyles: DomRefCell<FxHashMap<Dom<Element>, NoTrace<PendingRestyle>>>,
+    /// A completed Layout negative proof, revoked by dirty environment/scope inputs.
+    background_snapshot_lease: Cell<Option<u64>>,
+    /// Debt survives request draining until Layout completes; None snapshots alone
+    /// never represent deliberately omitted attribute history.
+    background_snapshot_debt: Cell<bool>,
+    #[cfg(feature = "testbinding")]
+    #[no_trace]
+    #[ignore_malloc_size_of = "One fixed-size observation for test bindings only"]
+    automatic_rendering_observation:
+        Cell<Option<crate::dom::servotestutils::AutomaticRenderingObservation>>,
+    #[no_trace]
+    #[ignore_malloc_size_of = "Bounded to sixteen short, independent declarations"]
+    absolute_background_cache: DomRefCell<
+        Vec<(
+            String,
+            style::context::QuirksMode,
+            style::properties::PropertyDeclaration,
+        )>,
+    >,
     /// A collection of reasons that the [`Document`] needs to be restyled at the next
     /// opportunity for a reflow. If this is empty, then the [`Document`] does not need to
     /// be restyled.
@@ -1055,8 +1075,8 @@ impl Document {
         // > A Document d is said to be fully active when d is the active document of a
         // > navigable navigable, and either navigable is a top-level traversable or
         // > navigable's container document is fully active.
-        self.is_active() &&
-            (self.window.is_top_level() || self.activity.get() == DocumentActivity::FullyActive)
+        self.is_active()
+            && (self.window.is_top_level() || self.activity.get() == DocumentActivity::FullyActive)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#nav-document>
@@ -1066,9 +1086,9 @@ impl Document {
         // The first two checks stand in for when the document is not the active session history
         // entry's document, as when that happens they will be false. The session history entry
         // is not really implemented in script in the same way the specification says.
-        self.browsing_context().is_some() &&
-            !self.window_detached() &&
-            self.activity.get() != DocumentActivity::Inactive
+        self.browsing_context().is_some()
+            && !self.window_detached()
+            && self.activity.get() != DocumentActivity::Inactive
     }
 
     #[inline]
@@ -1217,8 +1237,8 @@ impl Document {
 
         // Step 2: If document's URL matches about:blank and document's about base URL is
         // non-null, then return document's about base URL.
-        if document_url.matches_about_blank() &&
-            let Some(about_base_url) = self.about_base_url()
+        if document_url.matches_about_blank()
+            && let Some(about_base_url) = self.about_base_url()
         {
             return about_base_url;
         }
@@ -1258,8 +1278,8 @@ impl Document {
         // FIXME: This should check the dirty bit on the document,
         // not the document element. Needs some layout changes to make
         // that workable.
-        if let Some(root) = self.get_document_element_unrooted(no_gc) &&
-            root.has_dirty_descendants()
+        if let Some(root) = self.get_document_element_unrooted(no_gc)
+            && root.has_dirty_descendants()
         {
             condition.insert(RestyleReason::DOMChanged);
         }
@@ -1932,6 +1952,7 @@ impl Document {
     }
 
     pub(crate) fn invalidate_stylesheets(&self, no_gc: &NoGC) {
+        self.background_snapshot_lease.set(None);
         self.stylesheets.borrow_mut().force_dirty(OriginSet::all());
 
         // Mark the document element dirty so a reflow will be performed.
@@ -2195,8 +2216,8 @@ impl Document {
         // to fire an event named hashchange at document's relevant global object, using HashChangeEvent,
         // with the oldURL attribute initialized to the serialization of oldURL
         // and the newURL attribute initialized to the serialization of entry's URL.
-        if old_url.as_url()[Position::BeforeFragment..] !=
-            new_url.as_url()[Position::BeforeFragment..]
+        if old_url.as_url()[Position::BeforeFragment..]
+            != new_url.as_url()[Position::BeforeFragment..]
         {
             let window = Trusted::new(self.owner_window().deref());
             let old_url = old_url.to_string();
@@ -2777,8 +2798,8 @@ impl Document {
 
     /// Step 7 of <https://html.spec.whatwg.org/multipage/#the-end>
     fn wait_until_asap_scripts_have_executed(&self) {
-        if self.current_the_end_loading_phase.get() !=
-            TheEndLoadingPhase::ProcessingAsSoonAsPossibleScripts
+        if self.current_the_end_loading_phase.get()
+            != TheEndLoadingPhase::ProcessingAsSoonAsPossibleScripts
         {
             return;
         }
@@ -2811,8 +2832,8 @@ impl Document {
 
     /// Step 8 of <https://html.spec.whatwg.org/multipage/#the-end>
     pub(crate) fn wait_until_load_blockers_have_resolved(&self, cx: &mut JSContext) {
-        if self.current_the_end_loading_phase.get() !=
-            TheEndLoadingPhase::WaitingForLoadEventBlockers
+        if self.current_the_end_loading_phase.get()
+            != TheEndLoadingPhase::WaitingForLoadEventBlockers
         {
             return;
         }
@@ -2825,8 +2846,8 @@ impl Document {
                 .navigation_timing
                 .top_level_dom_complete
                 .get()
-                .is_none() &&
-                loader.is_only_blocked_by_iframes()
+                .is_none()
+                && loader.is_only_blocked_by_iframes()
             {
                 update_with_current_instant(&self.navigation_timing.top_level_dom_complete);
             }
@@ -3209,10 +3230,10 @@ impl Document {
         if !self.is_fully_active() {
             return false;
         }
-        if !self.window().layout_blocked() &&
-            (!self.restyle_reason(no_gc).is_empty() ||
-                self.window().layout().needs_new_display_list() ||
-                self.window().layout().needs_accessibility_update())
+        if !self.window().layout_blocked()
+            && (!self.restyle_reason(no_gc).is_empty()
+                || self.window().layout().needs_new_display_list()
+                || self.window().layout().needs_accessibility_update())
         {
             return true;
         }
@@ -3318,6 +3339,34 @@ impl Document {
         );
 
         (phases, statistics)
+    }
+
+    /// Called only by ScriptThread after its real automatic update, never by
+    /// forceLayout or a layout query. This is observation, not frame authority.
+    #[cfg(feature = "testbinding")]
+    pub(crate) fn record_automatic_rendering_observation(
+        &self,
+        phases: ReflowPhasesRun,
+        statistics: &ReflowStatistics,
+    ) {
+        if pref!(dom_servo_helpers_enabled) {
+            if let Some(observation) =
+                crate::dom::servotestutils::AutomaticRenderingObservation::next(
+                    self.automatic_rendering_observation.get(),
+                    phases,
+                    statistics,
+                )
+            {
+                self.automatic_rendering_observation.set(Some(observation));
+            }
+        }
+    }
+
+    #[cfg(feature = "testbinding")]
+    pub(crate) fn automatic_rendering_observation(
+        &self,
+    ) -> Option<crate::dom::servotestutils::AutomaticRenderingObservation> {
+        self.automatic_rendering_observation.get()
     }
 
     pub(crate) fn handle_no_longer_waiting_on_asynchronous_image_updates(&self) {
@@ -3724,8 +3773,8 @@ impl Document {
             _ => {
                 // Step 9.1: If document's unload counter is greater than 0 or
                 // document's ignore-destructive-writes counter is greater than 0, then return.
-                if self.is_prompting_or_unloading() ||
-                    self.ignore_destructive_writes_counter.get() > 0
+                if self.is_prompting_or_unloading()
+                    || self.ignore_destructive_writes_counter.get() > 0
                 {
                     return Ok(());
                 }
@@ -4105,6 +4154,11 @@ impl Document {
             internal_ancestor_origin_objects_list: Default::default(),
             appropriate_template_contents_owner_document: Default::default(),
             pending_restyles: DomRefCell::new(FxHashMap::default()),
+            background_snapshot_lease: Cell::new(None),
+            background_snapshot_debt: Cell::new(false),
+            #[cfg(feature = "testbinding")]
+            automatic_rendering_observation: Cell::new(None),
+            absolute_background_cache: DomRefCell::new(Vec::new()),
             needs_restyle: Cell::new(RestyleReason::DOMChanged),
             origin: DomRefCell::new(origin),
             referrer,
@@ -4208,8 +4262,8 @@ impl Document {
     pub(crate) fn insecure_requests_policy(&self) -> InsecureRequestsPolicy {
         if let Some(csp_list) = self.get_csp_list().as_ref() {
             for policy in &csp_list.0 {
-                if policy.contains_a_directive_whose_name_is("upgrade-insecure-requests") &&
-                    policy.disposition == PolicyDisposition::Enforce
+                if policy.contains_a_directive_whose_name_is("upgrade-insecure-requests")
+                    && policy.disposition == PolicyDisposition::Enforce
                 {
                     return InsecureRequestsPolicy::Upgrade;
                 }
@@ -4618,13 +4672,154 @@ impl Document {
         self.id_map.get(no_gc, self.upcast(), id)
     }
 
+    /// No caller may turn an unknown snapshot into a compact pending mutation.
+    pub(crate) fn background_style_snapshot_lease(&self, no_gc: &NoGC) -> Option<u64> {
+        let epoch = self.background_snapshot_lease.get()?;
+        if !self.is_fully_active()
+            || !self.shadow_roots.borrow().is_empty()
+            || self.shadow_roots_styles_changed.get()
+            || self.stylesheets_changed_since_last_reflow()
+            || self.dirty_root.get().is_some()
+            || !(self.restyle_reason(no_gc) - RestyleReason::PendingRestyles).is_empty()
+        {
+            return None;
+        }
+        Some(epoch)
+    }
+
+    pub(crate) fn may_have_background_style_snapshot_lease(&self) -> bool {
+        self.background_snapshot_lease.get().is_some()
+    }
+
+    pub(crate) fn allows_background_style_snapshot_lease(&self) -> bool {
+        self.shadow_roots.borrow().is_empty() && !self.shadow_roots_styles_changed.get()
+    }
+
+    pub(crate) fn background_style_has_omissions(&self) -> bool {
+        self.background_snapshot_debt.get()
+    }
+
+    pub(crate) fn can_compact_background_style(&self, el: &Element, no_gc: &NoGC) -> Option<u64> {
+        let epoch = self.background_style_snapshot_lease(no_gc)?;
+        let node = el.upcast::<Node>();
+        if !node.is_connected() || !std::ptr::eq(node.owner_doc_unrooted(no_gc).as_ptr(), self) {
+            return None;
+        }
+        if let Some(entry) = self.pending_restyles.borrow().get(&Dom::from_ref(el)) {
+            if !entry.0.style_attribute_only
+                || entry.0.snapshot.is_some()
+                || entry.0.style_snapshot_omitted != Some(epoch)
+                || !entry.0.damage.is_empty()
+                || entry.0.hint.bits() != RestyleHint::RESTYLE_STYLE_ATTRIBUTE.bits()
+            {
+                return None;
+            }
+        }
+        Some(epoch)
+    }
+
+    /// Called only in the same non-script-running CSSOM transaction as admission.
+    pub(crate) fn note_compact_background_style(&self, el: &Element, epoch: u64) {
+        let mut entry = self.ensure_pending_restyle_with_provenance(el, true);
+        debug_assert!(entry.snapshot.is_none() && entry.style_attribute_only);
+        entry.style_snapshot_omitted = Some(epoch);
+        entry.hint.insert(RestyleHint::RESTYLE_STYLE_ATTRIBUTE);
+        self.background_snapshot_debt.set(true);
+    }
+
+    /// Suspend admissions before Layout. Missing/failed Layout keeps debt alive.
+    pub(crate) fn suspend_background_style_snapshot_lease(&self) {
+        self.background_snapshot_lease.set(None);
+    }
+
+    pub(crate) fn finish_background_style_snapshot_lease(&self, lease: Option<u64>) {
+        self.background_snapshot_debt.set(false);
+        self.background_snapshot_lease.set(lease);
+    }
+
+    /// Borrow an exact entry without copying a JS Latin1 string or its color.
+    /// Every admitted key is ASCII, so equal raw Latin1/UTF-8 bytes mean the same
+    /// Unicode string. Non-ASCII input cannot match an ASCII-only cache key.
+    pub(crate) fn borrowed_absolute_background(
+        &self,
+        value: &[u8],
+    ) -> Option<Ref<'_, style::properties::PropertyDeclaration>> {
+        Ref::filter_map(self.absolute_background_cache.borrow(), |cache| {
+            cache
+                .iter()
+                .find(|(text, quirks, _)| text.as_bytes() == value && *quirks == self.quirks_mode())
+                .map(|(_, _, declaration)| declaration)
+        })
+        .ok()
+    }
+
+    pub(crate) fn cached_absolute_background(
+        &self,
+        value: &str,
+    ) -> Option<style::properties::PropertyDeclaration> {
+        self.absolute_background_cache
+            .borrow()
+            .iter()
+            .find(|(text, quirks, _)| text == value && *quirks == self.quirks_mode())
+            .map(|(_, _, declaration)| declaration.clone())
+    }
+
+    pub(crate) fn cache_absolute_background(
+        &self,
+        value: &str,
+        declaration: style::properties::PropertyDeclaration,
+    ) {
+        // Only stable legacy syntax and already-proved independent values enter.
+        // No base URL, system color, variable, relative color or feature-gated syntax.
+        let legacy_hex = value.strip_prefix('#').is_some_and(|digits| {
+            matches!(digits.len(), 3 | 4 | 6 | 8) && digits.bytes().all(|c| c.is_ascii_hexdigit())
+        });
+        let legacy_name = !value.is_empty() && value.bytes().all(|c| c.is_ascii_alphabetic());
+        let legacy_function = ["rgb(", "rgba(", "hsl(", "hsla("].iter().any(|prefix| {
+            value
+                .get(..prefix.len())
+                .is_some_and(|s| s.eq_ignore_ascii_case(prefix))
+                && value.strip_suffix(')').is_some_and(|body| {
+                    body[prefix.len()..].bytes().all(|c| {
+                        c.is_ascii_digit() || c.is_ascii_whitespace() || b".,%+-/eE".contains(&c)
+                    })
+                })
+        });
+        let legacy = legacy_hex || legacy_name || legacy_function;
+        if value.len() > 128 || !value.is_ascii() || !legacy {
+            return;
+        }
+        let mut cache = self.absolute_background_cache.borrow_mut();
+        if cache.len() == 16 {
+            cache.remove(0);
+        }
+        cache.push((value.to_owned(), self.quirks_mode(), declaration));
+    }
+
     pub(crate) fn ensure_pending_restyle(&self, el: &Element) -> RefMut<'_, PendingRestyle> {
+        self.ensure_pending_restyle_with_provenance(el, false)
+    }
+
+    fn ensure_pending_restyle_with_provenance(
+        &self,
+        el: &Element,
+        style_attribute_only: bool,
+    ) -> RefMut<'_, PendingRestyle> {
         let map = self.pending_restyles.borrow_mut();
         RefMut::map(map, |m| {
-            &mut m
+            let entry = &mut m
                 .entry(Dom::from_ref(el))
-                .or_insert_with(|| NoTrace(PendingRestyle::default()))
-                .0
+                .or_insert_with(|| {
+                    NoTrace(PendingRestyle {
+                        style_attribute_only,
+                        ..PendingRestyle::default()
+                    })
+                })
+                .0;
+            // Generic restyles, state changes and all other attributes permanently
+            // poison this entry. A later style mutation cannot erase their provenance.
+            entry.style_attribute_only &= style_attribute_only;
+            entry
         })
     }
 
@@ -4634,7 +4829,11 @@ impl Document {
         // I'm getting rid of the whole hashtable soon anyway, since all it does
         // right now is populate the element restyle data in layout, and we
         // could in theory do it in the DOM I think.
-        let mut entry = self.ensure_pending_restyle(el);
+        // Snapshot.changed_attrs records local names only. Distinguish namespaced
+        // `style` changes here, before that information is lost in the snapshot.
+        let style_attribute_only =
+            attr.namespace() == &ns!() && attr.local_name() == &local_name!("style");
+        let mut entry = self.ensure_pending_restyle_with_provenance(el, style_attribute_only);
         if entry.snapshot.is_none() {
             entry.snapshot = Some(Snapshot::new());
         }
@@ -4642,8 +4841,8 @@ impl Document {
             entry.hint.insert(RestyleHint::RESTYLE_STYLE_ATTRIBUTE);
         }
 
-        if vtable_for(el.upcast()).attribute_affects_presentational_hints(attr) ||
-            el.check_style_on_self_or_eager_pseudos(|style| {
+        if vtable_for(el.upcast()).attribute_affects_presentational_hints(attr)
+            || el.check_style_on_self_or_eager_pseudos(|style| {
                 if let Some(ref attribute_references) = style.attribute_references {
                     return attribute_references.contains_key(attr.local_name());
                 }
@@ -4757,6 +4956,7 @@ impl Document {
     }
 
     pub(crate) fn invalidate_shadow_roots_stylesheets(&self) {
+        self.background_snapshot_lease.set(None);
         self.shadow_roots_styles_changed.set(true);
     }
 
@@ -4919,6 +5119,107 @@ impl Document {
         name: &Atom,
     ) -> Ref<'_, [Dom<Element>]> {
         self.name_map.get_all(cx.no_gc(), self.upcast(), name)
+    }
+
+    /// Certify only the ancestor flags that the following ordinary drain may set.
+    /// This does not validate styles or consume restyles; every uncertain case
+    /// retains the ordinary traversal and its original invalidation behavior.
+    pub(crate) fn certify_fresh_background_restyle_paths(
+        &self,
+        no_gc: &NoGC,
+    ) -> Option<Vec<TrustedNodeAddress>> {
+        if self.dirty_root.get().is_some() {
+            return None;
+        }
+        let pending = self.pending_restyles.borrow();
+        if pending.is_empty() {
+            return None;
+        }
+        let clean_normal_element = |element: &Element| {
+            let node = element.upcast::<Node>();
+            !element.has_dirty_descendants()
+                && !element.is_shadow_host()
+                && !node.is::<HTMLSlotElement>()
+                && node.containing_shadow_root_unrooted(no_gc).is_none()
+                && node.assigned_slot_unrooted(no_gc).is_none()
+        };
+        let mut checked = FxHashSet::default();
+        let mut ancestors = Vec::new();
+        for (element, restyle) in pending.iter() {
+            let node = element.upcast::<Node>();
+            if !restyle.0.style_attribute_only
+                || !node.is_connected()
+                || !std::ptr::eq(node.owner_doc_unrooted(no_gc).as_ptr(), self)
+                || !clean_normal_element(element)
+            {
+                return None;
+            }
+            for ancestor in node.ancestors_unrooted(no_gc) {
+                let Some(ancestor_element) = ancestor.downcast::<Element>() else {
+                    // A connected ordinary chain ends at this owning Document.
+                    if !std::ptr::eq(ancestor.as_ptr(), self.upcast::<Node>()) {
+                        return None;
+                    }
+                    break;
+                };
+                let address = ancestor.to_trusted_node_address();
+                if !checked.insert(address) {
+                    break;
+                }
+                if !clean_normal_element(ancestor_element) {
+                    return None;
+                }
+                ancestors.push(address);
+            }
+        }
+        Some(ancestors)
+    }
+
+    /// Fresh internal focusability proof, never a substitute for public style
+    /// queries or the later retained transaction. No pending entry is drained.
+    pub(crate) fn background_style_for_focus_fixup(
+        &self,
+        focused: &Element,
+        no_gc: &NoGC,
+    ) -> Option<servo_arc::Arc<style::properties::ComputedValues>> {
+        let focused_node = focused.upcast::<Node>();
+        if !self.is_fully_active()
+            || !focused_node.is_connected()
+            || !std::ptr::eq(focused_node.owner_doc_unrooted(no_gc).as_ptr(), self)
+            || self.restyle_reason(no_gc) != RestyleReason::PendingRestyles
+            || self.stylesheets_changed_since_last_reflow()
+            || self.shadow_roots_styles_changed.get()
+        {
+            return None;
+        }
+        self.ensure_safe_to_run_script_or_layout();
+        let ancestors = self.certify_fresh_background_restyle_paths(no_gc)?;
+        let snapshot_lease = self.background_style_snapshot_lease(no_gc);
+        if self.background_style_has_omissions() && snapshot_lease.is_none() {
+            return None;
+        }
+        let pending = self.pending_restyles.borrow();
+        let pending_restyles = pending
+            .iter()
+            .map(|(element, pending)| {
+                (
+                    element.upcast::<Node>().to_trusted_node_address(),
+                    &pending.0,
+                )
+            })
+            .collect();
+        self.window.layout().background_style_for_focus_fixup(
+            layout_api::BackgroundFocusStyleRequest {
+                document: self.upcast::<Node>().to_trusted_node_address(),
+                focused: focused_node.to_trusted_node_address(),
+                pending_restyles,
+                ancestors,
+                snapshot_lease,
+                viewport_details: self.window.viewport_details(),
+                animations: self.animation_manager().sets(),
+                animation_timeline_value: self.current_animation_timeline_value(),
+            },
+        )
     }
 
     pub(crate) fn drain_pending_restyles(
@@ -5200,8 +5501,8 @@ impl Document {
     }
 
     pub(crate) fn has_trustworthy_ancestor_or_current_origin(&self) -> bool {
-        self.has_trustworthy_ancestor_origin.get() ||
-            self.origin().immutable().is_potentially_trustworthy()
+        self.has_trustworthy_ancestor_origin.get()
+            || self.origin().immutable().is_potentially_trustworthy()
     }
 
     pub(crate) fn highlight_dom_node(&self, node: Option<&Node>) {
@@ -6320,8 +6621,8 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
 
         let node = new_body.upcast::<Node>();
         match node.type_id() {
-            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLBodyElement)) |
-            NodeTypeId::Element(ElementTypeId::HTMLElement(
+            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLBodyElement))
+            | NodeTypeId::Element(ElementTypeId::HTMLElement(
                 HTMLElementTypeId::HTMLFrameSetElement,
             )) => {},
             _ => {
@@ -6392,8 +6693,8 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
     fn Links(&self, cx: &mut JSContext) -> DomRoot<HTMLCollection> {
         self.links.or_init(|| {
             HTMLCollection::new_with_filter_fn(cx, &self.window, self.upcast(), |element, _| {
-                (element.is::<HTMLAnchorElement>() || element.is::<HTMLAreaElement>()) &&
-                    element.has_attribute(&local_name!("href"))
+                (element.is::<HTMLAnchorElement>() || element.is::<HTMLAreaElement>())
+                    && element.has_attribute(&local_name!("href"))
             })
         })
     }
@@ -6640,8 +6941,8 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
                         elem.get_name().as_ref() == Some(&self.name)
                     },
                     HTMLElementTypeId::HTMLImageElement => elem.get_name().is_some_and(|name| {
-                        name == *self.name ||
-                            !name.is_empty() && elem.get_id().as_ref() == Some(&self.name)
+                        name == *self.name
+                            || !name.is_empty() && elem.get_id().as_ref() == Some(&self.name)
                     }),
                     // TODO handle <embed> and <object>; these depend on whether the element is
                     // “exposed”, a concept that doesn’t fully make sense until embed/object
@@ -7304,9 +7605,9 @@ fn is_named_element_with_name_attribute(elem: &Element) -> bool {
         _ => return false,
     };
     match type_ {
-        HTMLElementTypeId::HTMLFormElement |
-        HTMLElementTypeId::HTMLIFrameElement |
-        HTMLElementTypeId::HTMLImageElement => true,
+        HTMLElementTypeId::HTMLFormElement
+        | HTMLElementTypeId::HTMLIFrameElement
+        | HTMLElementTypeId::HTMLImageElement => true,
         // TODO handle <embed> and <object>; these depend on whether the element is
         // “exposed”, a concept that doesn’t fully make sense until embed/object
         // behaviour is actually implemented

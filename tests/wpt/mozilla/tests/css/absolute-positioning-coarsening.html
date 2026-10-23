@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>Coarsened independent absolute positioning preserves current geometry and order</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<style>html, body { margin: 0; width: 100%; height: 100%; }</style>
+<script>
+'use strict';
+setup({explicit_done: true});
+window.onload = () => {
+  function host(t, css = '') {
+    const element = document.createElement('div');
+    element.style.cssText = 'position:absolute;left:20px;top:20px;width:160px;height:160px;' + css;
+    document.body.append(element);
+    t.add_cleanup(() => element.remove());
+    return element;
+  }
+  function leaf(css) {
+    const element = document.createElement('div');
+    element.style.cssText = 'position:absolute;background:rgb(255,0,0);' + css;
+    return element;
+  }
+  function layout() {
+    const result = ServoTestUtils.forceLayout();
+    assert_true(result.phases.includes('RanLayout'), 'the mutation receives actual current layout');
+    return result;
+  }
+  function rect(element, x, y, width, height, label) {
+    const actual = element.getBoundingClientRect();
+    for (const [key, expected] of Object.entries({x, y, width, height}))
+      assert_approx_equals(actual[key], expected, 1 / 60, `${label} ${key}`);
+  }
+
+  test(t => {
+    const container = host(t);
+    const cells = Array.from({length: 128}, (_, index) => leaf(
+      `left:${(index % 16) * 8}px;top:${Math.floor(index / 16) * 8}px;` +
+      'width:calc(3px + 1%);height:2px'));
+    container.append(...cells);
+    layout();
+    cells.forEach((cell, index) => rect(cell, 20 + (index % 16) * 8,
+      20 + Math.floor(index / 16) * 8, 4.6, 2, `initial leaf ${index}`));
+    container.style.width = '240px';
+    layout();
+    cells.forEach((cell, index) => rect(cell, 20 + (index % 16) * 8,
+      20 + Math.floor(index / 16) * 8, 5.4, 2, `resized leaf ${index}`));
+  }, 'A wide list of small absolute siblings preserves definite positions and current percentage sizing');
+
+  test(t => {
+    const container = host(t, 'width:320px;height:240px');
+    const small = Array.from({length: 24}, (_, index) => leaf(
+      `left:${index * 5}px;top:2px;width:3px;height:2px`));
+    const large = Array.from({length: 3}, (_, index) => {
+      const parent = leaf(`left:${50 + index * 70}px;top:100px;width:50px;height:30px;` +
+        (index === 1 ? 'transform:translateX(3px)' : ''));
+      for (let child = 0; child < 20; child++) {
+        const content = document.createElement('div');
+        content.style.cssText = 'height:1px;width:1px';
+        parent.append(content);
+      }
+      const fixed = leaf(`position:fixed;left:${7 + index * 12}px;top:${8 + index * 4}px;width:5px;height:6px`);
+      parent.append(fixed);
+      return {parent, fixed, index};
+    });
+    container.append(...small, ...large.map(entry => entry.parent));
+    const check = (offset) => {
+      small.forEach((cell, index) => rect(cell, offset + index * 5, 22, 3, 2, `small ${index}`));
+      for (const {parent, fixed, index} of large) {
+        const x = offset + 50 + index * 70 + (index === 1 ? 3 : 0);
+        rect(parent, x, 120, 50, 30, `large ${index}`);
+        rect(fixed, (index === 1 ? x : 0) + 7 + index * 12,
+          (index === 1 ? 120 : 0) + 8 + index * 4, 5, 6, `nested fixed ${index}`);
+      }
+    };
+    layout();
+    check(20);
+    container.style.left = '40px';
+    layout();
+    check(40);
+  }, 'Mixed absolute subtree sizes preserve nested fixed hoisting and transformed containing blocks');
+
+  test(t => {
+    const scroller = host(t, 'width:100px;height:100px;overflow:hidden;transform:translate(10px,15px)');
+    const content = leaf('left:0;top:0;width:300px;height:300px;background:transparent');
+    const cells = Array.from({length: 80}, (_, index) => leaf(
+      `left:60px;top:70px;width:60px;height:60px;z-index:${index}`));
+    content.append(...cells);
+    scroller.append(content);
+    layout();
+    scroller.scrollLeft = 30;
+    scroller.scrollTop = 40;
+    ServoTestUtils.forceLayout();
+    rect(cells[79], 60, 65, 60, 60, 'scrolled and transformed leaf');
+    assert_equals(document.elementFromPoint(70, 80), cells[79], 'highest z-index paints last inside the clip');
+    assert_false(cells.includes(document.elementFromPoint(140, 80)), 'overflow clip excludes the same leaves outside the scroller');
+    cells[79].remove();
+    layout();
+    assert_equals(document.elementFromPoint(70, 80), cells[78], 'removal preserves the next stacking winner');
+    cells[78].style.display = 'none';
+    layout();
+    assert_equals(document.elementFromPoint(70, 80), cells[77], 'current display invalidation preserves stacking order');
+  }, 'Coarsened absolute siblings preserve transformed scroll geometry, clipping and stacking order');
+
+  done();
+};
+</script>

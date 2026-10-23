@@ -149,6 +149,8 @@ pub(crate) struct DisplayListBuilder<'a> {
     /// and is the focused frame in the frame tree.
     frame_focused: bool,
 
+    background_colors: &'a mut crate::background_color_cache::BackgroundColorCache,
+
     /// `None` makes `background-clip: text` a no-op (unclipped background).
     paint_api: Option<(CrossProcessPaintApi, WebViewId)>,
 
@@ -225,6 +227,7 @@ impl DisplayListBuilder<'_> {
         paint_api: Option<(CrossProcessPaintApi, WebViewId)>,
         snapshot_image_key_cache: &mut FxHashMap<OpaqueNode, wr::SnapshotImageKey>,
         frame_focused: bool,
+        background_colors: &mut crate::background_color_cache::BackgroundColorCache,
     ) -> BuiltDisplayList {
         // Build the rest of the display list which inclues all of the WebRender primitives.
         let paint_info = &mut stacking_context_tree.paint_info;
@@ -273,10 +276,14 @@ impl DisplayListBuilder<'_> {
             largest_contentful_paint_enabled: pref!(largest_contentful_paint_enabled),
             shell_background_color,
             frame_focused,
+            background_colors,
         };
 
         // Clear any caret color from previous display list constructions.
         builder.paint_info.caret_property_binding = None;
+        builder.paint_info.background_colors.clear();
+        builder.paint_info.background_color_generation = builder.background_colors.generation();
+        builder.paint_info.snapshot_image_keys.clear();
 
         builder.add_all_spatial_nodes();
 
@@ -1061,6 +1068,9 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
         }
 
         if fragment.selected.load(Ordering::Relaxed) {
+            // The static selection color can change independently of the
+            // primary background binding, including transparent to visible.
+            self.background_colors.record_selection_highlight();
             // If there is no selected style, just fall back to using the unfocused selection color,
             // which is strictly better than not drawing a selection highlight.
             let selected_style = fragment.selected_style.borrow();
@@ -1622,6 +1632,7 @@ impl Fragment {
 
         let parent_style = fragment.style();
         if !selection_character_range.is_empty() {
+            builder.background_colors.record_selection_highlight();
             let selection_rect = Rect::new(
                 Point2D::new(fragment_origin.x, line_box_rect.min_y()),
                 Size2D::new(end_x - start_x, line_box_rect.height()),
@@ -1899,9 +1910,34 @@ impl<'a> BuilderForBoxFragment<'a> {
             let layer_index = b.background_image.0.len() - 1;
             let bounds = painter.painting_area(self, builder, layer_index);
             let common = painter.common_properties(self, builder, state, layer_index, bounds);
-            builder
-                .wr()
-                .push_rect(&common, bounds, rgba(background_color));
+            let color = rgba(background_color);
+            let flags = self.fragment.base.flags;
+            let key = if background_color.alpha == 1.0
+                && background_color != builder.shell_background_color
+                && !flags.intersects(
+                    FragmentFlags::IS_ROOT_ELEMENT
+                        | FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT,
+                )
+                && matches!(&self.fragment.background_mode, BackgroundMode::Normal)
+                && !DisplayListBuilder::has_text_clipped_background(painter.style)
+                && painter.positioning_area_override.is_none()
+                && painter.painting_area_override.is_none()
+                && std::ptr::eq(painter.style, &**self.fragment.style())
+            {
+                Some(builder.background_colors.bind(&self.fragment.box_fragment))
+            } else {
+                None
+            };
+            if let Some(key) = key {
+                builder.paint_info.background_colors.push((key, color));
+                builder.wr().push_rect_with_animation(
+                    &common,
+                    bounds,
+                    PropertyBinding::Binding(key, color),
+                );
+            } else {
+                builder.wr().push_rect(&common, bounds, color);
+            }
 
             // From <https://www.w3.org/TR/paint-timing/#sec-terminology>:
             // First paint ... includes non-default background paint and the enclosing box of an iframe.
@@ -2522,7 +2558,7 @@ impl<'a> BuilderForBoxFragment<'a> {
     }
 }
 
-fn rgba(color: AbsoluteColor) -> wr::ColorF {
+pub(crate) fn rgba(color: AbsoluteColor) -> wr::ColorF {
     let rgba = color.to_color_space(ColorSpace::Srgb);
     wr::ColorF::new(
         rgba.components.0.clamp(0.0, 1.0),

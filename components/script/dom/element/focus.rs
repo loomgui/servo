@@ -12,6 +12,7 @@ use style::values::computed::Overflow;
 use xml5ever::local_name;
 
 use crate::dom::Node;
+use crate::dom::NodeTraits;
 use crate::dom::document::focus::FocusableAreaKind;
 use crate::dom::types::{Element, HTMLElement};
 
@@ -27,18 +28,37 @@ impl Element {
     /// both "Is this element a focusable area?" and "Is this element click (or sequentially)
     /// focusable."
     pub(crate) fn focusable_area_kind(&self, no_gc: &NoGC) -> FocusableAreaKind {
+        self.focusable_area_kind_with_style(no_gc, None)
+    }
+
+    fn focusable_area_kind_with_style(
+        &self,
+        no_gc: &NoGC,
+        current_style: Option<&style::properties::ComputedValues>,
+    ) -> FocusableAreaKind {
         // Do not allow unrendered, disconnected, or disabled nodes to be focusable areas ever.
         let node: &Node = self.upcast();
-        if !node.is_connected() || !self.has_css_layout_box() || self.is_actually_disabled() {
+        let has_css_layout_box = || {
+            current_style.map_or_else(
+                || self.has_css_layout_box(),
+                |style| !style.get_box().clone_display().is_none(),
+            )
+        };
+        if !node.is_connected() || !has_css_layout_box() || self.is_actually_disabled() {
             return Default::default();
         }
 
         // <https://www.w3.org/TR/css-display-4/#visibility>
         // Invisible elements are removed from navigation.
-        if self
-            .style()
-            .is_some_and(|style| style.get_inherited_box().visibility != Visibility::Visible)
-        {
+        let invisible = current_style.map_or_else(
+            || {
+                self.style().is_some_and(|style| {
+                    style.get_inherited_box().visibility != Visibility::Visible
+                })
+            },
+            |style| style.get_inherited_box().visibility != Visibility::Visible,
+        );
+        if invisible {
             return Default::default();
         }
 
@@ -96,11 +116,11 @@ impl Element {
             //
             // Note: the `hidden` attribute is checked above for all elements.
             NodeTypeId::Element(ElementTypeId::HTMLElement(
-                HTMLElementTypeId::HTMLInputElement |
-                HTMLElementTypeId::HTMLButtonElement |
-                HTMLElementTypeId::HTMLSelectElement |
-                HTMLElementTypeId::HTMLTextAreaElement |
-                HTMLElementTypeId::HTMLIFrameElement,
+                HTMLElementTypeId::HTMLInputElement
+                | HTMLElementTypeId::HTMLButtonElement
+                | HTMLElementTypeId::HTMLSelectElement
+                | HTMLElementTypeId::HTMLTextAreaElement
+                | HTMLElementTypeId::HTMLIFrameElement,
             )) => true,
             _ => {
                 // >  - summary elements that are the first summary element child of a details element
@@ -108,8 +128,8 @@ impl Element {
                 // > -  Elements with a draggable attribute set, if that would enable the user agent to allow
                 // >    the user to begin drag operations for those elements without the use of a pointing device
                 self.downcast::<HTMLElement>().is_some_and(|html_element| {
-                    html_element.is_a_summary_for_its_parent_details() ||
-                        html_element.is_editing_host()
+                    html_element.is_a_summary_for_its_parent_details()
+                        || html_element.is_editing_host()
                 }) || self.get_string_attribute(&local_name!("draggable")) == "true"
             },
         };
@@ -129,10 +149,10 @@ impl Element {
             .is_some_and(|axes_overflow| {
                 // This is checking whether there is an input event scrollable overflow value in
                 // a given axis and also overflow in that same axis.
-                (matches!(axes_overflow.x, Overflow::Auto | Overflow::Scroll) &&
-                    self.ScrollWidth() > self.ClientWidth(no_gc)) ||
-                    (matches!(axes_overflow.y, Overflow::Auto | Overflow::Scroll) &&
-                        self.ScrollHeight() > self.ClientHeight(no_gc))
+                (matches!(axes_overflow.x, Overflow::Auto | Overflow::Scroll)
+                    && self.ScrollWidth() > self.ClientWidth(no_gc))
+                    || (matches!(axes_overflow.y, Overflow::Auto | Overflow::Scroll)
+                        && self.ScrollHeight() > self.ClientHeight(no_gc))
             })
         {
             return FocusableAreaKind::Sequential;
@@ -146,6 +166,18 @@ impl Element {
             )) => FocusableAreaKind::Click,
             _ => Default::default(),
         }
+    }
+
+    /// Only the immediate pre-render focus fixup may use a complete, fresh
+    /// background-only proof. This Arc never replaces Element::style or escapes
+    /// this predicate. Every live DOM check and scroll-metrics fallback remains.
+    pub(crate) fn is_focusable_area_for_fixup(&self, no_gc: &NoGC) -> bool {
+        let style = self
+            .owner_document()
+            .background_style_for_focus_fixup(self, no_gc);
+        !self
+            .focusable_area_kind_with_style(no_gc, style.as_deref())
+            .is_empty()
     }
 
     /// <https://html.spec.whatwg.org/multipage/#sequentially-focusable>.

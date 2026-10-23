@@ -1,0 +1,90 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Root-document CSSOM insertRule background control</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<style>
+html,body{margin:0}
+#host{color:rgb(3,4,5)}
+.cell{position:absolute;left:2px;top:2px;width:8px;height:8px}
+</style>
+<div id="host"><div class="cell" style="background-color:red"></div><span id="sibling"></span></div>
+<script>
+'use strict';
+setup({explicit_done:true});
+window.onload=()=>{
+ promise_test(async t=>{
+  const mode=new URL(location.href).searchParams.get('control');
+  assert_in_array(mode,['none','ordinary','compact'],'one explicit control mode is required');
+  const u=ServoTestUtils,cell=document.querySelector('.cell'),sibling=document.querySelector('#sibling');
+  // Same text, base URL and quirks in two connected elements keeps the parse
+  // cache contents shared. Retain BOTH CSSOM wrappers and live rules before COW.
+  const firstStyle=document.querySelector('style'),secondStyle=document.createElement('style');
+  secondStyle.textContent=firstStyle.textContent;document.head.append(secondStyle);
+  const firstSheet=firstStyle.sheet,secondSheet=secondStyle.sheet;
+  const firstRules=firstSheet.cssRules,secondRules=secondSheet.cssRules;
+  const firstHostRule=firstRules[1],firstHostDeclaration=firstHostRule.style;
+  const firstHostText=firstHostRule.cssText,secondHostRule=secondRules[1];
+  const secondText=Array.from(secondRules,r=>r.cssText),initialFirstLength=firstRules.length;
+  assert_not_equals(firstSheet,secondSheet,'connected elements have separate CSSOM wrappers');
+  assert_equals(firstSheet.ownerNode,firstStyle);assert_equals(secondSheet.ownerNode,secondStyle);
+  assert_equals(secondStyle.textContent,firstStyle.textContent,'exact shared-cache parse key text');
+  const diagnostics=window.__loomRootControlDiagnostics={mode,warm:[],before:null,after:null,sharedTrigger:'two connected identical style texts in one Document'};
+  u.forceLayout();
+  let warm;
+  for(const value of ['green','blue','red']){
+   cell.style.backgroundColor=value;warm=u.forceLayout();
+   diagnostics.warm.push({value,phasesRun:warm.phasesRun,accepted:warm.certifiedBackgroundColorCount,leaf:warm.certifiedBackgroundCachedLeafCount,family:warm.certifiedBackgroundCachedFamilyCount});
+  }
+  const warmMessage='root-document actual warm admission '+JSON.stringify(diagnostics.warm);
+  assert_equals(warm.certifiedBackgroundColorCount,1,warmMessage+' painter ACK');
+  assert_equals(warm.certifiedBackgroundCachedLeafCount,1,warmMessage+' cached leaf');
+  assert_equals(warm.certifiedBackgroundCachedFamilyCount,1,warmMessage+' cached family');
+  const before=u.compactBackgroundMutationCount();diagnostics.before=before;
+  let observer=null,oldStyle=null;
+  if(mode==='ordinary'){
+   oldStyle=cell.getAttribute('style');observer=new MutationObserver(()=>{});
+   observer.observe(cell,{attributes:true,attributeOldValue:true,attributeFilter:['style']});
+   t.add_cleanup(()=>observer.disconnect());cell.style.backgroundColor='blue';
+   assert_equals(u.compactBackgroundMutationCount(),before,'matching observer keeps the write on ordinary CSSOM');
+  }else if(mode==='compact'){
+   cell.style.backgroundColor='blue';
+   assert_equals(u.compactBackgroundMutationCount(),before+1,'actual compact omission must execute');
+  }else{
+   assert_equals(u.compactBackgroundMutationCount(),before,'no pending background write');
+  }
+  diagnostics.after=u.compactBackgroundMutationCount();
+  // Deliberately identical sheet/rule/index in all three fresh root Documents.
+  document.styleSheets[0].insertRule('[style] + span { color:rgb(12,34,56) }',0);
+  assert_equals(firstStyle.sheet,firstSheet,'COW preserves first live CSSStyleSheet');
+  assert_equals(secondStyle.sheet,secondSheet,'COW preserves second live CSSStyleSheet');
+  assert_equals(firstSheet.ownerNode,firstStyle,'COW keeps first owner node');
+  assert_equals(secondSheet.ownerNode,secondStyle,'COW keeps second owner node');
+  assert_equals(firstSheet.cssRules,firstRules,'COW keeps first live rule list');
+  assert_equals(secondSheet.cssRules,secondRules,'second live rule list is unchanged');
+  assert_equals(firstRules.length,initialFirstLength+1,'insert updates first live list');
+  assert_equals(firstRules[2],firstHostRule,'pre-held rule keeps identity after inserted index');
+  assert_equals(firstHostRule.parentStyleSheet,firstSheet,'pre-held rule keeps original CSSOM parent');
+  assert_equals(firstHostRule.style,firstHostDeclaration,'pre-held declaration keeps identity');
+  assert_equals(firstHostRule.cssText,firstHostText,'existing first rule content stays exact');
+  assert_equals(secondRules[1],secondHostRule,'second pre-held rule identity remains');
+  assert_equals(secondHostRule.parentStyleSheet,secondSheet);
+  assert_array_equals(Array.from(secondRules,r=>r.cssText),secondText,'COW must not mutate second sheet rules');
+  const siblingColor=getComputedStyle(sibling).color;diagnostics.siblingColor=siblingColor;
+  assert_equals(siblingColor,'rgb(12, 34, 56)','same synchronous sibling selector after insertRule; mode='+mode);
+  assert_equals(getComputedStyle(cell).backgroundColor,mode==='none'?'rgb(255, 0, 0)':'rgb(0, 0, 255)','pending background value remains eager');
+  // Independently prove that the inserted rule belongs only to the first
+  // attached sheet, even if a stale second CSSRuleList could hide aliasing.
+  firstSheet.disabled=true;
+  assert_equals(getComputedStyle(sibling).color,'rgb(3, 4, 5)','second sheet did not receive first COW mutation');
+  firstSheet.disabled=false;
+  assert_equals(getComputedStyle(sibling).color,'rgb(12, 34, 56)','original first wrapper still controls its attached sheet');
+  if(observer){
+   const records=observer.takeRecords();diagnostics.observerRecordCount=records.length;
+   assert_equals(records.length,1,'ordinary mutation still delivers its record');
+   assert_equals(records[0].oldValue,oldStyle,'ordinary mutation preserves exact oldValue');
+  }
+ },'Root-document insertRule sibling control selected explicitly by URL');
+ done();
+};
+</script>

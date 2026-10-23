@@ -21,8 +21,8 @@ pub struct ProfilerChan(pub Option<GenericSender<ProfilerMsg>>);
 
 impl ProfilerChan {
     pub fn send(&self, msg: ProfilerMsg) {
-        if let Some(sender) = &self.0 &&
-            let Err(e) = sender.send(msg)
+        if let Some(sender) = &self.0
+            && let Err(e) = sender.send(msg)
         {
             warn!("Error communicating with the time profiler thread: {}", e);
         }
@@ -68,6 +68,16 @@ pub enum ProfilerCategory {
 
     /// The script thread is doing layout work.
     Layout = 0x10,
+    // Nested detail categories are not additive with the outer Layout total.
+    LayoutStyleTraversal = 0x11,
+    LayoutDamage = 0x12,
+    LayoutDisplayListBuild = 0x13,
+    LayoutDisplayListSubmit = 0x14,
+    LayoutBackgroundColorUpdate = 0x15,
+    PaintDisplayListInstall = 0x16,
+    PaintBackgroundColorUpdate = 0x17,
+    PaintCaretColorReset = 0x18,
+    LayoutBackgroundColorCommit = 0x19,
 
     ImageSaving = 0x51,
     ScriptSpawnPipeline = 0x60,
@@ -130,6 +140,15 @@ impl ProfilerCategory {
         match self {
             ProfilerCategory::Painting => "Painting",
             ProfilerCategory::Layout => "Layout",
+            ProfilerCategory::LayoutStyleTraversal => "LayoutStyleTraversal",
+            ProfilerCategory::LayoutDamage => "LayoutDamage",
+            ProfilerCategory::LayoutDisplayListBuild => "LayoutDisplayListBuild",
+            ProfilerCategory::LayoutDisplayListSubmit => "LayoutDisplayListSubmit",
+            ProfilerCategory::LayoutBackgroundColorUpdate => "LayoutBackgroundColorUpdate",
+            ProfilerCategory::PaintDisplayListInstall => "PaintDisplayListInstall",
+            ProfilerCategory::PaintBackgroundColorUpdate => "PaintBackgroundColorUpdate",
+            ProfilerCategory::PaintCaretColorReset => "PaintCaretColorReset",
+            ProfilerCategory::LayoutBackgroundColorCommit => "LayoutBackgroundColorCommit",
             ProfilerCategory::ImageSaving => "ImageSaving",
             ProfilerCategory::ScriptSpawnPipeline => "ScriptSpawnPipeline",
             ProfilerCategory::ScriptConstellationMsg => "ScriptConstellationMsg",
@@ -214,6 +233,29 @@ where
 
     send_profile_data(category, meta, &profiler_chan, start_time, end_time);
     val
+}
+
+/// Optional detail timing: disabled profiling performs no timestamp, metadata
+/// allocation or span work. Bucket sample counts also distinguish complete scene
+/// builds from retained color updates. Parent and child buckets overlap.
+pub fn profile_if_active<T, F, M>(
+    category: ProfilerCategory,
+    metadata: M,
+    profiler_chan: &ProfilerChan,
+    callback: F,
+) -> T
+where
+    F: FnOnce() -> T,
+    M: FnOnce() -> Option<TimerMetadata>,
+{
+    if profiler_chan.0.is_none() {
+        return callback();
+    }
+    let start_time = CrossProcessInstant::now();
+    let result = callback();
+    let end_time = CrossProcessInstant::now();
+    send_profile_data(category, metadata(), profiler_chan, start_time, end_time);
+    result
 }
 
 pub fn send_profile_data(

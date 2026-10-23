@@ -242,7 +242,11 @@ impl CSSRule {
                     rule.update_rule(s.clone());
                 }
             },
-            StyleCssRule::FontFeatureValues(_) => unimplemented!(),
+            StyleCssRule::FontFeatureValues(_) => {
+                // COW's CssRule::deep_clone_with_lock retains this exact Arc.
+                // The existing CSSOM rule and its cached maps already reference
+                // the unchanged font-feature values; no retargeting is needed.
+            },
             StyleCssRule::CounterStyle(_) => unimplemented!(),
             StyleCssRule::Keyframes(s) => {
                 if let Some(rule) = self.downcast::<CSSKeyframesRule>() {

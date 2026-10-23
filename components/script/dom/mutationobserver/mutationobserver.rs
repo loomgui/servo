@@ -2,16 +2,18 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::LazyCell;
+use std::cell::{LazyCell, OnceCell};
 
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Namespace, ns};
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use js::rust::HandleObject;
 use rustc_hash::FxHashMap;
 use script_bindings::callback::{OwnerWindow, RootedCallback, TracedCallback};
 use script_bindings::cell::DomRefCell;
+use script_bindings::inheritance::Castable;
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
+use style::attr::AttrValue;
 
 use crate::dom::bindings::codegen::Bindings::MutationObserverBinding::MutationObserver_Binding::MutationObserverMethods;
 use crate::dom::bindings::codegen::Bindings::MutationObserverBinding::{
@@ -25,7 +27,7 @@ use crate::dom::iterators::ShadowIncluding;
 use crate::dom::mutationrecord::MutationRecord;
 use crate::dom::node::Node;
 use crate::dom::window::Window;
-use crate::event_loop::script_thread::ScriptThread;
+use crate::event_loop::script_thread::{ScriptThread, with_script_thread};
 
 #[dom_struct]
 pub(crate) struct MutationObserver {
@@ -39,7 +41,7 @@ pub(crate) enum Mutation<'a> {
     Attribute {
         name: LocalName,
         namespace: Namespace,
-        old_value: Option<DOMString>,
+        old_value: Option<&'a AttrValue>,
     },
     CharacterData {
         old_value: String,
@@ -70,6 +72,15 @@ pub(crate) struct ObserverOptions {
     attribute_filter: Vec<DOMString>,
 }
 
+impl ObserverOptions {
+    fn observes_attribute(&self, name: &LocalName, namespace: &Namespace) -> bool {
+        self.attributes
+            && (self.attribute_filter.is_empty()
+                || (*namespace == ns!()
+                    && self.attribute_filter.iter().any(|filter| *filter == **name)))
+    }
+}
+
 impl MutationObserver {
     fn new_with_proto(
         cx: &mut JSContext,
@@ -98,6 +109,101 @@ impl MutationObserver {
         &self.callback
     }
 
+    /// A negative is usable only for DOM owned by this live script agent.
+    /// Both the reflector's window and the current owner-document window must
+    /// resolve to those exact windows in this ScriptThread. Unknown/foreign or
+    /// no-longer-tracked windows fall back to the original observer-list walk.
+    pub(crate) fn attribute_observers_cannot_match(target: &Node, name: &LocalName) -> bool {
+        let Some(observers) = with_script_thread(|_| Some(ScriptThread::mutation_observers()))
+        else {
+            return false;
+        };
+        let global = target.global();
+        let Some(window) = global.downcast::<Window>() else {
+            return false;
+        };
+        if !ScriptThread::find_window(window.pipeline_id())
+            .is_some_and(|current| std::ptr::eq(&*current, window))
+        {
+            return false;
+        }
+        let document = target.owner_doc();
+        let owner_window = document.window();
+        if !std::ptr::eq(window, owner_window)
+            && !ScriptThread::find_window(owner_window.pipeline_id())
+                .is_some_and(|current| std::ptr::eq(&*current, owner_window))
+        {
+            return false;
+        }
+        observers.attribute_observers_cannot_match(name)
+    }
+
+    /// Fresh matching interest for one attribute; no cross-write observer cache.
+    pub(crate) fn attribute_interest(
+        no_gc: &NoGC,
+        target: &Node,
+        name: &LocalName,
+        namespace: &Namespace,
+    ) -> (bool, bool) {
+        if Self::attribute_observers_cannot_match(target, name) {
+            return (false, false);
+        }
+        let mut records = false;
+        let mut old_value = false;
+        for node in target.inclusive_ancestors_unrooted(no_gc, ShadowIncluding::No) {
+            let Some(registered) = node.registered_mutation_observers() else {
+                continue;
+            };
+            for registration in &*registered {
+                let options = &registration.options;
+                if (*node == target || options.subtree)
+                    && options.observes_attribute(name, namespace)
+                {
+                    records = true;
+                    old_value |= options.attribute_old_value;
+                }
+            }
+        }
+        (records, old_value)
+    }
+
+    /// Preserve the ordinary empty notification microtask after a fresh negative
+    /// interest proof. No callbacks run between the proof and this transaction.
+    pub(crate) fn queue_unobserved_attribute_microtask(cx: &mut JSContext, target: &Node) {
+        if target.global().as_window().get_exists_mut_observer() {
+            ScriptThread::mutation_observers().queue_mutation_observer_microtask(cx);
+        }
+    }
+
+    /// Whether queuing this attribute mutation can request its old value.
+    /// Use the same observer lists, ancestry, and option matching as record
+    /// delivery, including registered observers on a detached subtree.
+    pub(crate) fn has_attribute_old_value_observer(
+        no_gc: &NoGC,
+        target: &Node,
+        name: &LocalName,
+        namespace: &Namespace,
+    ) -> bool {
+        if Self::attribute_observers_cannot_match(target, name) {
+            return false;
+        }
+        for node in target.inclusive_ancestors_unrooted(no_gc, ShadowIncluding::No) {
+            let Some(registered) = node.registered_mutation_observers() else {
+                continue;
+            };
+            for registered in &*registered {
+                let options = &registered.options;
+                if (*node == target || options.subtree)
+                    && options.attribute_old_value
+                    && options.observes_attribute(name, namespace)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// <https://dom.spec.whatwg.org/#queueing-a-mutation-record>
     pub(crate) fn queue_a_mutation_record<'a, F>(
         cx: &mut JSContext,
@@ -112,6 +218,10 @@ impl MutationObserver {
         // Step 1 Let interestedObservers be an empty map.
         let mut interested_observers: FxHashMap<DomRoot<MutationObserver>, Option<DOMString>> =
             FxHashMap::default();
+        // Attribute values such as inline declaration blocks serialize lazily. Match
+        // observer options before requesting their string, and share the result when
+        // multiple observers request the old value of this mutation.
+        let attribute_old_value = OnceCell::new();
 
         // Step 2 Let nodes be the inclusive ancestors of target.
         // Step 3 For each node in nodes ...
@@ -135,30 +245,17 @@ impl MutationObserver {
                         ref namespace,
                         ref old_value,
                     } => {
-                        // 3.1.2 "2": type is "attributes" and options["attributes"] either does not exist or is false
-                        if !registered.options.attributes {
+                        // 3.1.2 "2", "3": match attributes, namespace, and filter.
+                        if !registered.options.observes_attribute(name, namespace) {
                             continue;
-                        }
-                        // 3.1.2 "3": type is "attributes", options["attributeFilter"] exists,
-                        // and options["attributeFilter"] does not contain name or namespace is non-null
-                        if !registered.options.attribute_filter.is_empty() {
-                            if *namespace != ns!() {
-                                continue;
-                            }
-                            if !registered
-                                .options
-                                .attribute_filter
-                                .iter()
-                                .any(|s| *s == **name)
-                            {
-                                continue;
-                            }
                         }
                         // 3.2.1 Let mo be registered’s observer.
                         let mo = registered.observer.as_rooted();
                         // 3.2.2 If interestedObservers[mo] does not exist, then set interestedObservers[mo] to null.
                         if registered.options.attribute_old_value {
                             // 3.2.3 ... type is "attributes" and options["attributeOldValue"] is true ...
+                            let old_value = attribute_old_value
+                                .get_or_init(|| old_value.map(|value| DOMString::from(&**value)));
                             interested_observers.insert(mo, old_value.clone());
                         } else {
                             // 3.2.2 If interestedObservers[mo] does not exist, then set interestedObservers[mo] to null.
@@ -263,8 +360,8 @@ impl MutationObserverMethods<crate::DomTypeHolder> for MutationObserver {
         let subtree = options.subtree;
 
         // Step 1
-        if (options.attributeOldValue.is_some() || options.attributeFilter.is_some()) &&
-            options.attributes.is_none()
+        if (options.attributeOldValue.is_some() || options.attributeFilter.is_some())
+            && options.attributes.is_none()
         {
             attributes = true;
         }
@@ -301,6 +398,11 @@ impl MutationObserverMethods<crate::DomTypeHolder> for MutationObserver {
                 c"characterDataOldValue is true but characterData is false".into(),
             ));
         }
+
+        // Publish the conservative union only after all option validation and
+        // before either replacing options or publishing a new registration.
+        // This state belongs to the script agent, not a particular Window.
+        ScriptThread::mutation_observers().record_attribute_observer(attributes, &attribute_filter);
 
         // Step 7
         let add_new_observer = {

@@ -1373,8 +1373,8 @@ where
             EmbedderToConstellationMessage::ThemeChange(webview_id, theme) => {
                 self.handle_theme_change(webview_id, theme);
             },
-            EmbedderToConstellationMessage::TickAnimation(webview_ids, callback) => {
-                self.handle_tick_animation(webview_ids, callback)
+            EmbedderToConstellationMessage::TickAnimation(webview_ids, callback, applied_seal) => {
+                self.handle_tick_animation(webview_ids, callback, applied_seal)
             },
             EmbedderToConstellationMessage::NoLongerWaitingOnAsynchronousImageUpdates(
                 pipeline_ids,
@@ -4055,8 +4055,10 @@ where
         &mut self,
         webview_ids: Vec<WebViewId>,
         callback: Option<GenericCallback<bool>>,
+        applied_seal: Option<paint_api::AppliedSeal>,
     ) {
-        let mut animating_event_loops = HashSet::new();
+        let mut animating_event_loops = Vec::new();
+        let mut seen_event_loops = HashSet::new();
         let mut animating_workers = FxHashSet::default();
 
         for webview_id in webview_ids.iter() {
@@ -4069,18 +4071,31 @@ where
 
                 // Window rAF still follows the existing script-thread path.
                 let event_loop = &pipeline.event_loop;
-                if !animating_event_loops.contains(&event_loop.id()) {
-                    // No error handling here. It's unclear what to do when this fails as the error isn't associated
-                    // with a particular pipeline. In addition, the danger of not progressing animations is pretty
-                    // low, so it's probably safe to ignore this error and handle the crashed ScriptThread on
-                    // some other message.
-                    let _ = event_loop.send(ScriptThreadMessage::TickAllAnimations(
-                        webview_ids.clone(),
-                        callback.clone(),
-                    ));
-                    animating_event_loops.insert(event_loop.id());
+                if seen_event_loops.insert(event_loop.id()) {
+                    animating_event_loops.push(event_loop.clone());
                 }
             }
+        }
+
+        // Freeze the entire distinct loop set before any participant is dispatched.
+        // A missing/send-failed loop never becomes an all-false completion.
+        let participants: Vec<_> = animating_event_loops
+            .iter()
+            .map(|event_loop| event_loop.id())
+            .collect();
+        for event_loop in animating_event_loops {
+            let opportunity = applied_seal
+                .as_ref()
+                .map(|seal| paint_api::AppliedSealOpportunity {
+                    seal: seal.clone(),
+                    participants: participants.clone(),
+                    participant: event_loop.id(),
+                });
+            let _ = event_loop.send(ScriptThreadMessage::TickAllAnimations(
+                webview_ids.clone(),
+                callback.clone(),
+                opportunity,
+            ));
         }
 
         // Step 6.1.2 runs on the worker event loop; constellation only sends

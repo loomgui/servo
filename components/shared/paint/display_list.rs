@@ -1013,6 +1013,10 @@ pub struct PaintDisplayListInfo {
     /// key and original color value so that the painter can animate the caret.
     pub caret_property_binding: Option<(PropertyBindingKey<ColorF>, ColorF)>,
 
+    /// Initial values for retained ordinary background primitives.
+    pub background_colors: Vec<(PropertyBindingKey<ColorF>, ColorF)>,
+    pub background_color_generation: u64,
+
     /// clip:text glyph-mask snapshot keys referenced by this display list, for
     /// the paint thread to register.
     #[ignore_malloc_size_of = "Small WebRender resource keys"]
@@ -1070,6 +1074,8 @@ impl PaintDisplayListInfo {
             paint_timing_report: PaintTimingReport::default(),
             paint_timing_info: PaintTimingInfo::now(),
             caret_property_binding: Default::default(),
+            background_colors: Vec::new(),
+            background_color_generation: 0,
             snapshot_image_keys: Vec::new(),
         }
     }

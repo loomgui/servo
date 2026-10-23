@@ -196,6 +196,7 @@ bitflags! {
 
 impl Paint {
     pub fn new(state: InitialPaintState) -> Rc<RefCell<Self>> {
+        crate::preparation_probe::install_hooks_before_painters();
         let registration = state.mem_profiler_chan.prepare_memory_reporting(
             "paint".into(),
             state.paint_proxy.clone(),
@@ -462,9 +463,6 @@ impl Paint {
             PaintMessage::EmbedderSceneFrameReady(..) => {
                 unreachable!("Embedder scene frames should be handled in the caller.");
             },
-            PaintMessage::EmbedderRenderingUpdateReady(..) => {
-                unreachable!("Embedder rendering updates should be handled in the caller.");
-            },
             PaintMessage::SendInitialTransaction(webview_id, pipeline_id) => {
                 if let Some(mut painter) = self.maybe_painter_mut(webview_id.into()) {
                     painter.send_initial_pipeline_transaction(webview_id, pipeline_id);
@@ -505,13 +503,58 @@ impl Paint {
                 display_list_info_receiver,
                 display_list_data_receiver,
             } => {
+                let profiler = self.time_profiler_chan.clone();
                 if let Some(mut painter) = self.maybe_painter_mut(webview_id.into()) {
-                    painter.handle_new_display_list(
-                        webview_id,
-                        display_list_descriptor,
-                        display_list_info_receiver,
-                        display_list_data_receiver,
+                    profile_time::profile_if_active(
+                        profile_time::ProfilerCategory::PaintDisplayListInstall,
+                        || None,
+                        &profiler,
+                        || {
+                            painter.handle_new_display_list(
+                                webview_id,
+                                display_list_descriptor,
+                                display_list_info_receiver,
+                                display_list_data_receiver,
+                            );
+                        },
                     );
+                }
+            },
+            PaintMessage::UpdateBackgroundColors {
+                webview_id,
+                pipeline_id,
+                epoch,
+                colors,
+                generation,
+                response,
+            } => {
+                let profiler = self.time_profiler_chan.clone();
+                let accepted = if let Some(mut painter) = self.maybe_painter_mut(webview_id.into())
+                {
+                    profile_time::profile_if_active(
+                        profile_time::ProfilerCategory::PaintBackgroundColorUpdate,
+                        || None,
+                        &profiler,
+                        || {
+                            painter.update_background_colors(
+                                webview_id,
+                                pipeline_id,
+                                epoch,
+                                generation,
+                                colors,
+                            )
+                        },
+                    )
+                } else {
+                    false
+                };
+                let _ = response.send(accepted);
+            },
+            PaintMessage::AppliedSealRenderingComplete(opportunity, changed) => {
+                if let Some(mut painter) =
+                    self.maybe_painter_mut(opportunity.seal.webview_id.into())
+                {
+                    painter.complete_applied_seal(opportunity, changed);
                 }
             },
             PaintMessage::GenerateFrame(painter_ids) => {
@@ -675,6 +718,9 @@ impl Paint {
     /// `Paint` no longer does any WebRender frame generation.
     fn handle_browser_message_while_shutting_down(&self, msg: PaintMessage) {
         match msg {
+            PaintMessage::UpdateBackgroundColors { response, .. } => {
+                let _ = response.send(false);
+            },
             PaintMessage::PipelineExited(webview_id, pipeline_id, pipeline_exit_source) => {
                 if let Some(mut painter) = self.maybe_painter_mut(webview_id.into()) {
                     painter.notify_pipeline_exited(webview_id, pipeline_id, pipeline_exit_source);
@@ -769,8 +815,13 @@ impl Paint {
     /// Consume pending WebRender updates for an embedder-tagged frame without
     /// drawing into the rendering context.
     pub fn prepare_for_render(&self, webview_id: WebViewId, frame_tag: u64) -> bool {
-        self.painter_mut(webview_id.into())
-            .prepare_for_render(frame_tag, &self.time_profiler_chan)
+        let result = {
+            let mut painter = self.painter_mut(webview_id.into());
+            painter.prepare_for_render(frame_tag, &self.time_profiler_chan)
+        };
+        // Diagnostic I/O occurs only after the painter RefMut has dropped.
+        crate::preparation_probe::flush_completed();
+        result
     }
 
     /// Draw only the scene prepared for `frame_tag`.
@@ -785,28 +836,18 @@ impl Paint {
             .discard_prepared_render(frame_tag)
     }
 
-    /// Tag the next scene generated for this WebView and return that same tag
-    /// only after WebRender reports the frame ready.
-    pub fn arm_next_scene_frame(&self, webview_id: WebViewId, frame_tag: u64) -> bool {
-        self.painter(webview_id.into())
-            .arm_next_scene_frame(frame_tag)
+    /// Register one already-applied seal before its specific Script opportunity.
+    pub fn register_applied_seal(&self, seal: paint_api::AppliedSeal) -> bool {
+        self.painter_mut(seal.webview_id.into())
+            .register_applied_seal(seal)
     }
 
     pub fn take_ready_scene_frame(&self, webview_id: WebViewId) -> Option<u64> {
         self.painter(webview_id.into()).take_ready_scene_frame()
     }
 
-    pub fn rendering_update_callback(
-        &self,
-        webview_id: WebViewId,
-        frame_tag: u64,
-    ) -> Option<servo_base::generic_channel::GenericCallback<bool>> {
-        self.painter(webview_id.into())
-            .rendering_update_callback(frame_tag)
-    }
-
     pub fn take_unchanged_rendering_update(&self, webview_id: WebViewId) -> Option<u64> {
-        self.painter(webview_id.into())
+        self.painter_mut(webview_id.into())
             .take_unchanged_rendering_update()
     }
 
@@ -848,12 +889,6 @@ impl Paint {
                 }
                 false
             },
-            PaintMessage::EmbedderRenderingUpdateReady(painter_id, frame_tag, changed) => {
-                if let Some(painter) = self.maybe_painter(*painter_id) {
-                    painter.mark_rendering_update_complete(*frame_tag, *changed);
-                }
-                false
-            },
             _ => true,
         });
 
@@ -882,7 +917,9 @@ impl Paint {
         self.webxr_main_thread.borrow_mut().run_one_frame();
 
         for painter in &self.painters {
-            painter.borrow_mut().perform_updates();
+            painter
+                .borrow_mut()
+                .perform_updates(&self.time_profiler_chan);
         }
 
         self.shutdown_state() != ShutdownState::FinishedShuttingDown

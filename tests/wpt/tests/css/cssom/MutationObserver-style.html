@@ -39,5 +39,72 @@
     await Promise.resolve();
     assert_equals(called, 2, "times callback called");
   }, "Updating cssText triggers an observation callback even if the value is the same");
+
+  for (const {name, registrations, oldValues} of [
+    {
+      name: "on the target with old values",
+      registrations: [["target", {attributes: true, attributeOldValue: true}]],
+      oldValues: ["color: red;", "color: blue;", "color: green;"]
+    },
+    {
+      name: "on an ancestor with a matching filter and old values",
+      registrations: [["ancestor", {
+        attributes: true, subtree: true,
+        attributeFilter: ["style"], attributeOldValue: true
+      }]],
+      oldValues: ["color: red;", "color: blue;", "color: green;"]
+    },
+    {
+      name: "on both the target and an ancestor with different old-value options",
+      registrations: [
+        ["target", {attributes: true}],
+        ["ancestor", {attributes: true, subtree: true, attributeOldValue: true}]
+      ],
+      oldValues: ["color: red;", "color: blue;", "color: green;"]
+    },
+    {
+      name: "on the target without old values",
+      registrations: [["target", {attributes: true}]],
+      oldValues: [null, null, null]
+    },
+    {
+      name: "on an ancestor without subtree observation",
+      registrations: [["ancestor", {attributes: true, attributeOldValue: true}]],
+      oldValues: []
+    },
+    {
+      name: "with a filter excluding style",
+      registrations: [["ancestor", {
+        attributes: true, subtree: true,
+        attributeFilter: ["data-image-kind"], attributeOldValue: true
+      }]],
+      oldValues: []
+    }
+  ]) {
+    test(t => {
+      const ancestor = document.createElement("div");
+      const target = ancestor.appendChild(document.createElement("div"));
+      target.style.color = "red";
+      const observer = new MutationObserver(t.unreached_func("records were taken synchronously"));
+      t.add_cleanup(() => observer.disconnect());
+      for (const [node, options] of registrations) {
+        observer.observe(node === "target" ? target : ancestor, options);
+      }
+
+      target.style.color = "blue";
+      target.style.setProperty("color", "green");
+      target.style.removeProperty("color");
+
+      const records = observer.takeRecords();
+      assert_array_equals(records.map(record => record.oldValue), oldValues);
+      for (const record of records) {
+        assert_equals(record.type, "attributes");
+        assert_equals(record.target, target);
+        assert_equals(record.attributeName, "style");
+        assert_equals(record.attributeNamespace, null);
+      }
+      assert_equals(target.getAttribute("style"), "");
+    }, `Repeated CSSOM mutations report independent old values ${name}`);
+  }
 </script>
 

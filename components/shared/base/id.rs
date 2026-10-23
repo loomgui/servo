@@ -259,6 +259,17 @@ pub const FIRST_CONTENT_PIPELINE_NAMESPACE_ID: PipelineNamespaceId = PipelineNam
 
 namespace_id! {PipelineId, PipelineIndex, "Pipeline"}
 
+// Property bindings and caret PipelineIds share this authoritative index
+// allocator. Their namespaces are globally unique even in multiprocess mode.
+// Never use a separate per-pipeline counter or a WebRender resource key here.
+namespace_id! {ColorBindingId, ColorBindingIndex, "ColorBinding"}
+
+impl From<ColorBindingId> for u64 {
+    fn from(id: ColorBindingId) -> Self {
+        ((id.namespace_id.0 as u64) << 32) | u64::from(id.index.0.get())
+    }
+}
+
 size_of_test!(PipelineId, 8);
 size_of_test!(Option<PipelineId>, 8);
 
@@ -592,3 +603,34 @@ impl fmt::Display for ScriptEventLoopId {
 /// layout time.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
 pub struct LCPCandidateID(pub u64);
+
+#[cfg(test)]
+#[test]
+fn color_bindings_and_caret_pipeline_ids_share_unique_authoritative_indices() {
+    use std::collections::HashSet;
+    use webrender_api::{ColorF, PropertyBindingKey};
+    let mut keys = HashSet::new();
+    for namespace in [10_001, 10_002] {
+        let generated = std::thread::spawn(move || {
+            PipelineNamespace::install(PipelineNamespaceId(namespace));
+            let mut ids = Vec::new();
+            for _ in 0..1_000 {
+                let pipeline = PipelineId::new();
+                let caret: PropertyBindingKey<ColorF> = PropertyBindingKey::new(pipeline.into());
+                let background: PropertyBindingKey<ColorF> =
+                    PropertyBindingKey::new(ColorBindingId::new().into());
+                assert_eq!(caret.id.namespace.0, namespace);
+                assert_eq!(background.id.namespace.0, namespace);
+                assert_eq!(background.id.uid, caret.id.uid + 1);
+                ids.extend([caret.id, background.id]);
+            }
+            ids
+        })
+        .join()
+        .unwrap();
+        for id in generated {
+            assert!(keys.insert(id));
+        }
+    }
+    assert_eq!(keys.len(), 4_000);
+}

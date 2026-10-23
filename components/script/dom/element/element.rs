@@ -2100,7 +2100,7 @@ impl Element {
         let mutation = LazyCell::new(|| Mutation::Attribute {
             name: name.clone(),
             namespace: namespace.clone(),
-            old_value: old_value.map(|old_value| DOMString::from(&**old_value)),
+            old_value,
         });
         MutationObserver::queue_a_mutation_record(cx, &self.node, mutation);
 
@@ -2877,19 +2877,109 @@ impl Element {
     /// attribute to persist after modification, because it is sent as an argument to
     /// script callbacks. Normally that's not the case, so this method tries to detect
     /// when it's required so it can be avoided for performance reasons.
-    pub(crate) fn needs_preserved_style_attribute_after_change(&self) -> bool {
-        // This is a global check for whether any mutation observers are installed on this
-        // Document at all. If cloning of the property declaration block (look at the
-        // caller of this method), starts showing up in profiles, this check may need to
-        // be a bit smarter. For instance, maybe only returning true if any mutation
-        // observer is installed on an inclusive ancestor and only if it has an observer
-        // with the attribute filter set to include `style`.
-        self.owner_window().get_exists_mut_observer()
-            || self
-                .get_custom_element_definition()
-                .is_some_and(|custom_element_definition| {
-                    custom_element_definition.has_attribute_changed_callback()
-                })
+    /// A conservative ordinary-element lane; all other element virtual hooks keep
+    /// their original mutation path. No observer/reaction or script runs here.
+    pub(crate) fn compact_background_style_admission(
+        &self,
+        no_gc: &NoGC,
+    ) -> Option<(u64, ServoArc<Locked<PropertyDeclarationBlock>>)> {
+        let node = self.upcast::<Node>();
+        if !matches!(
+            node.type_id(),
+            NodeTypeId::Element(ElementTypeId::HTMLElement(
+                HTMLElementTypeId::HTMLDivElement
+            )) | NodeTypeId::Element(ElementTypeId::HTMLElement(
+                HTMLElementTypeId::HTMLSpanElement
+            ))
+        ) || self.get_custom_element_state() != CustomElementState::Uncustomized
+            || self.get_custom_element_definition().is_some()
+            || self.is_shadow_host()
+            || node.get_first_child_unrooted(no_gc).is_some()
+            || node.containing_shadow_root_unrooted(no_gc).is_some()
+            || node.assigned_slot_unrooted(no_gc).is_some()
+        {
+            return None;
+        }
+        // Ordinary attribute mutation requests RESTYLE_SELF when attr(style)
+        // is consumed by the primary or an eager pseudo. STYLE_ATTRIBUTE alone
+        // would retain old cascade/pseudo inputs, so keep that original path.
+        if self.check_style_on_self_or_eager_pseudos(|style| {
+            style
+                .attribute_references
+                .as_ref()
+                .is_some_and(|references| references.contains_key(&local_name!("style")))
+        }) {
+            return None;
+        }
+        let epoch = self
+            .owner_document()
+            .can_compact_background_style(self, no_gc)?;
+        let block = self.style_attribute().borrow().as_ref()?.clone();
+        let same = self.with_attribute(&ns!(), &local_name!("style"), |attr| {
+            matches!(&*attr.value(), AttrValue::Declaration { block: stored, .. } if ServoArc::ptr_eq(stored, &block))
+        }).unwrap_or(false);
+        same.then_some((epoch, block))
+    }
+
+    pub(crate) fn complete_compact_background_style(
+        &self,
+        cx: &mut JSContext,
+        epoch: u64,
+        block: ServoArc<Locked<PropertyDeclarationBlock>>,
+    ) {
+        // Admission, PDB update and this reset are one callback-free transaction.
+        // Record omission even if a defensive ordinary reinstall is necessary.
+        self.owner_document()
+            .note_compact_background_style(self, epoch);
+        if !self.attrs.invalidate_style_serialization(&block) {
+            self.set_attribute(
+                cx,
+                &local_name!("style"),
+                AttrValue::from_declaration(
+                    block,
+                    self.owner_document().style_shared_author_lock().clone(),
+                ),
+            );
+        } else {
+            MutationObserver::queue_unobserved_attribute_microtask(cx, self.upcast::<Node>());
+        }
+    }
+
+    pub(crate) fn needs_preserved_style_attribute_after_change(&self, no_gc: &NoGC) -> bool {
+        if self
+            .get_custom_element_definition()
+            .is_some_and(|definition| {
+                definition.has_attribute_changed_callback()
+                    && definition
+                        .observed_attributes
+                        .iter()
+                        .any(|name| *name == *local_name!("style"))
+            })
+        {
+            return true;
+        }
+
+        if !self.owner_window().get_exists_mut_observer() {
+            return false;
+        }
+
+        let node = self.upcast::<Node>();
+        if MutationObserver::attribute_observers_cannot_match(node, &local_name!("style")) {
+            return false;
+        }
+
+        // Keep detached-node preservation conservative whenever the agent-wide
+        // union cannot rule out even copied/transient attribute registrations.
+        if !node.is_connected() {
+            return true;
+        }
+
+        MutationObserver::has_attribute_old_value_observer(
+            no_gc,
+            node,
+            &local_name!("style"),
+            &ns!(),
+        )
     }
 
     pub(crate) fn register_current_id_and_name_attribute(&self, cx: &mut JSContext) {

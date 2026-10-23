@@ -26,9 +26,12 @@ mod paint;
 mod painter;
 mod pinch_zoom;
 mod pipeline_details;
+mod preparation_probe;
 mod refresh_driver;
 mod render_notifier;
+mod retained_colors;
 mod screenshot;
+mod shader_program_cache;
 mod touch;
 mod web_content_animation;
 #[cfg(feature = "webgl")]

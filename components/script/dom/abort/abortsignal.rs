@@ -8,12 +8,13 @@ use std::sync::{Arc, Mutex};
 
 use dom_struct::dom_struct;
 use indexmap::IndexSet;
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use js::jsapi::{ExceptionStackBehavior, Heap};
 use js::jsval::{JSVal, UndefinedValue};
 use js::realm::CurrentRealm;
 use js::rust::wrappers2::JS_SetPendingException;
 use js::rust::{HandleObject, HandleValue, MutableHandleValue};
+use net_traits::request::RequestId;
 use script_bindings::callback::TracedCallback;
 use script_bindings::cell::DomRefCell;
 use script_bindings::inheritance::Castable;
@@ -34,6 +35,9 @@ use crate::dom::readablestream::PipeTo;
 use crate::fetch::fetch::{DeferredFetchRecordId, FetchContext};
 use crate::realms::enter_auto_realm;
 
+// Avoid scanning a controller's live followers on each new registration.
+const MIN_DEPENDENT_SIGNAL_CLEANUP: usize = 16;
+
 impl js::gc::Rootable for AbortAlgorithm {}
 
 /// <https://dom.spec.whatwg.org/#abortcontroller-api-integration>
@@ -48,6 +52,7 @@ pub(crate) enum AbortAlgorithm {
     StreamPiping(PipeTo),
     /// <https://fetch.spec.whatwg.org/#dom-global-fetch>
     Fetch(
+        #[no_trace] RequestId,
         #[no_trace]
         #[conditional_malloc_size_of]
         Arc<Mutex<Option<FetchContext>>>,
@@ -89,6 +94,9 @@ pub(crate) struct AbortSignal {
     #[no_trace]
     #[ignore_malloc_size_of = "WeakRef"]
     dependent_signals: DomRefCell<IndexSet<WeakRef<AbortSignal>>>,
+
+    /// The next follower count at which dead weak entries should be swept.
+    next_dependent_signal_cleanup: Cell<usize>,
 }
 
 impl AbortSignal {
@@ -100,6 +108,7 @@ impl AbortSignal {
             dependent: Default::default(),
             source_signals: Default::default(),
             dependent_signals: Default::default(),
+            next_dependent_signal_cleanup: Cell::new(MIN_DEPENDENT_SIGNAL_CLEANUP),
         }
     }
 
@@ -177,6 +186,15 @@ impl AbortSignal {
         }
     }
 
+    /// Remove a fetch registration after its network listener has consumed the
+    /// context at EOF. The registration can no longer abort anything, and keeping
+    /// it would unnecessarily root this dependent signal for its source's lifetime.
+    pub(crate) fn remove_completed_fetch(&self, request_id: RequestId) {
+        self.abort_algorithms.borrow_mut().retain(
+            |algorithm| !matches!(algorithm, AbortAlgorithm::Fetch(id, _) if *id == request_id),
+        );
+    }
+
     /// Run a specific abort algorithm.
     pub(crate) fn run_abort_algorithm(
         &self,
@@ -190,7 +208,7 @@ impl AbortSignal {
                 reason.set(self.abort_reason.get());
                 pipe.abort_with_reason(cx, global, reason.handle());
             },
-            AbortAlgorithm::Fetch(fetch_context) => {
+            AbortAlgorithm::Fetch(_, fetch_context) => {
                 rooted!(&in(cx) let mut reason = UndefinedValue());
                 reason.set(self.abort_reason.get());
                 if let Some(fetch_context) = &mut *fetch_context.lock().unwrap() {
@@ -260,10 +278,7 @@ impl AbortSignal {
                     .safe_borrow_mut(cx.no_gc())
                     .insert(WeakRef::new(signal));
                 // Step 4.1.2. Append resultSignal to signal’s dependent signals.
-                signal
-                    .dependent_signals
-                    .safe_borrow_mut(cx.no_gc())
-                    .insert(WeakRef::new(&*result_signal));
+                signal.add_dependent_signal(cx.no_gc(), &result_signal);
             } else {
                 // Step 4.2. Otherwise, for each sourceSignal of signal’s source signals:
                 for source_signal_weak in signal.source_signals.borrow().iter() {
@@ -276,10 +291,7 @@ impl AbortSignal {
                             .safe_borrow_mut(cx.no_gc())
                             .insert(WeakRef::new(&*source_signal));
                         // Step 4.2.3. Append resultSignal to sourceSignal’s dependent signals.
-                        source_signal
-                            .dependent_signals
-                            .safe_borrow_mut(cx.no_gc())
-                            .insert(WeakRef::new(&*result_signal));
+                        source_signal.add_dependent_signal(cx.no_gc(), &result_signal);
                     }
                 }
             }
@@ -287,6 +299,32 @@ impl AbortSignal {
         // Step 5. Return resultSignal.
         global.register_dependent_abort_signal(&result_signal);
         result_signal
+    }
+
+    /// Source signals need not be dependent themselves, so the global's
+    /// dependent-signal GC checkpoint does not necessarily visit them. Sweep
+    /// collected followers in batches to avoid retaining every past fetch's weak
+    /// entry on a long-lived controller. Doubling the surviving count ensures
+    /// that each sweep examines at most twice the registrations since the last
+    /// sweep, even when all followers are still alive.
+    fn add_dependent_signal(&self, no_gc: &NoGC, signal: &AbortSignal) {
+        let mut dependents = self.dependent_signals.safe_borrow_mut(no_gc);
+        dependents.insert(WeakRef::new(signal));
+        if dependents.len() >= self.next_dependent_signal_cleanup.get() {
+            dependents.retain(|weak| weak.is_alive());
+            self.next_dependent_signal_cleanup.set(
+                dependents
+                    .len()
+                    .saturating_mul(2)
+                    .max(MIN_DEPENDENT_SIGNAL_CLEANUP),
+            );
+        }
+    }
+
+    /// Observe the actual weak registry without pruning it in the test helper.
+    #[cfg(feature = "testbinding")]
+    pub(crate) fn dependent_signal_count(&self) -> usize {
+        self.dependent_signals.borrow().len()
     }
 
     /// Remove weak references whose target has been collected.
