@@ -136,8 +136,15 @@ pub struct Preferences {
     ///
     /// Available values:
     /// - vello
+    /// - gpu (Loom): `vello_hybrid` on the GPU for canvases of at least
+    ///   `dom_canvas_gpu_min_pixels` pixels, `vello_cpu` for smaller ones
     /// - Everything else selects vello_cpu
     pub dom_canvas_backend: String,
+    /// With `dom_canvas_backend = "gpu"`, the smallest canvas (width × height) rasterized on the
+    /// GPU. Smaller canvases are cheaper on the CPU backend: a GPU canvas update has a fixed cost
+    /// (presenting through a swap chain) that only pays off on larger surfaces. 0 uses the GPU
+    /// for every canvas.
+    pub dom_canvas_gpu_min_pixels: i64,
     /// Maximum number of buffered canvas commands before an automatic flush is triggered.
     ///
     /// A lower value keeps the paint thread fed with work (better parallelism),
@@ -435,6 +442,7 @@ impl Preferences {
             dom_canvas_capture_enabled: false,
             dom_canvas_text_enabled: true,
             dom_canvas_backend: String::new(),
+            dom_canvas_gpu_min_pixels: 512 * 512,
             dom_canvas_msg_buffer_size: 16,
             dom_composition_event_enabled: false,
             dom_cookiestore_enabled: false,

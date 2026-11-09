@@ -41,6 +41,27 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
         }
     }
 
+    /// Hand this canvas's WebRender image to another backend (Loom: GPU/CPU switch on resize).
+    pub(crate) fn take_image_key(&mut self) -> Option<ImageKey> {
+        self.image_key.take()
+    }
+
+    pub(crate) fn paint_api(&self) -> CrossProcessPaintApi {
+        self.paint_api.clone()
+    }
+
+    pub(crate) fn size(&self) -> Size2D<u64> {
+        self.draw_target.get_size().cast()
+    }
+
+    /// Take over an image key that WebRender already knows, replacing its contents with this
+    /// canvas on the next `update_image_rendering`.
+    pub(crate) fn adopt_image_key(&mut self, image_key: ImageKey) {
+        if let Some(old_image_key) = self.image_key.replace(image_key) {
+            self.paint_api.delete_image(old_image_key);
+        }
+    }
+
     pub(crate) fn set_image_key(&mut self, image_key: ImageKey) {
         let (descriptor, data) = self.draw_target.image_descriptor_and_serializable_data();
         self.paint_api.add_image(image_key, descriptor, data, false);

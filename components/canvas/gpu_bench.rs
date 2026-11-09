@@ -208,6 +208,68 @@ fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
+/// One canvas of `side`×`side` showing a HUD panel scaled to fill it: finds the size where the
+/// GPU backend's fixed per-update cost stops dominating.
+#[test]
+#[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+fn gpu_bench_crossover() {
+    let mut report = String::from("
+side    pixels    cpu ms   gpu+finish ms
+");
+    for side in [128_u32, 192, 256, 320, 384, 512, 768, 1024] {
+        let icon = images().remove(0);
+        let scale = f64::from(side) / 400.0;
+        let cpu = {
+            let icon = icon.clone();
+            let mut targets = vec![VelloCPUDrawTarget::new(Size2D::new(side, side))];
+            run(&mut targets, |t, frame| scaled_panel(&mut t[0], frame, &icon, scale), |_| {})
+        };
+        let gpu = on_gpu_thread(move || {
+            let mut targets = vec![VelloGpuDrawTarget::new(Size2D::new(side, side))];
+            let timing = run(
+                &mut targets,
+                |t, frame| scaled_panel(&mut t[0], frame, &icon, scale),
+                |t| t[0].finish_gpu(),
+            );
+            timing.per_frame.as_nanos().to_string().into_bytes()
+        });
+        let gpu = Duration::from_nanos(String::from_utf8(gpu).unwrap().parse().unwrap());
+        report += &format!(
+            "{:<6} {:>7} {:>9.3} {:>15.3}
+",
+            side,
+            side * side,
+            ms(cpu.per_frame),
+            ms(gpu)
+        );
+    }
+    eprintln!("{report}");
+}
+
+/// The HUD panel content, stretched over a square canvas (`scale` = side / 400).
+fn scaled_panel<T: GenericDrawTarget>(t: &mut T, frame: u32, icon: &pixels::Snapshot, scale: f64) {
+    let side = (400.0 * scale) as f32;
+    t.clear_rect(&rect(0.0, 0.0, side, side), identity());
+    let s = Transform2D::scale(scale, scale * 400.0 / 140.0);
+    t.fill_rect(&rect(0.0, 0.0, 400.0, 140.0), color(12, 14, 22, 0.85), normal(), s);
+    let health = 0.5 + 0.5 * (frame as f64 * 0.05).sin();
+    t.fill_rect(&rect(12.0, 52.0, 376.0, 18.0), color(40, 44, 60, 1.0), normal(), s);
+    let gradient = FillOrStrokeStyle::LinearGradient(LinearGradientStyle::new(
+        12.0,
+        0.0,
+        388.0,
+        0.0,
+        vec![stop(0.0, 220, 40, 40, 1.0), stop(1.0, 250, 160, 60, 1.0)],
+    ));
+    t.fill_rect(&rect(12.0, 52.0, (376.0 * health) as f32, 18.0), gradient, normal(), s);
+    let score = format!("P1 {:06}", frame * 37);
+    t.fill_text(vec![text_run(&score, 12.0, 34.0, 24.0)], color(240, 230, 200, 1.0), normal(), s);
+    for slot in 0..6 {
+        let surface = t.create_source_surface_from_data(icon.clone()).expect("icon");
+        t.draw_surface(surface, frect(12.0 + slot as f64 * 34.0, 106.0, 28.0, 28.0), frect(0.0, 0.0, 32.0, 32.0), Filter::Bilinear, normal(), s);
+    }
+}
+
 #[test]
 #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
 fn gpu_bench() {

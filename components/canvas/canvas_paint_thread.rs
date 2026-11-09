@@ -350,11 +350,59 @@ impl Canvas {
         {
             #[cfg(feature = "vello")]
             "vello" => Some(Self::Vello(CanvasData::new(size, paint_api))),
-            "gpu" if crate::vello_gpu_backend::available() => {
-                Some(Self::VelloGpu(CanvasData::new(size, paint_api)))
-            },
+            "gpu" if Self::wants_gpu(size) => Some(Self::VelloGpu(CanvasData::new(size, paint_api))),
             _ => Some(Self::VelloCPU(CanvasData::new(size, paint_api))),
         }
+    }
+
+    /// Loom: under the `gpu` backend, whether a canvas of `size` belongs on the GPU.
+    fn wants_gpu(size: Size2D<u64>) -> bool {
+        let min_pixels = servo_config::pref!(dom_canvas_gpu_min_pixels).max(0) as u64;
+        size.area() >= min_pixels && crate::vello_gpu_backend::available()
+    }
+
+    /// Loom: on resize under the `gpu` backend, move a canvas between the GPU and CPU backends
+    /// when it crosses `dom_canvas_gpu_min_pixels`. Returns whether it moved (and was reset).
+    fn switch_backend_for(&mut self, size: Option<Size2D<u64>>) -> bool {
+        if servo_config::pref!(dom_canvas_backend).to_lowercase() != "gpu" {
+            return false;
+        }
+        let (current_size, is_gpu) = match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(_) => return false,
+            Canvas::VelloCPU(canvas_data) => (canvas_data.size(), false),
+            Canvas::VelloGpu(canvas_data) => (canvas_data.size(), true),
+        };
+        let size = size.unwrap_or(current_size);
+        if Self::wants_gpu(size) == is_gpu {
+            return false;
+        }
+        let (image_key, paint_api) = match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(_) => unreachable!(),
+            Canvas::VelloCPU(canvas_data) => (canvas_data.take_image_key(), canvas_data.paint_api()),
+            Canvas::VelloGpu(canvas_data) => (canvas_data.take_image_key(), canvas_data.paint_api()),
+        };
+        *self = if is_gpu {
+            Canvas::VelloCPU(CanvasData::new(size, paint_api))
+        } else {
+            Canvas::VelloGpu(CanvasData::new(size, paint_api))
+        };
+        if let Some(image_key) = image_key {
+            match self {
+                #[cfg(feature = "vello")]
+                Canvas::Vello(_) => unreachable!(),
+                Canvas::VelloCPU(canvas_data) => {
+                    canvas_data.adopt_image_key(image_key);
+                    canvas_data.update_image_rendering(None);
+                },
+                Canvas::VelloGpu(canvas_data) => {
+                    canvas_data.adopt_image_key(image_key);
+                    canvas_data.update_image_rendering(None);
+                },
+            }
+        }
+        true
     }
 
     fn collect_memory_report(
@@ -693,6 +741,9 @@ impl Canvas {
     }
 
     fn recreate(&mut self, size: Option<Size2D<u64>>) {
+        if self.switch_backend_for(size) {
+            return;
+        }
         match self {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.recreate(size),

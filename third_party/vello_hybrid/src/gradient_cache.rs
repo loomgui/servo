@@ -14,10 +14,18 @@ use vello_common::peniko::color::cache_key::CacheKey;
 /// This constant is used to convert between byte offsets and texel indices.
 const BYTES_PER_TEXEL: u32 = 4;
 
+/// Loom: renders a ramp survives without being used. Content that animates gradient colors
+/// (alpha fades, color cycling) creates new ramps every frame and never reuses old ones; keeping
+/// them until the count cap made every frame compact and re-upload megabytes of ramps. A few
+/// renders still cover several canvases that share one renderer.
+const LOOM_KEEP_RENDERS: u64 = 8;
+
 #[derive(Debug)]
 pub(crate) struct GradientRampCache {
-    /// Current epoch for LRU tracking.
+    /// Current epoch for LRU tracking: Loom counts renders (`maintain` calls), not lookups.
     epoch: u64,
+    /// Loom: first byte of `luts` changed since the last sync (`usize::MAX` when clean).
+    dirty_from: usize,
     /// Cache mapping gradient signature to cached ramps and last access time.
     cache: HashMap<CacheKey<GradientCacheKey>, (CachedRamp, u64)>,
     /// Packed gradient luts.
@@ -58,6 +66,7 @@ impl GradientRampCache {
     pub(crate) fn new(retained_count: u32, level: Level) -> Self {
         Self {
             epoch: 0,
+            dirty_from: usize::MAX,
             cache: HashMap::new(),
             luts: Vec::new(),
             has_changed: false,
@@ -73,8 +82,6 @@ impl GradientRampCache {
         reason = "Conversion from usize to u32 is safe, used for texture coordinates"
     )]
     pub(crate) fn get_or_create_ramp(&mut self, gradient: &EncodedGradient) -> (u32, u32) {
-        self.epoch += 1;
-
         // Check if we already have this gradient cached.
         if let Some((cached_ramp, last_used)) = self.cache.get_mut(&gradient.cache_key) {
             *last_used = self.epoch;
@@ -82,6 +89,7 @@ impl GradientRampCache {
         }
 
         // Generate new gradient LUT.
+        self.dirty_from = self.dirty_from.min(self.luts.len());
         let lut_start = self.luts.len() as u32 / BYTES_PER_TEXEL;
         let width = dispatch!(self.level, simd => generate_gradient_lut_impl(simd, gradient, &mut self.luts))
             as u32;
@@ -93,13 +101,26 @@ impl GradientRampCache {
         (lut_start, width)
     }
 
-    /// Maintain the gradient cache by evicting old entries.
+    /// Maintain the gradient cache by evicting old entries. Called once per render.
     pub(crate) fn maintain(&mut self) {
-        let entries_to_remove_count = self
+        // Loom: drop ramps that recent renders did not use, then enforce the count cap.
+        let stale_before = self.epoch.saturating_sub(LOOM_KEEP_RENDERS - 1);
+        let stale = self
+            .cache
+            .values()
+            .filter(|(_, last_used)| *last_used < stale_before)
+            .count();
+        let over_cap = self
             .cache
             .len()
             .saturating_sub(self.retained_count as usize);
-        self.evict(entries_to_remove_count);
+        self.evict(stale.max(over_cap));
+        self.epoch += 1;
+    }
+
+    /// Loom: first byte of the packed luts that changed since the last sync.
+    pub(crate) fn dirty_from(&self) -> usize {
+        self.dirty_from.min(self.luts.len())
     }
 
     /// Get the size of the packed luts.
@@ -120,6 +141,7 @@ impl GradientRampCache {
     /// Mark the luts as synced.
     pub(crate) fn mark_synced(&mut self) {
         self.has_changed = false;
+        self.dirty_from = usize::MAX;
     }
 
     /// Take ownership of the luts, leaving an empty vector in its place.
@@ -197,6 +219,10 @@ impl GradientRampCache {
         // See comment in `remove_lru_entries`, the entries are not sorted yet but need to be
         // for the prefix sum to work correctly.
         ramps_to_remove.sort_by_key(|(_, ramp)| ramp.lut_start);
+        // Loom: everything from the first removed ramp moves.
+        self.dirty_from = self
+            .dirty_from
+            .min((ramps_to_remove[0].1.lut_start * BYTES_PER_TEXEL) as usize);
 
         // Compute a prefix sum of how much the `lut_start` entry of a given cached ramp needs
         // to be adjusted to account for compaction.

@@ -1677,16 +1677,21 @@ impl WebGlPrograms {
         let gradient_texture_height = self.resources.gradient_texture_height;
 
         // Take ownership of the luts to avoid copying, then pad to whole texels.
+        let dirty_texel = gradient_cache.dirty_from() / 4;
         let mut luts = gradient_cache.take_luts();
         let old_luts_len = luts.len();
         luts.resize(old_luts_len.div_ceil(4) * 4, 0);
 
-        // Loom: upload only the ramps, without reallocating the texture.
-        upload_texels(
+        // Loom: upload only the ramps that changed since the last upload (a newly allocated
+        // texture gets everything), without reallocating the texture.
+        let reallocates = self.resources.gradient_texture_allocated < gradient_texture_height;
+        let first_texel = if reallocates { 0 } else { dirty_texel };
+        upload_texels_from(
             gl,
             &self.resources.gradient_texture,
             TexelFormat::RGBA8,
             &luts,
+            first_texel,
             gradient_texture_width,
             gradient_texture_height,
             &mut self.resources.gradient_texture_allocated,
@@ -3608,6 +3613,21 @@ fn upload_texels(
     height: u32,
     allocated: &mut u32,
 ) {
+    upload_texels_from(gl, texture, format, data, 0, width, height, allocated);
+}
+
+/// Loom: like `upload_texels`, but only uploads texels from `first_texel` on.
+#[allow(clippy::too_many_arguments, reason = "GL upload parameters")]
+fn upload_texels_from(
+    gl: &WebGl2RenderingContext,
+    texture: &WebGlTexture,
+    format: TexelFormat,
+    data: &[u8],
+    first_texel: usize,
+    width: u32,
+    height: u32,
+    allocated: &mut u32,
+) {
     use glow::HasContext;
     let glow = gl.glow();
     let (internal_format, pixel_format, ty) = format.gl();
@@ -3615,6 +3635,7 @@ fn upload_texels(
     debug_assert_eq!(data.len() % texel_bytes, 0, "upload_texels takes whole texels");
     let texels = data.len() / texel_bytes;
     let width_texels = width as usize;
+    let first_texel = first_texel.min(texels);
     // SAFETY: plain GL calls on the renderer's current context; GL copies client memory before
     // returning.
     unsafe {
@@ -3634,34 +3655,36 @@ fn upload_texels(
             );
             *allocated = height;
         }
-        let full_rows = texels / width_texels;
-        let remainder = texels % width_texels;
-        if full_rows > 0 {
+        // Up to three uploads: the rest of `first_texel`'s row, the full rows after it, and the
+        // final partial row.
+        let mut texel = first_texel;
+        let upload = |x: usize, y: usize, w: usize, h: usize, start: usize| {
+            let bytes = &data[start * texel_bytes..(start + w * h) * texel_bytes];
             glow.tex_sub_image_2d(
                 glow::TEXTURE_2D,
                 0,
-                0,
-                0,
-                width as i32,
-                full_rows as i32,
+                x as i32,
+                y as i32,
+                w as i32,
+                h as i32,
                 pixel_format,
                 ty,
-                glow::PixelUnpackData::Slice(Some(&data[..full_rows * width_texels * texel_bytes])),
+                glow::PixelUnpackData::Slice(Some(bytes)),
             );
+        };
+        let head = texel % width_texels;
+        if head != 0 {
+            let w = (width_texels - head).min(texels - texel);
+            upload(head, texel / width_texels, w, 1, texel);
+            texel += w;
         }
-        if remainder > 0 {
-            let start = full_rows * width_texels * texel_bytes;
-            glow.tex_sub_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                0,
-                full_rows as i32,
-                remainder as i32,
-                1,
-                pixel_format,
-                ty,
-                glow::PixelUnpackData::Slice(Some(&data[start..start + remainder * texel_bytes])),
-            );
+        let full_rows = (texels - texel) / width_texels;
+        if full_rows > 0 {
+            upload(0, texel / width_texels, width_texels, full_rows, texel);
+            texel += full_rows * width_texels;
+        }
+        if texel < texels {
+            upload(0, texel / width_texels, texels - texel, 1, texel);
         }
     }
 }
