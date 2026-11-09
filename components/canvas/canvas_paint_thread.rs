@@ -350,7 +350,9 @@ impl Canvas {
         {
             #[cfg(feature = "vello")]
             "vello" => Some(Self::Vello(CanvasData::new(size, paint_api))),
-            "gpu" if Self::wants_gpu(size) => Some(Self::VelloGpu(CanvasData::new(size, paint_api))),
+            "gpu" if Self::wants_gpu(size) => {
+                Some(Self::VelloGpu(CanvasData::new(size, paint_api)))
+            },
             _ => Some(Self::VelloCPU(CanvasData::new(size, paint_api))),
         }
     }
@@ -380,8 +382,12 @@ impl Canvas {
         let (image_key, paint_api) = match self {
             #[cfg(feature = "vello")]
             Canvas::Vello(_) => unreachable!(),
-            Canvas::VelloCPU(canvas_data) => (canvas_data.take_image_key(), canvas_data.paint_api()),
-            Canvas::VelloGpu(canvas_data) => (canvas_data.take_image_key(), canvas_data.paint_api()),
+            Canvas::VelloCPU(canvas_data) => {
+                (canvas_data.take_image_key(), canvas_data.paint_api())
+            },
+            Canvas::VelloGpu(canvas_data) => {
+                (canvas_data.take_image_key(), canvas_data.paint_api())
+            },
         };
         *self = if is_gpu {
             Canvas::VelloCPU(CanvasData::new(size, paint_api))

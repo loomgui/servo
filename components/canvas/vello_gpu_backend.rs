@@ -59,7 +59,7 @@ use webrender_api::{
 
 use crate::backend::{CanvasStoreSizesPerType, Convert, GenericDrawTarget};
 use crate::canvas_data::Filter;
-use crate::vello_cpu_backend::{paint, snapshot_as_pixmap};
+use crate::vello_cpu_backend::{paint, shadow_filter, snapshot_as_pixmap};
 
 /// Texture binding id used to draw retained content back into a scene.
 const RETAINED_TEXTURE: TextureId = TextureId(1);
@@ -295,7 +295,10 @@ impl GpuThread {
             id = self.try_upload(pixmap);
         }
         let Some(id) = id else {
-            warn_once(&WARNED_IMAGE, "the image atlas is full; skipping an image draw");
+            warn_once(
+                &WARNED_IMAGE,
+                "the image atlas is full; skipping an image draw",
+            );
             return None;
         };
         uploads.bytes += bytes;
@@ -461,15 +464,15 @@ impl Gpu {
         let Some(swap_chain) = thread.shared.swap_chains.get(self.image_id) else {
             return;
         };
-        let surface_texture =
-            match swap_chain.take_surface_texture(&thread.device, &mut thread.context.borrow_mut())
-            {
-                Ok(surface_texture) => surface_texture,
-                Err(error) => {
-                    warn!("GPU canvas: could not take the back buffer: {error:?}");
-                    return;
-                },
-            };
+        let surface_texture = match swap_chain
+            .take_surface_texture(&thread.device, &mut thread.context.borrow_mut())
+        {
+            Ok(surface_texture) => surface_texture,
+            Err(error) => {
+                warn!("GPU canvas: could not take the back buffer: {error:?}");
+                return;
+            },
+        };
         let target = thread.device.surface_gl_texture_target();
         if let Some(texture) = thread.device.surface_texture_object(&surface_texture) {
             thread
@@ -614,6 +617,8 @@ pub(crate) struct VelloGpuDrawTarget {
     draws_retained: bool,
     /// Cached uploads the pending scene samples; unpinned after the next rasterization.
     pinned_uploads: Vec<UploadKey>,
+    /// Open shadow (filter) layers: draws inside them do not target the canvas directly.
+    shadow_depth: u32,
 }
 
 impl VelloGpuDrawTarget {
@@ -630,7 +635,8 @@ impl VelloGpuDrawTarget {
         // `lighter` is plain additive blending. Outside clip layers it can blend straight into
         // the canvas instead of through a layer per draw (two GPU passes each).
         if composition_operation == CompositionOrBlending::Composition(CompositionStyle::Lighter) &&
-            self.clips.is_empty()
+            self.clips.is_empty() &&
+            self.shadow_depth == 0
         {
             self.scene.set_additive(true);
             f(self);
@@ -720,7 +726,10 @@ impl VelloGpuDrawTarget {
     /// `None` for images the atlas cannot hold.
     fn upload_image(&mut self, pixmap: &vello_cpu::Pixmap) -> Option<ImageId> {
         if pixmap.width() > MAX_ATLAS_IMAGE_SIDE || pixmap.height() > MAX_ATLAS_IMAGE_SIDE {
-            warn_once(&WARNED_IMAGE, "images larger than 4096 px are not drawn yet");
+            warn_once(
+                &WARNED_IMAGE,
+                "images larger than 4096 px are not drawn yet",
+            );
             return None;
         }
         let (key, id) = self.gpu.thread.pin_upload(pixmap)?;
@@ -792,6 +801,7 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
             clear_next: true,
             draws_retained: false,
             pinned_uploads: Vec::new(),
+            shadow_depth: 0,
         };
         // Publish a transparent first frame so WebRender always has a surface to sample.
         target.flush();
@@ -915,6 +925,20 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
         })
     }
 
+    fn push_shadow(&mut self, shadow: &ShadowOptions) -> bool {
+        self.ensure_drawing();
+        self.scene.set_transform(kurbo::Affine::IDENTITY);
+        self.scene
+            .push_layer(None, None, None, None, Some(shadow_filter(shadow)));
+        self.shadow_depth += 1;
+        true
+    }
+
+    fn pop_shadow(&mut self) {
+        self.scene.pop_layer();
+        self.shadow_depth -= 1;
+    }
+
     fn draw_surface_with_shadow(
         &self,
         _surface: Self::SourceSurface,
@@ -957,8 +981,7 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
         let Some(paint) = self.paint(style, composition_options.alpha) else {
             return;
         };
-        self.scene
-            .set_paint(paint);
+        self.scene.set_paint(paint);
         self.scene.set_transform(transform.cast().into());
         let thread = self.gpu.thread.clone();
         self.with_composition(composition_options.composition_operation, |self_| {
@@ -1055,8 +1078,7 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
         let Some(paint) = self.paint(style, composition_options.alpha) else {
             return;
         };
-        self.scene
-            .set_paint(paint);
+        self.scene.set_paint(paint);
         self.scene.set_stroke(line_options.convert());
         self.scene.set_transform(transform.cast().into());
         let thread = self.gpu.thread.clone();

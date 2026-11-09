@@ -291,6 +291,17 @@ impl GenericDrawTarget for VelloCPUDrawTarget {
         })
     }
 
+    fn push_shadow(&mut self, shadow: &ShadowOptions) -> bool {
+        self.ensure_drawing();
+        self.ctx.set_transform(kurbo::Affine::IDENTITY);
+        self.ctx.push_filter_layer(shadow_filter(shadow));
+        true
+    }
+
+    fn pop_shadow(&mut self) {
+        self.ctx.pop_layer();
+    }
+
     fn draw_surface_with_shadow(
         &self,
         _surface: Self::SourceSurface,
@@ -528,6 +539,19 @@ impl GenericDrawTarget for VelloCPUDrawTarget {
     fn create_source_surface_from_data(&self, data: Snapshot) -> Option<Self::SourceSurface> {
         Some(snapshot_as_pixmap(data))
     }
+}
+
+/// Loom: a canvas shadow as a `vello` drop-shadow filter. Offsets are in canvas pixels, unaffected
+/// by the current transform; the blur's standard deviation is half of `shadowBlur`.
+pub(crate) fn shadow_filter(shadow: &ShadowOptions) -> vello_hybrid::filter_effects::Filter {
+    use vello_hybrid::filter_effects::{EdgeMode, Filter, FilterPrimitive};
+    Filter::from_primitive(FilterPrimitive::DropShadow {
+        dx: shadow.offset_x as f32,
+        dy: shadow.offset_y as f32,
+        std_deviation: (shadow.blur / 2.0) as f32,
+        color: shadow.color.convert(),
+        edge_mode: EdgeMode::None,
+    })
 }
 
 pub(crate) fn snapshot_as_pixmap(mut snapshot: Snapshot) -> Arc<vello_cpu::Pixmap> {
