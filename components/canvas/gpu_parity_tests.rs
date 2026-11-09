@@ -145,12 +145,39 @@ pub(crate) fn compare_pixels(cpu: &[u8], gpu: &[u8]) -> Comparison {
     }
 }
 
+/// The GPU canvas backend runs only on OpenGL ES (ANGLE on Windows). On desktop GL, such as CGL
+/// on macOS, it must report itself unavailable so canvases use the CPU backend.
+fn gpu_canvas_unsupported_platform() -> bool {
+    surfman::Connection::new()
+        .map(|connection| connection.gl_api() != surfman::GLApi::GLES)
+        .unwrap_or(false)
+}
+
+#[test]
+fn unsupported_gl_falls_back_to_cpu_without_panicking() {
+    let result = on_gpu_thread(|| {
+        let available = crate::vello_gpu_backend::available();
+        let created = VelloGpuDrawTarget::try_new(Size2D::new(64, 64)).is_some();
+        vec![available as u8, created as u8]
+    });
+    let expected = if gpu_canvas_unsupported_platform() {
+        vec![0, 0]
+    } else {
+        vec![1, 1]
+    };
+    assert_eq!(result, expected, "[available, created]");
+}
+
 fn run_parity(
     name: &str,
     size: Size2D<u32>,
     cpu_scene: fn(&mut VelloCPUDrawTarget),
     gpu_scene: fn(&mut VelloGpuDrawTarget),
 ) {
+    if gpu_canvas_unsupported_platform() {
+        eprintln!("{name}: skipped; the GPU canvas backend needs OpenGL ES");
+        return;
+    }
     let mut cpu = VelloCPUDrawTarget::new(size);
     cpu_scene(&mut cpu);
     let cpu = cpu.snapshot();
@@ -1278,6 +1305,10 @@ parity!(recreate_and_resize, 100, 80, |t| {
 /// released, and the GPU must keep up (no exhausted contexts or surfaces).
 #[test]
 fn gpu_lifetime_stress() {
+    if gpu_canvas_unsupported_platform() {
+        eprintln!("gpu_lifetime_stress: skipped; the GPU canvas backend needs OpenGL ES");
+        return;
+    }
     on_gpu_thread(|| {
         let shared = paint_api::gpu_canvas_shared().expect("published");
         let mut ids = Vec::new();
@@ -1333,6 +1364,10 @@ fn gpu_lifetime_stress() {
 /// GPU memory shared by a thread's canvases shows up in memory reports once images are cached.
 #[test]
 fn gpu_memory_report() {
+    if gpu_canvas_unsupported_platform() {
+        eprintln!("gpu_memory_report: skipped; the GPU canvas backend needs OpenGL ES");
+        return;
+    }
     on_gpu_thread(|| {
         let mut target = VelloGpuDrawTarget::new(Size2D::new(64, 64));
         draw_image(

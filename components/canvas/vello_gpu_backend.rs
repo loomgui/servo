@@ -44,7 +44,7 @@ use servo_canvas_traits::canvas::{
 };
 use surfman::chains::SwapChainsAPI;
 use surfman::{
-    Context, ContextAttributeFlags, ContextAttributes, Device, GLVersion, SurfaceAccess,
+    Context, ContextAttributeFlags, ContextAttributes, Device, GLApi, GLVersion, SurfaceAccess,
     SurfaceType,
 };
 use vello_cpu::{kurbo, peniko};
@@ -232,6 +232,15 @@ impl GpuThread {
             .surfman_details
             .any()
             .ok_or("no painter surfman details")?;
+        // vello_hybrid's WebGL renderer needs an OpenGL ES 3.0 context: its shaders are GLSL ES
+        // 3.00 and it asserts on GLES-only queries. Desktop GL (CGL on macOS) is not supported,
+        // so report it as unavailable instead of letting the renderer panic this thread.
+        let gl_api = details.connection.gl_api();
+        if gl_api != GLApi::GLES {
+            return Err(format!(
+                "the GPU canvas needs an OpenGL ES context; this surfman connection is {gl_api:?}"
+            ));
+        }
         let device = details
             .connection
             .create_device(&details.adapter)
@@ -272,9 +281,33 @@ impl GpuThread {
         let glow = unsafe {
             glow::Context::from_loader_function(|symbol| device.get_proc_address(&context, symbol))
         };
-        let copy_framebuffer = unsafe { glow.create_framebuffer()? };
+        let copy_framebuffer = match unsafe { glow.create_framebuffer() } {
+            Ok(framebuffer) => framebuffer,
+            Err(error) => {
+                let _ = device.destroy_context(&mut context);
+                return Err(error);
+            },
+        };
         let gl = WebGl2RenderingContext::from_glow(glow, 1, 1);
-        let (renderer, resources) = WebGlRenderer::new(gl.clone());
+        // The renderer panics rather than returning errors (shader compilation, link and
+        // capability checks). Contain that here so a driver that cannot run it falls back to the
+        // CPU backend instead of killing the canvas thread.
+        let renderer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            WebGlRenderer::new(gl.clone())
+        }));
+        let (renderer, resources) = match renderer {
+            Ok(renderer) => renderer,
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                unsafe { gl.glow().delete_framebuffer(copy_framebuffer) };
+                let _ = device.destroy_context(&mut context);
+                return Err(format!("renderer: {message}"));
+            },
+        };
         Ok(Self {
             device,
             context: std::mem::ManuallyDrop::new(RefCell::new(context)),
