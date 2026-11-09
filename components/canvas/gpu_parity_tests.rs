@@ -19,6 +19,8 @@
 use std::path::PathBuf;
 use std::sync::Once;
 
+use surfman::chains::SwapChainsAPI;
+
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
 use fonts::{FontData, FontDataAndIndex, FontIdentifier};
 use paint_api::{
@@ -750,6 +752,52 @@ parity!(many_sprites, 256, 192, |t| {
         draw_image(t, sprite.clone(), dest, Filter::Bilinear, options, identity());
     }
 });
+
+// ---- recreate, resize, lifetime ----------------------------------------------------------
+
+parity!(recreate_and_resize, 100, 80, |t| {
+    // `CanvasData::recreate` swaps in a similar target: on resize and on context reset.
+    t.fill_rect(&rect(0.0, 0.0, 100.0, 80.0), color(200, 30, 30, 1.0), normal(), identity());
+    let _ = t.snapshot();
+    *t = t.create_similar_draw_target(&Size2D::new(40, 30));
+    t.fill_rect(&rect(0.0, 0.0, 40.0, 30.0), color(30, 200, 30, 1.0), normal(), identity());
+    let _ = t.snapshot();
+    *t = t.create_similar_draw_target(&Size2D::new(100, 80));
+    t.fill(&circle(50.0, 40.0, 30.0), FillRule::Nonzero, color(30, 30, 200, 0.8), normal(), identity());
+});
+
+/// Create, draw, present and drop many canvases: every swap chain and external image id must be
+/// released, and the GPU must keep up (no exhausted contexts or surfaces).
+#[test]
+fn gpu_lifetime_stress() {
+    on_gpu_thread(|| {
+        let shared = paint_api::gpu_canvas_shared().expect("published");
+        let mut ids = Vec::new();
+        let mut alive = std::collections::VecDeque::new();
+        for i in 0..300_u32 {
+            let size = Size2D::new(16 + (i % 7) * 40, 16 + (i % 5) * 30);
+            let mut target = VelloGpuDrawTarget::new(size);
+            target.fill_rect(&rect(0.0, 0.0, 10.0, 10.0), color(255, 0, 0, 1.0), normal(), identity());
+            let surface = target.create_source_surface_from_data(test_image(8, 8)).unwrap();
+            target.draw_surface(surface, frect(2.0, 2.0, 12.0, 12.0), frect(0.0, 0.0, 8.0, 8.0), Filter::Bilinear, normal(), identity());
+            let _ = target.image_descriptor_and_serializable_data();
+            let id = target.external_image_id();
+            assert!(shared.swap_chains.get(id).is_some(), "live canvas has a swap chain");
+            ids.push(id);
+            // Keep a few alive at once, like a page with several canvases.
+            alive.push_back(target);
+            if alive.len() > 4 {
+                alive.pop_front();
+            }
+        }
+        alive.clear();
+        for id in ids {
+            assert!(shared.swap_chains.get(id).is_none(), "swap chain {id:?} leaked");
+            assert!(shared.external_image_id_manager.get(&id).is_none(), "image id {id:?} leaked");
+        }
+        vec![1]
+    });
+}
 
 // ---- realistic workloads -------------------------------------------------------------------
 

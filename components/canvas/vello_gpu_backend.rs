@@ -9,10 +9,11 @@
 //! on the same adapter as WebRender. The surface is handed to WebRender as an external texture
 //! through a swap chain, so no canvas pixels are copied through CPU memory per update.
 //!
-//! Each canvas owns one GLES 3.0 context with an attached swap chain (the same model as WebGL).
-//! Content persists across updates: every rendered frame is copied on the GPU into a retained
-//! texture, which is drawn back as the background when later draws are not preceded by a
-//! full-canvas clear.
+//! All GPU canvases on a canvas thread share one GLES 3.0 context, one `vello_hybrid` renderer
+//! (its shader programs take about half a second to compile under ANGLE) and one image atlas. Each
+//! canvas owns a swap chain on that context and a retained texture. Content persists across
+//! updates: every rendered frame is copied on the GPU into the retained texture, which is drawn
+//! back as the background when later draws are not preceded by a full-canvas clear.
 //!
 //! Images (`drawImage`, `putImageData`, patterns) are uploaded into `vello_hybrid`'s image atlas
 //! for the next rasterization and released right after it.
@@ -63,11 +64,6 @@ const RETAINED_TEXTURE: TextureId = TextureId(1);
 /// Largest image side the renderer's atlas pages hold (`AtlasConfig::default().atlas_size`).
 const MAX_ATLAS_IMAGE_SIDE: u16 = 4096;
 
-thread_local! {
-    /// One surfman device per canvas thread, on the same adapter as WebRender.
-    static DEVICE: RefCell<Option<Rc<Device>>> = const { RefCell::new(None) };
-}
-
 fn warn_once(flag: &'static std::thread::LocalKey<Cell<bool>>, message: &str) {
     flag.with(|warned| {
         if !warned.replace(true) {
@@ -114,56 +110,72 @@ fn glyphs(text_run: &TextRun) -> impl Iterator<Item = vello_cpu::Glyph> + Clone 
 /// Whether GPU canvases can be created on this thread. Selecting the backend calls this first so
 /// that any failure falls back to the CPU backend instead of panicking later.
 pub(crate) fn available() -> bool {
-    device().is_some()
+    GpuThread::get().is_some()
 }
 
 fn shared() -> Option<&'static GpuCanvasShared> {
     paint_api::gpu_canvas_shared()
 }
 
-fn device() -> Option<Rc<Device>> {
-    DEVICE.with(|slot| {
-        if let Some(device) = slot.borrow().as_ref() {
-            return Some(device.clone());
-        }
-        let details = shared()?.surfman_details.any()?;
-        let device = match details.connection.create_device(&details.adapter) {
-            Ok(device) => Rc::new(device),
-            Err(error) => {
-                warn!("GPU canvas: could not open a surfman device: {error:?}");
-                return None;
-            },
-        };
-        *slot.borrow_mut() = Some(device.clone());
-        Some(device)
-    })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum State {
-    /// The scene holds commands that have not been rasterized yet.
-    Drawing,
-    /// The scene was rasterized; the retained texture holds the canvas content.
-    Rendered,
-}
-
-/// Per-canvas GL resources.
-struct Gpu {
-    device: Rc<Device>,
-    context: Option<Context>,
+/// GL state shared by every GPU canvas on a canvas thread: a surfman device and context on
+/// WebRender's adapter, one `vello_hybrid` renderer and its resources (image and glyph atlases,
+/// gradient ramps). Canvases own only a swap chain on this context and a retained texture. Before
+/// a canvas renders, its swap chain takes the context's surface attachment; a 1×1 anchor swap
+/// chain holds the attachment while no canvas does.
+struct GpuThread {
+    device: Device,
+    /// Never dropped: this lives until the canvas thread exits, and tearing down EGL objects from
+    /// thread-exit callbacks can deadlock ANGLE.
+    context: std::mem::ManuallyDrop<RefCell<Context>>,
     gl: WebGl2RenderingContext,
-    renderer: WebGlRenderer,
-    resources: Resources,
-    image_id: ExternalImageId,
-    /// Copy of the last rendered frame, drawn back when content must be retained.
-    retained: glow::NativeTexture,
+    renderer: RefCell<WebGlRenderer>,
+    resources: RefCell<Resources>,
     shared: &'static GpuCanvasShared,
+    anchor: ExternalImageId,
+    /// The swap chain whose back buffer is bound to the context.
+    attached: Cell<ExternalImageId>,
 }
 
-impl Gpu {
-    fn new(size: Size2D<u32>) -> Result<Self, String> {
+thread_local! {
+    static GPU_THREAD: RefCell<Option<Rc<GpuThread>>> = const { RefCell::new(None) };
+    /// GPU setup failed on this thread; canvases use the CPU backend.
+    static GPU_FAILED: Cell<bool> = const { Cell::new(false) };
+}
+
+impl GpuThread {
+    fn get() -> Option<Rc<Self>> {
+        if GPU_FAILED.with(Cell::get) {
+            return None;
+        }
+        GPU_THREAD.with(|slot| {
+            if let Some(gpu) = slot.borrow().as_ref() {
+                return Some(gpu.clone());
+            }
+            match Self::new() {
+                Ok(gpu) => {
+                    let gpu = Rc::new(gpu);
+                    *slot.borrow_mut() = Some(gpu.clone());
+                    Some(gpu)
+                },
+                Err(error) => {
+                    warn!("GPU canvas: using the CPU backend: {error}");
+                    GPU_FAILED.with(|failed| failed.set(true));
+                    None
+                },
+            }
+        })
+    }
+
+    fn new() -> Result<Self, String> {
         let shared = shared().ok_or("GPU canvas state was not published")?;
-        let device = device().ok_or("no surfman device")?;
+        let details = shared
+            .surfman_details
+            .any()
+            .ok_or("no painter surfman details")?;
+        let device = details
+            .connection
+            .create_device(&details.adapter)
+            .map_err(|e| format!("device: {e:?}"))?;
         let attributes = ContextAttributes {
             version: GLVersion::new(3, 0),
             flags: ContextAttributeFlags::ALPHA |
@@ -176,34 +188,129 @@ impl Gpu {
         let mut context = device
             .create_context(&descriptor, None)
             .map_err(|e| format!("context: {e:?}"))?;
-        let surface = device
-            .create_surface(
-                &context,
-                SurfaceAccess::GPUOnly,
-                SurfaceType::Generic {
-                    size: size.cast(),
-                },
-            )
-            .map_err(|e| format!("surface: {e:?}"))?;
-        device
-            .bind_surface_to_context(&mut context, surface)
-            .map_err(|(e, _)| format!("bind surface: {e:?}"))?;
-        device
-            .make_context_current(&context)
-            .map_err(|e| format!("make current: {e:?}"))?;
-
-        let image_id = shared
+        let anchor = shared
             .external_image_id_manager
             .clone()
             .next_id(WebRenderImageHandlerType::Canvas2d);
-        shared
-            .swap_chains
-            .create_attached_swap_chain(image_id, &device, &mut context, SurfaceAccess::GPUOnly)
-            .map_err(|e| format!("swap chain: {e:?}"))?;
-
+        let setup = (|| {
+            let surface = device
+                .create_surface(
+                    &context,
+                    SurfaceAccess::GPUOnly,
+                    SurfaceType::Generic {
+                        size: Size2D::new(1, 1),
+                    },
+                )
+                .map_err(|e| format!("surface: {e:?}"))?;
+            device
+                .bind_surface_to_context(&mut context, surface)
+                .map_err(|(e, _)| format!("bind surface: {e:?}"))?;
+            device
+                .make_context_current(&context)
+                .map_err(|e| format!("make current: {e:?}"))?;
+            shared
+                .swap_chains
+                .create_attached_swap_chain(anchor, &device, &mut context, SurfaceAccess::GPUOnly)
+                .map_err(|e| format!("swap chain: {e:?}"))
+        })();
+        if let Err(error) = setup {
+            let _ = device.destroy_context(&mut context);
+            shared.external_image_id_manager.clone().remove(&anchor);
+            return Err(error);
+        }
         let glow = unsafe {
             glow::Context::from_loader_function(|symbol| device.get_proc_address(&context, symbol))
         };
+        let gl = WebGl2RenderingContext::from_glow(glow, 1, 1);
+        let (renderer, resources) = WebGlRenderer::new(gl.clone());
+        Ok(Self {
+            device,
+            context: std::mem::ManuallyDrop::new(RefCell::new(context)),
+            gl,
+            renderer: RefCell::new(renderer),
+            resources: RefCell::new(resources),
+            shared,
+            anchor,
+            attached: Cell::new(anchor),
+        })
+    }
+
+    fn make_current(&self) {
+        if let Err(error) = self.device.make_context_current(&self.context.borrow()) {
+            warn!("GPU canvas: make current failed: {error:?}");
+        }
+    }
+
+    /// Bind the back buffer of `id`'s swap chain to the context.
+    fn attach(&self, id: ExternalImageId) -> bool {
+        let current = self.attached.get();
+        if current == id {
+            return true;
+        }
+        let (Some(chain), Some(current_chain)) = (
+            self.shared.swap_chains.get(id),
+            self.shared.swap_chains.get(current),
+        ) else {
+            warn!("GPU canvas: missing swap chain for {id:?} or {current:?}");
+            return false;
+        };
+        match chain.take_attachment_from(
+            &self.device,
+            &mut self.context.borrow_mut(),
+            &current_chain,
+        ) {
+            Ok(()) => {
+                self.attached.set(id);
+                true
+            },
+            Err(error) => {
+                warn!("GPU canvas: could not attach {id:?}: {error:?}");
+                false
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum State {
+    /// The scene holds commands that have not been rasterized yet.
+    Drawing,
+    /// The scene was rasterized; the retained texture holds the canvas content.
+    Rendered,
+}
+
+/// Per-canvas GL resources: a swap chain on the thread's context and the retained frame.
+struct Gpu {
+    thread: Rc<GpuThread>,
+    image_id: ExternalImageId,
+    /// Copy of the last rendered frame, drawn back when content must be retained.
+    retained: glow::NativeTexture,
+}
+
+impl Gpu {
+    fn new(size: Size2D<u32>) -> Result<Self, String> {
+        let thread = GpuThread::get().ok_or("GPU canvases are unavailable on this thread")?;
+        thread.make_current();
+        let image_id = thread
+            .shared
+            .external_image_id_manager
+            .clone()
+            .next_id(WebRenderImageHandlerType::Canvas2d);
+        if let Err(error) = thread.shared.swap_chains.create_detached_swap_chain(
+            image_id,
+            size.cast(),
+            &thread.device,
+            &mut thread.context.borrow_mut(),
+            SurfaceAccess::GPUOnly,
+        ) {
+            thread
+                .shared
+                .external_image_id_manager
+                .clone()
+                .remove(&image_id);
+            return Err(format!("swap chain: {error:?}"));
+        }
+        let glow = thread.gl.glow();
         let retained = unsafe {
             let texture = glow.create_texture()?;
             glow.bind_texture(glow::TEXTURE_2D, Some(texture));
@@ -227,33 +334,23 @@ impl Gpu {
             glow.bind_texture(glow::TEXTURE_2D, None);
             texture
         };
-        let gl = WebGl2RenderingContext::from_glow(glow, size.width as i32, size.height as i32);
-        let (renderer, resources) = WebGlRenderer::new(gl.clone());
         Ok(Self {
-            device,
-            context: Some(context),
-            gl,
-            renderer,
-            resources,
+            thread,
             image_id,
             retained,
-            shared,
         })
     }
 
-    fn make_current(&self) {
-        if let Some(context) = self.context.as_ref() &&
-            let Err(error) = self.device.make_context_current(context)
-        {
-            warn!("GPU canvas: make current failed: {error:?}");
-        }
-    }
-
-    /// Rasterize `scene` into the context's current surface, keep a GPU copy of the result, and
-    /// publish the surface to WebRender.
+    /// Rasterize `scene` into this canvas's back buffer, keep a GPU copy of the result, and
+    /// publish the buffer to WebRender.
     fn render(&mut self, scene: &Scene, size: Size2D<u32>, clear: bool, draw_retained: bool) {
-        self.make_current();
-        self.gl
+        let thread = &self.thread;
+        thread.make_current();
+        if !thread.attach(self.image_id) {
+            return;
+        }
+        thread
+            .gl
             .set_drawing_buffer_size(size.width as i32, size.height as i32);
         let mut bindings = WebGlTextureBindings::new();
         if draw_retained {
@@ -263,13 +360,16 @@ impl Gpu {
             width: size.width,
             height: size.height,
         };
-        if let Err(error) =
-            self.renderer
-                .render_with_clear(scene, &mut self.resources, &render_size, &bindings, clear)
-        {
+        if let Err(error) = thread.renderer.borrow_mut().render_with_clear(
+            scene,
+            &mut thread.resources.borrow_mut(),
+            &render_size,
+            &bindings,
+            clear,
+        ) {
             warn!("GPU canvas: render failed: {error:?}");
         }
-        let glow = self.gl.glow();
+        let glow = thread.gl.glow();
         unsafe {
             // Retain this frame on the GPU before the surface moves to WebRender.
             glow.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
@@ -287,13 +387,10 @@ impl Gpu {
             glow.bind_texture(glow::TEXTURE_2D, None);
             glow.flush();
         }
-        let Some(context) = self.context.as_mut() else {
-            return;
-        };
-        if let Some(swap_chain) = self.shared.swap_chains.get(self.image_id) &&
+        if let Some(swap_chain) = thread.shared.swap_chains.get(self.image_id) &&
             let Err(error) = swap_chain.swap_buffers(
-                &self.device,
-                context,
+                &thread.device,
+                &mut thread.context.borrow_mut(),
                 surfman::chains::PreserveBuffer::No,
             )
         {
@@ -303,8 +400,8 @@ impl Gpu {
 
     /// Read the retained copy back as top-down premultiplied RGBA.
     fn read_retained(&self, size: Size2D<u32>) -> Vec<u8> {
-        self.make_current();
-        let glow = self.gl.glow();
+        self.thread.make_current();
+        let glow = self.thread.gl.glow();
         let (width, height) = (size.width as usize, size.height as usize);
         let mut pixels = vec![0_u8; width * height * 4];
         unsafe {
@@ -344,16 +441,19 @@ impl Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
-        self.make_current();
-        unsafe { self.gl.glow().delete_texture(self.retained) };
-        if let Some(mut context) = self.context.take() {
-            let _ = self
-                .shared
-                .swap_chains
-                .destroy(self.image_id, &self.device, &mut context);
-            let _ = self.device.destroy_context(&mut context);
+        let thread = &self.thread;
+        thread.make_current();
+        unsafe { thread.gl.glow().delete_texture(self.retained) };
+        if thread.attached.get() == self.image_id {
+            thread.attach(thread.anchor);
         }
-        self.shared
+        let _ = thread.shared.swap_chains.destroy(
+            self.image_id,
+            &thread.device,
+            &mut thread.context.borrow_mut(),
+        );
+        thread
+            .shared
             .external_image_id_manager
             .clone()
             .remove(&self.image_id);
@@ -470,8 +570,12 @@ impl VelloGpuDrawTarget {
             warn_once(&WARNED_IMAGE, "images larger than 4096 px are not drawn yet");
             return None;
         }
-        self.gpu.make_current();
-        let id = self.gpu.renderer.upload_image(&mut self.gpu.resources, pixmap);
+        let thread = &self.gpu.thread;
+        thread.make_current();
+        let id = thread
+            .renderer
+            .borrow_mut()
+            .upload_image(&mut thread.resources.borrow_mut(), pixmap);
         self.uploaded_images.push(id);
         Some(id)
     }
@@ -480,9 +584,12 @@ impl VelloGpuDrawTarget {
         if self.uploaded_images.is_empty() {
             return;
         }
-        self.gpu.make_current();
+        let thread = &self.gpu.thread;
+        thread.make_current();
+        let (mut renderer, mut resources) =
+            (thread.renderer.borrow_mut(), thread.resources.borrow_mut());
         for id in self.uploaded_images.drain(..) {
-            self.gpu.renderer.destroy_image(&mut self.gpu.resources, id);
+            renderer.destroy_image(&mut resources, id);
         }
     }
 
@@ -498,6 +605,12 @@ impl VelloGpuDrawTarget {
             },
             other => Some(other),
         }
+    }
+
+    /// The external image id WebRender samples this canvas through.
+    #[cfg(test)]
+    pub(crate) fn external_image_id(&self) -> ExternalImageId {
+        self.gpu.image_id
     }
 
     fn external_image_data(&self) -> SerializableImageData {
@@ -686,12 +799,13 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
         self.scene
             .set_paint(paint);
         self.scene.set_transform(transform.cast().into());
+        let thread = self.gpu.thread.clone();
         self.with_composition(composition_options.composition_operation, |self_| {
             for text_run in &text_runs {
                 with_font(text_run, |font| {
                     self_
                         .scene
-                        .glyph_run(&mut self_.gpu.resources, font)
+                        .glyph_run(&mut thread.resources.borrow_mut(), font)
                         .font_size(text_run.pt_size)
                         .fill_glyphs(glyphs(text_run));
                 });
@@ -784,12 +898,13 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
             .set_paint(paint);
         self.scene.set_stroke(line_options.convert());
         self.scene.set_transform(transform.cast().into());
+        let thread = self.gpu.thread.clone();
         self.with_composition(composition_options.composition_operation, |self_| {
             for text_run in &text_runs {
                 with_font(text_run, |font| {
                     self_
                         .scene
-                        .glyph_run(&mut self_.gpu.resources, font)
+                        .glyph_run(&mut thread.resources.borrow_mut(), font)
                         .font_size(text_run.pt_size)
                         .stroke_glyphs(glyphs(text_run));
                 });
