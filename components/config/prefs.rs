@@ -354,6 +354,11 @@ pub struct Preferences {
     pub network_enforce_tls_localhost: bool,
     pub network_enforce_tls_onion: bool,
     pub network_http_cache_disabled: bool,
+    /// Whether every fetch asks the embedder if it wants to intercept the request
+    /// (`WebViewDelegate::load_web_resource`), waiting for the answer from the embedder's event
+    /// loop before the request proceeds. Embedders that never intercept can turn this off so
+    /// requests do not wait on their event loop (Loom).
+    pub network_request_interception_enabled: bool,
     /// The path to a disk cache file. Empty string disables the disk cache.
     pub network_http_disk_cache: String,
     /// Maximum size of the disk cache file in bytes.
@@ -578,6 +583,7 @@ impl Preferences {
             network_enforce_tls_enabled: false,
             network_enforce_tls_localhost: false,
             network_enforce_tls_onion: false,
+            network_request_interception_enabled: true,
             network_http_cache_disabled: false,
             network_http_disk_cache: String::new(),
             network_http_disk_cache_size: 1024 * 1024 * 100, // Roughtly 100MB

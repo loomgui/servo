@@ -539,12 +539,14 @@ pub async fn main_fetch(
     let current_scheme = current_url.scheme();
 
     // Intercept the request and maybe override the response.
-    context
-        .request_interceptor
-        .lock()
-        .await
-        .intercept_request(request, &mut response, context)
-        .await;
+    if servo_config::pref!(network_request_interception_enabled) {
+        context
+            .request_interceptor
+            .lock()
+            .await
+            .intercept_request(request, &mut response, context)
+            .await;
+    }
 
     let mut response = match response {
         Some(response) => response,
