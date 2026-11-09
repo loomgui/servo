@@ -150,6 +150,23 @@ fn glyphs(text_run: &TextRun) -> impl Iterator<Item = vello_cpu::Glyph> + Clone 
         })
 }
 
+/// GPU memory shared by every canvas of this thread, as `(name, bytes)`: the renderer's image
+/// atlas and the cached uploads in it. Empty when no GPU canvas was created on this thread.
+pub(crate) fn shared_memory_report() -> Vec<(&'static str, usize)> {
+    GPU_THREAD.with(|slot| {
+        let Some(thread) = slot.borrow().clone() else {
+            return Vec::new();
+        };
+        let atlas = thread.renderer.borrow().atlas_info();
+        let atlas_bytes =
+            atlas.width as usize * atlas.height as usize * 4 * atlas.layer_count as usize;
+        vec![
+            ("gpu-image-atlas", atlas_bytes),
+            ("gpu-cached-uploads", thread.uploads.borrow().bytes),
+        ]
+    })
+}
+
 /// Whether GPU canvases can be created on this thread. Selecting the backend calls this first so
 /// that any failure falls back to the CPU backend instead of panicking later.
 pub(crate) fn available() -> bool {
@@ -824,11 +841,21 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
         &self,
         _ops: &mut malloc_size_of::MallocSizeOfOps,
     ) -> Option<Vec<CanvasStoreSizesPerType>> {
-        Some(vec![CanvasStoreSizesPerType {
-            name: "gpu-backing-texture",
-            size: (self.size.width * self.size.height * 4) as usize,
-            kind: ReportKind::ExplicitNonHeapSize,
-        }])
+        // The retained copy plus the swap chain's buffers: the back buffer, the front buffer
+        // WebRender samples, and at most one recycled buffer.
+        let frame = (self.size.width * self.size.height * 4) as usize;
+        Some(vec![
+            CanvasStoreSizesPerType {
+                name: "gpu-retained-texture",
+                size: frame,
+                kind: ReportKind::ExplicitNonHeapSize,
+            },
+            CanvasStoreSizesPerType {
+                name: "gpu-swap-chain",
+                size: frame * 3,
+                kind: ReportKind::ExplicitNonHeapSize,
+            },
+        ])
     }
 
     fn clear_rect(&mut self, rect: &Rect<f32>, transform: Transform2D<f64>) {

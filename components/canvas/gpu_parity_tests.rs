@@ -1330,6 +1330,33 @@ fn gpu_lifetime_stress() {
     });
 }
 
+/// GPU memory shared by a thread's canvases shows up in memory reports once images are cached.
+#[test]
+fn gpu_memory_report() {
+    on_gpu_thread(|| {
+        let mut target = VelloGpuDrawTarget::new(Size2D::new(64, 64));
+        draw_image(
+            &mut target,
+            test_image(32, 32),
+            frect(0.0, 0.0, 32.0, 32.0),
+            Filter::Bilinear,
+            normal(),
+            identity(),
+        );
+        let _ = target.snapshot();
+        let report = crate::vello_gpu_backend::shared_memory_report();
+        let size = |name| {
+            report
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map_or(0, |(_, size)| *size)
+        };
+        assert!(size("gpu-image-atlas") >= 4096 * 4096 * 4, "{report:?}");
+        assert!(size("gpu-cached-uploads") >= 32 * 32 * 4, "{report:?}");
+        vec![1]
+    });
+}
+
 // ---- realistic workloads -------------------------------------------------------------------
 
 // The hands-on main menu's ember particles: a radial-gradient glow plus a solid core per

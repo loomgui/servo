@@ -114,11 +114,21 @@ impl CanvasPaintThread {
 
     fn collect_memory_reports(&self, sender: ReportsChan) {
         perform_memory_report(|ops| {
-            let reports = self
+            let mut reports: Vec<Report> = self
                 .canvases
                 .iter()
                 .flat_map(|(canvas_id, canvas)| canvas.collect_memory_report(*canvas_id, ops))
                 .collect();
+            // Loom: GPU resources shared by all GPU canvases (image atlas, cached uploads).
+            reports.extend(
+                crate::vello_gpu_backend::shared_memory_report()
+                    .into_iter()
+                    .map(|(name, size)| Report {
+                        path: profile_traits::path!["canvas", "gpu-shared", name],
+                        kind: profile_traits::mem::ReportKind::ExplicitNonHeapSize,
+                        size,
+                    }),
+            );
             sender.send(ProcessReports::new(reports));
         });
     }
