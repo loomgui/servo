@@ -47,6 +47,8 @@ webrender_api = { workspace = true }
 
 [dev-dependencies]
 image = { workspace = true }
+skrifa = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

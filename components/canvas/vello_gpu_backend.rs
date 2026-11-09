@@ -14,7 +14,7 @@
 //! texture, which is drawn back as the background when later draws are not preceded by a
 //! full-canvas clear.
 //!
-//! Prototype limitations: text, image draws and image patterns are skipped with a warning.
+//! Not implemented yet: image draws and image patterns (skipped with a warning).
 
 #![allow(
     unsafe_code,
@@ -22,9 +22,11 @@
 )]
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
+use fonts::FontIdentifier;
 use glow::HasContext;
 use kurbo::Shape;
 use log::warn;
@@ -71,8 +73,38 @@ fn warn_once(flag: &'static std::thread::LocalKey<Cell<bool>>, message: &str) {
 }
 
 thread_local! {
-    static WARNED_TEXT: Cell<bool> = const { Cell::new(false) };
     static WARNED_IMAGE: Cell<bool> = const { Cell::new(false) };
+    /// Font data shared by all GPU canvases on this thread, as in the CPU backend.
+    static FONT_CACHE: RefCell<HashMap<FontIdentifier, peniko::FontData>> = RefCell::default();
+}
+
+/// Run `f` with the `peniko` font for `text_run`, loading it into the thread's cache once.
+fn with_font(text_run: &TextRun, f: impl FnOnce(&peniko::FontData)) {
+    FONT_CACHE.with(|cache| {
+        let identifier = &text_run.font.identifier;
+        if !cache.borrow().contains_key(identifier) {
+            let Some(font_data_and_index) = text_run.font.font_data_and_index() else {
+                return;
+            };
+            cache
+                .borrow_mut()
+                .insert(identifier.clone(), font_data_and_index.convert());
+        }
+        if let Some(font) = cache.borrow().get(identifier) {
+            f(font);
+        }
+    });
+}
+
+fn glyphs(text_run: &TextRun) -> impl Iterator<Item = vello_cpu::Glyph> + Clone + '_ {
+    text_run
+        .glyphs_and_positions
+        .iter()
+        .map(|glyph| vello_cpu::Glyph {
+            id: glyph.id,
+            x: glyph.point.x,
+            y: glyph.point.y,
+        })
 }
 
 /// Whether GPU canvases can be created on this thread. Selecting the backend calls this first so
@@ -547,12 +579,30 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
 
     fn fill_text(
         &mut self,
-        _text_runs: Vec<TextRun>,
-        _style: FillOrStrokeStyle,
-        _composition_options: CompositionOptions,
-        _transform: Transform2D<f64>,
+        text_runs: Vec<TextRun>,
+        style: FillOrStrokeStyle,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
     ) {
-        warn_once(&WARNED_TEXT, "text is not implemented in the prototype");
+        if matches!(style, FillOrStrokeStyle::Surface(_)) {
+            warn_once(&WARNED_IMAGE, "pattern text is not implemented yet");
+            return;
+        }
+        self.ensure_drawing();
+        self.scene
+            .set_paint(paint(style, composition_options.alpha));
+        self.scene.set_transform(transform.cast().into());
+        self.with_composition(composition_options.composition_operation, |self_| {
+            for text_run in &text_runs {
+                with_font(text_run, |font| {
+                    self_
+                        .scene
+                        .glyph_run(&mut self_.gpu.resources, font)
+                        .font_size(text_run.pt_size)
+                        .fill_glyphs(glyphs(text_run));
+                });
+            }
+        })
     }
 
     fn fill_rect(
@@ -628,13 +678,32 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
 
     fn stroke_text(
         &mut self,
-        _text_runs: Vec<TextRun>,
-        _style: FillOrStrokeStyle,
-        _line_options: LineOptions,
-        _composition_options: CompositionOptions,
-        _transform: Transform2D<f64>,
+        text_runs: Vec<TextRun>,
+        style: FillOrStrokeStyle,
+        line_options: LineOptions,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
     ) {
-        warn_once(&WARNED_TEXT, "text is not implemented in the prototype");
+        if matches!(style, FillOrStrokeStyle::Surface(_)) {
+            warn_once(&WARNED_IMAGE, "pattern text is not implemented yet");
+            return;
+        }
+        self.ensure_drawing();
+        self.scene
+            .set_paint(paint(style, composition_options.alpha));
+        self.scene.set_stroke(line_options.convert());
+        self.scene.set_transform(transform.cast().into());
+        self.with_composition(composition_options.composition_operation, |self_| {
+            for text_run in &text_runs {
+                with_font(text_run, |font| {
+                    self_
+                        .scene
+                        .glyph_run(&mut self_.gpu.resources, font)
+                        .font_size(text_run.pt_size)
+                        .stroke_glyphs(glyphs(text_run));
+                });
+            }
+        })
     }
 
     fn stroke_rect(

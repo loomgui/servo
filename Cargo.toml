@@ -275,7 +275,7 @@ urlpattern = "0.3"
 uuid = { version = "1.23.3", features = ["v4", "v5"] }
 vello = "0.10"
 vello_cpu = { version = "0.2.0", features = ["multithreading"] }
-vello_hybrid = { path = "third_party/vello_hybrid", default-features = false, features = ["webgl"] }
+vello_hybrid = { path = "third_party/vello_hybrid", default-features = false, features = ["webgl", "text"] }
 warp = "0.4.2"
 web_atoms = "0.3.0"
 webdriver = "0.54.0"

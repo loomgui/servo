@@ -9,7 +9,8 @@
 //! when every channel differs by at most `CHANNEL_TOLERANCE`; a scene passes when at most
 //! `MISMATCH_BUDGET` of its pixels miss that bound (anti-aliasing and gradient dithering are not
 //! bit-identical between the CPU and GPU fine rasterizers). Failing scenes write
-//! `<name>-cpu.png`, `<name>-gpu.png` and `<name>-diff.png` to `target/gpu-parity/`.
+//! `<name>-cpu.png`, `<name>-gpu.png` and `<name>-diff.png` to `target/gpu-parity/`; set
+//! `GPU_PARITY_SAVE=1` to write the CPU and GPU images of every scene.
 //!
 //! The GPU half needs a real GPU. On Windows run with ANGLE, as Loom ships it:
 //! `cargo test -p servo-canvas --features surfman/sm-angle-default gpu_parity`
@@ -18,7 +19,8 @@
 use std::path::PathBuf;
 use std::sync::Once;
 
-use euclid::default::{Rect, Size2D, Transform2D};
+use euclid::default::{Point2D, Rect, Size2D, Transform2D};
+use fonts::{FontData, FontDataAndIndex, FontIdentifier};
 use paint_api::{
     GpuCanvasShared, PainterSurfmanDetails, PainterSurfmanDetailsMap,
     WebRenderExternalImageIdManager,
@@ -27,7 +29,7 @@ use servo_base::id::PainterId;
 use servo_canvas_traits::canvas::{
     BlendingStyle, CanvasGradientStop, CompositionOptions, CompositionOrBlending,
     CompositionStyle, FillOrStrokeStyle, FillRule, LineCapStyle, LineJoinStyle, LineOptions,
-    LinearGradientStyle, Path, RadialGradientStyle,
+    CanvasFont, GlyphAndPosition, LinearGradientStyle, Path, RadialGradientStyle, TextRun,
 };
 use style::color::AbsoluteColor;
 
@@ -162,11 +164,20 @@ fn run_parity(
         gpu,
     );
 
+    // A scene that drew nothing would match trivially; `clear` legitimately wipes the canvas.
+    assert!(
+        name == "composite_clear" || cpu.as_raw_bytes().chunks_exact(4).any(|pixel| pixel[3] != 0),
+        "{name}: the CPU reference is blank"
+    );
+
     let result = compare_pixels(cpu.as_raw_bytes(), gpu.as_raw_bytes());
     let fraction = result.mismatched as f64 / result.total as f64;
-    if fraction > MISMATCH_BUDGET {
+    let save_all = std::env::var_os("GPU_PARITY_SAVE").is_some();
+    if save_all || fraction > MISMATCH_BUDGET {
         save(name, "cpu", size, cpu.as_raw_bytes());
         save(name, "gpu", size, gpu.as_raw_bytes());
+    }
+    if fraction > MISMATCH_BUDGET {
         let diff: Vec<u8> = cpu
             .as_raw_bytes()
             .chunks_exact(4)
@@ -483,6 +494,109 @@ parity!(retained_across_updates, 120, 80, |t| {
     t.fill_rect(&rect(40.0, 25.0, 80.0, 55.0), color(200, 20, 120, 0.7), normal(), identity());
     let _ = t.snapshot();
     t.clear_rect(&rect(0.0, 0.0, 20.0, 20.0), identity());
+});
+
+// ---- text ----------------------------------------------------------------------------------
+
+/// Lato Medium from the WPT fonts, shared by every text scene (one identifier, so both backends
+/// exercise their font caches).
+fn lato() -> &'static (uuid::Uuid, Vec<u8>) {
+    static LATO: std::sync::OnceLock<(uuid::Uuid, Vec<u8>)> = std::sync::OnceLock::new();
+    LATO.get_or_init(|| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/wpt/tests/fonts/Lato-Medium.ttf");
+        (uuid::Uuid::new_v4(), std::fs::read(path).expect("Lato-Medium.ttf"))
+    })
+}
+
+/// Lay `text` out on one line with the font's own advances (no shaping; enough for parity).
+fn text_run(text: &str, x: f32, y: f32, pt_size: f32) -> TextRun {
+    use skrifa::MetadataProvider;
+    let (id, bytes) = lato();
+    let font = skrifa::FontRef::new(bytes).expect("parse Lato");
+    let charmap = font.charmap();
+    let metrics = font.glyph_metrics(skrifa::instance::Size::new(pt_size), skrifa::instance::LocationRef::default());
+    let mut pen = x;
+    let glyphs_and_positions = text
+        .chars()
+        .map(|ch| {
+            let glyph = charmap.map(ch).unwrap_or_default();
+            let positioned = GlyphAndPosition {
+                id: glyph.to_u32(),
+                point: Point2D::new(pen, y),
+            };
+            pen += metrics.advance_width(glyph).unwrap_or(pt_size * 0.5);
+            positioned
+        })
+        .collect();
+    TextRun {
+        font: CanvasFont {
+            identifier: FontIdentifier::ArrayBuffer(*id),
+            data: Some(FontDataAndIndex {
+                data: FontData::from_bytes(bytes),
+                index: 0,
+            }),
+        },
+        pt_size,
+        glyphs_and_positions,
+        advance: pen - x,
+        bounds: euclid::default::Rect::new(
+            euclid::default::Point2D::new(x as f64, (y - pt_size) as f64),
+            Size2D::new((pen - x) as f64, pt_size as f64 * 1.3),
+        ),
+    }
+}
+
+parity!(fill_text_sizes, 220, 120, |t| {
+    for (y, size) in [(16.0, 12.0), (40.0, 20.0), (78.0, 34.0), (114.0, 30.0)] {
+        t.fill_text(vec![text_run("Loom GPU canvas 0123", 6.0, y, size)], color(30, 30, 40, 1.0), normal(), identity());
+    }
+});
+
+parity!(stroke_text, 220, 80, |t| {
+    let options = line(2.0, LineCapStyle::Round, LineJoinStyle::Round, vec![]);
+    t.stroke_text(vec![text_run("Outline", 8.0, 56.0, 48.0)], color(200, 40, 40, 1.0), options, normal(), identity());
+});
+
+parity!(gradient_text, 220, 80, |t| {
+    let gradient = FillOrStrokeStyle::LinearGradient(LinearGradientStyle::new(
+        0.0,
+        0.0,
+        220.0,
+        0.0,
+        vec![stop(0.0, 255, 80, 0, 1.0), stop(1.0, 40, 80, 255, 1.0)],
+    ));
+    t.fill_text(vec![text_run("Gradient", 6.0, 58.0, 52.0)], gradient, normal(), identity());
+});
+
+parity!(transformed_text, 200, 200, |t| {
+    let transform = Transform2D::rotation(euclid::Angle::degrees(30.0))
+        .then_scale(1.2, 0.9)
+        .then_translate(euclid::default::Vector2D::new(40.0, 30.0));
+    t.fill_text(vec![text_run("Rotated text", 0.0, 24.0, 22.0)], color(20, 120, 60, 0.85), normal(), transform);
+});
+
+parity!(text_composite_and_clip, 200, 100, |t| {
+    t.fill_rect(&rect(0.0, 0.0, 200.0, 100.0), color(30, 40, 90, 1.0), normal(), identity());
+    t.push_clip(&circle(100.0, 50.0, 46.0), FillRule::Nonzero, identity());
+    let lighter = with_op(CompositionOrBlending::Composition(CompositionStyle::Lighter));
+    t.fill_text(vec![text_run("Lighter", 10.0, 62.0, 44.0)], color(200, 120, 40, 0.8), lighter, identity());
+    t.pop_clip();
+    let xor = with_op(CompositionOrBlending::Composition(CompositionStyle::Xor));
+    t.fill_text(vec![text_run("xor", 140.0, 90.0, 24.0)], color(250, 250, 250, 1.0), xor, identity());
+});
+
+parity!(text_runs_hud, 256, 96, |t| {
+    // A HUD-style label: several runs, mixed sizes and alpha, drawn every frame.
+    t.fill_rect(&rect(0.0, 0.0, 256.0, 96.0), color(12, 14, 20, 0.8), normal(), identity());
+    let runs = vec![
+        text_run("P1 1250", 8.0, 24.0, 18.0),
+        text_run("P2 980", 136.0, 24.0, 18.0),
+        text_run("HP 74 / 100", 8.0, 56.0, 14.0),
+        text_run("x3 combo!", 136.0, 56.0, 14.0),
+        text_run("wave 12 - 00:41.6", 8.0, 86.0, 11.0),
+    ];
+    t.fill_text(runs, color(240, 230, 200, 0.95), normal(), identity());
 });
 
 // ---- realistic workloads -------------------------------------------------------------------
