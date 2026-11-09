@@ -214,6 +214,10 @@ pub(crate) struct Painter {
     applied_seal_join: Option<AppliedSealJoin>,
     /// A completed request delayed by the existing canvas-image gate.
     pending_applied_scene: Option<AppliedSeal>,
+    /// WebViews that registered an applied seal since the last refresh-driver frame start. Each
+    /// applied seal already ticks its WebView's animations (the embedder's rendering update for
+    /// that frame), so the animation refresh observer skips them instead of ticking them twice.
+    sealed_since_frame_start: FxHashSet<WebViewId>,
 
     /// Completed non-zero scene tags not yet consumed by the embedder.
     ready_scene_frame_tags: RefCell<VecDeque<u64>>,
@@ -428,6 +432,7 @@ impl Painter {
             prepared_frame_tag: None,
             applied_seal_join: None,
             pending_applied_scene: None,
+            sealed_since_frame_start: Default::default(),
             ready_scene_frame_tags: RefCell::new(VecDeque::new()),
             ready_unchanged_frame_tags: RefCell::new(VecDeque::new()),
             scene_frame_notification_sender: paint.paint_proxy.sender.clone(),
@@ -577,8 +582,14 @@ impl Painter {
         // Process-monotonic frame IDs retire abandoned prior-session requests.
         // Late old completions cannot match the new full frame/sequence token.
         self.pending_applied_scene = None;
+        self.sealed_since_frame_start.insert(seal.webview_id);
         self.applied_seal_join = Some(AppliedSealJoin::new(seal));
         true
+    }
+
+    /// Take the WebViews that registered an applied seal since the previous call.
+    pub(crate) fn take_sealed_since_frame_start(&mut self) -> FxHashSet<WebViewId> {
+        std::mem::take(&mut self.sealed_since_frame_start)
     }
 
     pub(crate) fn mark_scene_frame_ready(&self, frame_tag: u64) {
