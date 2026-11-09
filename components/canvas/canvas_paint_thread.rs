@@ -350,9 +350,10 @@ impl Canvas {
         {
             #[cfg(feature = "vello")]
             "vello" => Some(Self::Vello(CanvasData::new(size, paint_api))),
-            "gpu" if Self::wants_gpu(size) => {
-                Some(Self::VelloGpu(CanvasData::new(size, paint_api)))
-            },
+            "gpu" if Self::wants_gpu(size) => Some(
+                Self::try_gpu(size, paint_api.clone())
+                    .unwrap_or_else(|| Self::VelloCPU(CanvasData::new(size, paint_api))),
+            ),
             _ => Some(Self::VelloCPU(CanvasData::new(size, paint_api))),
         }
     }
@@ -363,9 +364,21 @@ impl Canvas {
         size.area() >= min_pixels && crate::vello_gpu_backend::available()
     }
 
-    /// Loom: on resize under the `gpu` backend, move a canvas between the GPU and CPU backends
-    /// when it crosses `dom_canvas_gpu_min_pixels`. Returns whether it moved (and was reset).
-    fn switch_backend_for(&mut self, size: Option<Size2D<u64>>) -> bool {
+    /// Loom: a GPU canvas of `size`, or `None` when its GPU resources cannot be created.
+    fn try_gpu(size: Size2D<u64>, paint_api: CrossProcessPaintApi) -> Option<Self> {
+        let target = crate::vello_gpu_backend::VelloGpuDrawTarget::try_new(
+            size.max(Size2D::new(1, 1)).cast(),
+        )?;
+        Some(Self::VelloGpu(CanvasData::with_draw_target(
+            target, paint_api,
+        )))
+    }
+
+    /// Loom: recreate (resize or reset) under the `gpu` backend. GPU canvases are rebuilt here,
+    /// so a failed GPU allocation falls back to the CPU backend instead of panicking, and canvases
+    /// move between backends when their size crosses `dom_canvas_gpu_min_pixels`. Returns whether
+    /// the canvas was recreated.
+    fn recreate_with_backend_choice(&mut self, size: Option<Size2D<u64>>) -> bool {
         if servo_config::pref!(dom_canvas_backend).to_lowercase() != "gpu" {
             return false;
         }
@@ -376,7 +389,8 @@ impl Canvas {
             Canvas::VelloGpu(canvas_data) => (canvas_data.size(), true),
         };
         let size = size.unwrap_or(current_size);
-        if Self::wants_gpu(size) == is_gpu {
+        let wants_gpu = Self::wants_gpu(size);
+        if !wants_gpu && !is_gpu {
             return false;
         }
         let (image_key, paint_api) = match self {
@@ -389,11 +403,10 @@ impl Canvas {
                 (canvas_data.take_image_key(), canvas_data.paint_api())
             },
         };
-        *self = if is_gpu {
-            Canvas::VelloCPU(CanvasData::new(size, paint_api))
-        } else {
-            Canvas::VelloGpu(CanvasData::new(size, paint_api))
-        };
+        *self = wants_gpu
+            .then(|| Self::try_gpu(size, paint_api.clone()))
+            .flatten()
+            .unwrap_or_else(|| Canvas::VelloCPU(CanvasData::new(size, paint_api)));
         if let Some(image_key) = image_key {
             match self {
                 #[cfg(feature = "vello")]
@@ -747,7 +760,7 @@ impl Canvas {
     }
 
     fn recreate(&mut self, size: Option<Size2D<u64>>) {
-        if self.switch_backend_for(size) {
+        if self.recreate_with_backend_choice(size) {
             return;
         }
         match self {

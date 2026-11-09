@@ -722,6 +722,33 @@ impl VelloGpuDrawTarget {
         transformed_rect.cast().contains_rect(&viewport) && clip.contains_rect(&viewport)
     }
 
+    /// A GPU canvas of `size`, or `None` (logged) when its GPU resources cannot be created;
+    /// callers fall back to the CPU backend.
+    pub(crate) fn try_new(size: Size2D<u32>) -> Option<Self> {
+        let size = size.max(Size2D::new(1, 1));
+        let gpu = match Gpu::new(size) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                warn!("GPU canvas: using the CPU backend for a {size:?} canvas: {error}");
+                return None;
+            },
+        };
+        let mut target = Self {
+            scene: Scene::new(size.width as u16, size.height as u16),
+            gpu,
+            size,
+            clips: Vec::new(),
+            state: State::Drawing,
+            clear_next: true,
+            draws_retained: false,
+            pinned_uploads: Vec::new(),
+            shadow_depth: 0,
+        };
+        // Publish a transparent first frame so WebRender always has a surface to sample.
+        target.flush();
+        Some(target)
+    }
+
     /// The atlas image holding `pixmap`, pinned until the pending scene is rasterized. Returns
     /// `None` for images the atlas cannot hold.
     fn upload_image(&mut self, pixmap: &vello_cpu::Pixmap) -> Option<ImageId> {
@@ -790,22 +817,7 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
     type SourceSurface = Arc<vello_cpu::Pixmap>;
 
     fn new(size: Size2D<u32>) -> Self {
-        let size = size.max(Size2D::new(1, 1));
-        let gpu = Gpu::new(size).unwrap_or_else(|error| panic!("GPU canvas init failed: {error}"));
-        let mut target = Self {
-            scene: Scene::new(size.width as u16, size.height as u16),
-            gpu,
-            size,
-            clips: Vec::new(),
-            state: State::Drawing,
-            clear_next: true,
-            draws_retained: false,
-            pinned_uploads: Vec::new(),
-            shadow_depth: 0,
-        };
-        // Publish a transparent first frame so WebRender always has a surface to sample.
-        target.flush();
-        target
+        Self::try_new(size).expect("GPU canvas init failed")
     }
 
     fn canvas_store_sizes(

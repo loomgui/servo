@@ -41,6 +41,18 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
         }
     }
 
+    /// Loom: a canvas around an already created draw target (GPU targets can fail to create).
+    pub(crate) fn with_draw_target(
+        draw_target: DrawTarget,
+        paint_api: CrossProcessPaintApi,
+    ) -> CanvasData<DrawTarget> {
+        CanvasData {
+            draw_target,
+            paint_api,
+            image_key: None,
+        }
+    }
+
     /// Hand this canvas's WebRender image to another backend (Loom: GPU/CPU switch on resize).
     pub(crate) fn take_image_key(&mut self) -> Option<ImageKey> {
         self.image_key.take()
