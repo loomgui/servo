@@ -176,6 +176,10 @@ pub enum PaintMessage {
     GenerateFrame(Vec<PainterId>),
     /// A per-loop barrier after every DL/color message from this rendering opportunity.
     AppliedSealRenderingComplete(AppliedSealOpportunity, bool),
+    /// Register an applied seal before its rendering opportunity is requested. Sent on this
+    /// FIFO ahead of the seal-tagged tick, so it is handled before the opportunity completes,
+    /// without the embedder thread having to be free (see `servo::FrameDriver`).
+    RegisterAppliedSeal(AppliedSeal),
     /// Create a new image key. The result will be returned via the
     /// provided channel sender.
     GenerateImageKey(WebViewId, GenericSender<ImageKey>),

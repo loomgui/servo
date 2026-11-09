@@ -786,6 +786,16 @@ impl WebView {
         true
     }
 
+    /// A handle that requests this WebView's seal-tagged rendering updates from any thread,
+    /// without waiting for the embedder's event loop (see [`FrameDriver`]).
+    pub fn frame_driver(&self) -> FrameDriver {
+        FrameDriver {
+            webview_id: self.id(),
+            constellation_proxy: self.inner().servo.constellation_proxy().clone(),
+            paint_proxy: self.inner().servo.paint().paint_proxy(),
+        }
+    }
+
     pub fn take_ready_scene_frame(&self) -> Option<u64> {
         self.inner().servo.paint().take_ready_scene_frame(self.id())
     }
@@ -1239,5 +1249,44 @@ impl WebViewBuilder {
     /// Create the [`WebView`] using the configuration specified in this [`WebViewBuilder`].
     pub fn build(self) -> WebView {
         WebView::new(self)
+    }
+}
+
+/// Requests a [`WebView`]'s seal-tagged rendering update from any thread (Loom).
+///
+/// [`WebView::request_rendering_update_for_frame`] registers the applied seal with the painter on
+/// the embedder's thread, so a request waits until that thread is free, for example while it
+/// paints the previous frame. This handle instead queues the registration on the paint FIFO
+/// and then sends the seal-tagged tick. The rendering opportunity's completion is only sent after
+/// that tick arrives, behind the registration on the same FIFO, so the painter always sees the
+/// registration first. A rejected (stale) registration is logged instead of returned.
+#[derive(Clone)]
+pub struct FrameDriver {
+    webview_id: WebViewId,
+    constellation_proxy: crate::proxies::ConstellationProxy,
+    paint_proxy: paint_api::PaintProxy,
+}
+
+impl FrameDriver {
+    pub fn request_rendering_update_for_frame(
+        &self,
+        frame_tag: u64,
+        state_sequence: u64,
+        force_external_images: bool,
+    ) {
+        let seal = paint_api::AppliedSeal {
+            webview_id: self.webview_id,
+            frame_id: frame_tag,
+            state_sequence,
+            force_external_images,
+        };
+        self.paint_proxy
+            .send(paint_api::PaintMessage::RegisterAppliedSeal(seal.clone()));
+        self.constellation_proxy
+            .send(EmbedderToConstellationMessage::TickAnimation(
+                vec![self.webview_id],
+                None,
+                Some(seal),
+            ));
     }
 }
