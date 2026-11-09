@@ -8488,6 +8488,7 @@ dependencies = [
  "euclid",
  "futures-intrusive",
  "glow",
+ "image",
  "kurbo",
  "log",
  "peniko",

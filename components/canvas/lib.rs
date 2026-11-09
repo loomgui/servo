@@ -13,3 +13,5 @@ mod peniko_conversions;
 mod vello_backend;
 mod vello_cpu_backend;
 mod vello_gpu_backend;
+#[cfg(test)]
+mod gpu_parity_tests;

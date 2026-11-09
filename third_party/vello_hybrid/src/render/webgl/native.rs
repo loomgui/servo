@@ -23,6 +23,7 @@
 
 use alloc::rc::Rc;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::Cell;
 use core::fmt;
@@ -178,6 +179,29 @@ fn unpack(pixels: Option<&[u8]>) -> glow::PixelUnpackData<'_> {
     glow::PixelUnpackData::Slice(pixels)
 }
 
+/// Bytes per texel for an unpack `format` / `ty` pair.
+fn texel_bytes(format: u32, ty: u32) -> usize {
+    let components = match format {
+        glow::RGBA | glow::RGBA_INTEGER => 4,
+        glow::RGB | glow::RGB_INTEGER => 3,
+        glow::RG | glow::RG_INTEGER => 2,
+        _ => 1,
+    };
+    let bytes = match ty {
+        glow::UNSIGNED_INT | glow::INT | glow::FLOAT => 4,
+        glow::UNSIGNED_SHORT | glow::SHORT | glow::HALF_FLOAT => 2,
+        _ => 1,
+    };
+    components * bytes
+}
+
+/// WebGL zero-initializes textures allocated without data; native GL leaves them undefined, and
+/// drivers recycle freed memory. The backend relies on the WebGL behavior, so supply zeros.
+fn zeroed(width: i32, height: i32, depth: i32, format: u32, ty: u32) -> Vec<u8> {
+    let texels = width.max(0) as usize * height.max(0) as usize * depth.max(0) as usize;
+    vec![0_u8; texels * texel_bytes(format, ty)]
+}
+
 impl WebGl2RenderingContext {
     /// Wrap a native GLES 3.0 context. `width`/`height` are the size of the default framebuffer
     /// the renderer draws into (see [`Self::set_drawing_buffer_size`]).
@@ -328,6 +352,8 @@ impl WebGl2RenderingContext {
         ty: u32,
         pixels: Option<&[u8]>,
     ) -> Result<(), JsValue> {
+        let zeros = pixels.is_none().then(|| zeroed(width, height, 1, format, ty));
+        let pixels = pixels.or(zeros.as_deref());
         // SAFETY: module contract; GL copies client memory before returning.
         unsafe {
             self.gl.tex_image_2d(
@@ -383,6 +409,8 @@ impl WebGl2RenderingContext {
         ty: u32,
         pixels: Option<&[u8]>,
     ) -> Result<(), JsValue> {
+        let zeros = pixels.is_none().then(|| zeroed(width, height, depth, format, ty));
+        let pixels = pixels.or(zeros.as_deref());
         // SAFETY: module contract; GL copies client memory before returning.
         unsafe {
             self.gl.tex_image_3d(
