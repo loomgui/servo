@@ -227,8 +227,13 @@ impl WebGlRenderer {
 
         // Estimate the maximum number of gradient cache entries based on the max texture dimension
         // and the maximum gradient LUT size - worst case scenario.
-        let max_gradient_cache_size =
-            max_texture_dimension_2d * max_texture_dimension_2d / MAX_GRADIENT_LUT_SIZE as u32;
+        // Loom: bound the cache to a few frames' working set. The upstream bound (the whole texture)
+        // never evicts, so content that creates new gradients every frame (for example a particle
+        // per gradient with animated alpha) grows the ramp table, and its per-frame upload, forever.
+        const LOOM_MAX_GRADIENT_CACHE_ENTRIES: u32 = 2048;
+        let max_gradient_cache_size = (max_texture_dimension_2d * max_texture_dimension_2d
+            / MAX_GRADIENT_LUT_SIZE as u32)
+            .min(LOOM_MAX_GRADIENT_CACHE_ENTRIES);
         let gradient_cache = GradientRampCache::new(max_gradient_cache_size, settings.level);
         let layer_config = settings.memory_settings.layers_config;
         let renderer = Self {
