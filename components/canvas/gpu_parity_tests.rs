@@ -29,11 +29,13 @@ use servo_base::id::PainterId;
 use servo_canvas_traits::canvas::{
     BlendingStyle, CanvasGradientStop, CompositionOptions, CompositionOrBlending,
     CompositionStyle, FillOrStrokeStyle, FillRule, LineCapStyle, LineJoinStyle, LineOptions,
-    CanvasFont, GlyphAndPosition, LinearGradientStyle, Path, RadialGradientStyle, TextRun,
+    CanvasFont, GlyphAndPosition, LinearGradientStyle, Path, RadialGradientStyle, SurfaceStyle,
+    TextRun,
 };
 use style::color::AbsoluteColor;
 
 use crate::backend::GenericDrawTarget;
+use crate::canvas_data::Filter;
 use crate::vello_cpu_backend::VelloCPUDrawTarget;
 use crate::vello_gpu_backend::VelloGpuDrawTarget;
 
@@ -597,6 +599,156 @@ parity!(text_runs_hud, 256, 96, |t| {
         text_run("wave 12 - 00:41.6", 8.0, 86.0, 11.0),
     ];
     t.fill_text(runs, color(240, 230, 200, 0.95), normal(), identity());
+});
+
+// ---- images and patterns -------------------------------------------------------------------
+
+/// A `w`×`h` premultiplied test image: a hue gradient, a checkerboard, and a translucent band.
+fn test_image(w: u32, h: u32) -> pixels::Snapshot {
+    let mut data = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let checker = ((x / 4) + (y / 4)) % 2 == 0;
+            let (r, g, b) = (
+                (x * 255 / w.max(1)) as u8,
+                (y * 255 / h.max(1)) as u8,
+                if checker { 220 } else { 40 },
+            );
+            let a: u32 = if y * 3 < h { 140 } else { 255 };
+            let premultiply = |c: u8| ((c as u32 * a + 127) / 255) as u8;
+            data.extend_from_slice(&[premultiply(r), premultiply(g), premultiply(b), a as u8]);
+        }
+    }
+    pixels::Snapshot::from_vec(
+        Size2D::new(w, h),
+        pixels::SnapshotPixelFormat::RGBA,
+        pixels::SnapshotAlphaMode::Transparent {
+            premultiplied: true,
+        },
+        data,
+    )
+}
+
+fn draw_image<T: GenericDrawTarget>(
+    t: &mut T,
+    image: pixels::Snapshot,
+    dest: Rect<f64>,
+    filter: Filter,
+    composition: CompositionOptions,
+    transform: Transform2D<f64>,
+) {
+    let source = Rect::from_size(image.size().cast());
+    let surface = t.create_source_surface_from_data(image).expect("surface");
+    t.draw_surface(surface, dest, source, filter, composition, transform);
+}
+
+fn frect(x: f64, y: f64, w: f64, h: f64) -> Rect<f64> {
+    Rect::new(euclid::default::Point2D::new(x, y), Size2D::new(w, h))
+}
+
+fn pattern(w: u32, h: u32, repeat_x: bool, repeat_y: bool) -> FillOrStrokeStyle {
+    FillOrStrokeStyle::Surface(SurfaceStyle::new(
+        test_image(w, h).to_shared(),
+        Size2D::new(w, h),
+        repeat_x,
+        repeat_y,
+        Transform2D::identity(),
+    ))
+}
+
+parity!(draw_image_one_to_one, 96, 64, |t| {
+    draw_image(t, test_image(40, 32), frect(8.0, 12.0, 40.0, 32.0), Filter::Bilinear, normal(), identity());
+    draw_image(t, test_image(24, 24), frect(60.5, 20.25, 24.0, 24.0), Filter::Bilinear, normal(), identity());
+});
+
+parity!(draw_image_scaled_up_bilinear, 128, 96, |t| {
+    draw_image(t, test_image(16, 12), frect(4.0, 4.0, 120.0, 88.0), Filter::Bilinear, normal(), identity());
+});
+
+// Integer scale: at fractional scales a texel boundary can land exactly on a pixel center, and
+// the backends break that tie differently (vello_hybrid nudges sample positions by 1e-5 against
+// skew artifacts), so the chosen texel differs by one along those lines.
+parity!(draw_image_scaled_up_nearest, 128, 96, |t| {
+    draw_image(t, test_image(16, 12), frect(4.0, 4.0, 112.0, 84.0), Filter::Nearest, normal(), identity());
+});
+
+parity!(draw_image_scaled_down, 96, 64, |t| {
+    draw_image(t, test_image(160, 120), frect(10.0, 6.0, 64.0, 48.0), Filter::Bilinear, normal(), identity());
+});
+
+parity!(draw_image_alpha_and_transform, 128, 128, |t| {
+    let transform = Transform2D::rotation(euclid::Angle::degrees(25.0))
+        .then_translate(euclid::default::Vector2D::new(40.0, 10.0));
+    let mut options = normal();
+    options.alpha = 0.6;
+    t.fill_rect(&rect(0.0, 0.0, 128.0, 128.0), color(250, 250, 240, 1.0), normal(), identity());
+    draw_image(t, test_image(64, 48), frect(0.0, 0.0, 64.0, 48.0), Filter::Bilinear, options, transform);
+});
+
+parity!(draw_image_composite_and_clip, 128, 96, |t| {
+    backdrop(t);
+    t.push_clip(&circle(64.0, 48.0, 40.0), FillRule::Nonzero, identity());
+    let multiply = with_op(CompositionOrBlending::Blending(BlendingStyle::Multiply));
+    draw_image(t, test_image(48, 36), frect(16.0, 12.0, 96.0, 72.0), Filter::Bilinear, multiply, identity());
+    t.pop_clip();
+    let source_in = with_op(CompositionOrBlending::Composition(CompositionStyle::SourceAtop));
+    draw_image(t, test_image(20, 20), frect(96.0, 64.0, 30.0, 30.0), Filter::Nearest, source_in, identity());
+});
+
+parity!(put_image_data_at_origin, 96, 64, |t| {
+    t.fill_rect(&rect(0.0, 0.0, 96.0, 64.0), color(30, 60, 200, 1.0), normal(), identity());
+    let surface = t.create_source_surface_from_data(test_image(48, 40)).expect("surface");
+    t.copy_surface(surface, Rect::from_size(Size2D::new(48, 40)), euclid::default::Point2D::new(0, 0));
+});
+
+parity!(put_image_data_offset, 96, 64, |t| {
+    t.fill_rect(&rect(0.0, 0.0, 96.0, 64.0), color(30, 60, 200, 1.0), normal(), identity());
+    t.push_clip(&circle(10.0, 10.0, 5.0), FillRule::Nonzero, identity());
+    let surface = t.create_source_surface_from_data(test_image(48, 40)).expect("surface");
+    t.copy_surface(surface, Rect::from_size(Size2D::new(48, 40)), euclid::default::Point2D::new(30, 12));
+    t.pop_clip();
+});
+
+parity!(pattern_repeat, 128, 96, |t| {
+    t.fill(&circle(64.0, 48.0, 44.0), FillRule::Nonzero, pattern(12, 10, true, true), normal(), identity());
+});
+
+parity!(pattern_repeat_x_stroke, 128, 96, |t| {
+    let options = line(14.0, LineCapStyle::Butt, LineJoinStyle::Miter, vec![]);
+    t.stroke(&circle(64.0, 48.0, 32.0), pattern(10, 96, true, false), options, normal(), identity());
+});
+
+parity!(pattern_no_repeat_rect_and_text, 160, 96, |t| {
+    t.fill_rect(&rect(0.0, 0.0, 160.0, 48.0), pattern(40, 30, false, false), normal(), identity());
+    t.fill_text(vec![text_run("Pattern", 4.0, 88.0, 40.0)], pattern(8, 8, true, true), normal(), identity());
+});
+
+parity!(canvas_as_image_source, 128, 96, |t| {
+    // drawImage(otherCanvas): the source canvas is rasterized and read back first.
+    let mut source = T::new(Size2D::new(48, 48));
+    source.fill(&circle(24.0, 24.0, 20.0), FillRule::Nonzero, color(220, 60, 30, 0.9), normal(), identity());
+    source.fill_rect(&rect(10.0, 30.0, 28.0, 10.0), color(20, 200, 90, 1.0), normal(), identity());
+    let surface = source.surface();
+    t.draw_surface(surface, frect(10.0, 10.0, 96.0, 72.0), frect(0.0, 0.0, 48.0, 48.0), Filter::Bilinear, normal(), identity());
+});
+
+parity!(many_sprites, 256, 192, |t| {
+    // A sprite-heavy frame: 300 small image draws with varying scale and alpha.
+    let sprite = test_image(16, 16);
+    let mut seed = 0x9e37_79b9_u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        (seed % 10_000) as f64 / 10_000.0
+    };
+    for _ in 0..300 {
+        let size = 8.0 + next() * 24.0;
+        let mut options = normal();
+        options.alpha = 0.4 + next() * 0.6;
+        let dest = frect(next() * 240.0, next() * 176.0, size, size);
+        draw_image(t, sprite.clone(), dest, Filter::Bilinear, options, identity());
+    }
 });
 
 // ---- realistic workloads -------------------------------------------------------------------

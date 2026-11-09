@@ -38,5 +38,5 @@ hashbrown = { version = "0.17.1", features = ["default-hasher"], default-feature
 log = "0.4.29"
 thiserror = { version = "2.0.18", default-features = false }
 vello_common = { version = "0.2.0", features = ["std"], default-features = false }
-vello_sparse_shaders = { version = "0.2.0", optional = true }
+vello_sparse_shaders = { path = "../vello_sparse_shaders", optional = true }
 wgpu = { version = "29.0.3", features = ["std", "wgsl"], optional = true, default-features = false }

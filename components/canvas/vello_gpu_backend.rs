@@ -14,7 +14,8 @@
 //! texture, which is drawn back as the background when later draws are not preceded by a
 //! full-canvas clear.
 //!
-//! Not implemented yet: image draws and image patterns (skipped with a warning).
+//! Images (`drawImage`, `putImageData`, patterns) are uploaded into `vello_hybrid`'s image atlas
+//! for the next rasterization and released right after it.
 
 #![allow(
     unsafe_code,
@@ -24,6 +25,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
 use fonts::FontIdentifier;
@@ -44,8 +46,8 @@ use surfman::{
 };
 use vello_cpu::{kurbo, peniko};
 use vello_hybrid::{
-    RenderSize, Resources, SampleRect, Scene, TextureId, WebGl2RenderingContext, WebGlRenderer,
-    WebGlTextureBindings,
+    ImageId, RenderSize, Resources, SampleRect, Scene, TextureId, WebGl2RenderingContext,
+    WebGlRenderer, WebGlTextureBindings,
 };
 use webrender_api::{
     ExternalImageData, ExternalImageId, ExternalImageType, ImageBufferKind, ImageDescriptor,
@@ -54,10 +56,12 @@ use webrender_api::{
 
 use crate::backend::{CanvasStoreSizesPerType, Convert, GenericDrawTarget};
 use crate::canvas_data::Filter;
-use crate::vello_cpu_backend::paint;
+use crate::vello_cpu_backend::{paint, snapshot_as_pixmap};
 
 /// Texture binding id used to draw retained content back into a scene.
 const RETAINED_TEXTURE: TextureId = TextureId(1);
+/// Largest image side the renderer's atlas pages hold (`AtlasConfig::default().atlas_size`).
+const MAX_ATLAS_IMAGE_SIDE: u16 = 4096;
 
 thread_local! {
     /// One surfman device per canvas thread, on the same adapter as WebRender.
@@ -366,6 +370,8 @@ pub(crate) struct VelloGpuDrawTarget {
     clear_next: bool,
     /// The scene's first command draws the retained texture back.
     draws_retained: bool,
+    /// Atlas images the pending scene samples; released after the next rasterization.
+    uploaded_images: Vec<ImageId>,
 }
 
 impl VelloGpuDrawTarget {
@@ -435,6 +441,7 @@ impl VelloGpuDrawTarget {
             self_.gpu.render(&self_.scene, size, clear, draw_retained);
             self_.scene.reset();
         });
+        self.release_images();
         self.state = State::Rendered;
         self.clear_next = true;
         self.draws_retained = false;
@@ -456,6 +463,43 @@ impl VelloGpuDrawTarget {
         transformed_rect.cast().contains_rect(&viewport) && clip.contains_rect(&viewport)
     }
 
+    /// Upload `pixmap` into the atlas for the pending scene. Returns `None` for images the atlas
+    /// cannot hold.
+    fn upload_image(&mut self, pixmap: &vello_cpu::Pixmap) -> Option<ImageId> {
+        if pixmap.width() > MAX_ATLAS_IMAGE_SIDE || pixmap.height() > MAX_ATLAS_IMAGE_SIDE {
+            warn_once(&WARNED_IMAGE, "images larger than 4096 px are not drawn yet");
+            return None;
+        }
+        self.gpu.make_current();
+        let id = self.gpu.renderer.upload_image(&mut self.gpu.resources, pixmap);
+        self.uploaded_images.push(id);
+        Some(id)
+    }
+
+    fn release_images(&mut self) {
+        if self.uploaded_images.is_empty() {
+            return;
+        }
+        self.gpu.make_current();
+        for id in self.uploaded_images.drain(..) {
+            self.gpu.renderer.destroy_image(&mut self.gpu.resources, id);
+        }
+    }
+
+    /// The `vello_cpu` paint for `style`, with any pattern image moved into the atlas.
+    fn paint(&mut self, style: FillOrStrokeStyle, alpha: f64) -> Option<vello_cpu::PaintType> {
+        match paint(style, alpha) {
+            vello_cpu::PaintType::Image(mut image) => {
+                if let vello_cpu::ImageSource::Pixmap(pixmap) = &image.image {
+                    let id = self.upload_image(pixmap)?;
+                    image.image = vello_cpu::ImageSource::opaque_id(id);
+                }
+                Some(vello_cpu::PaintType::Image(image))
+            },
+            other => Some(other),
+        }
+    }
+
     fn external_image_data(&self) -> SerializableImageData {
         SerializableImageData::External(ExternalImageData {
             id: self.gpu.image_id,
@@ -467,7 +511,7 @@ impl VelloGpuDrawTarget {
 }
 
 impl GenericDrawTarget for VelloGpuDrawTarget {
-    type SourceSurface = ();
+    type SourceSurface = Arc<vello_cpu::Pixmap>;
 
     fn new(size: Size2D<u32>) -> Self {
         let size = size.max(Size2D::new(1, 1));
@@ -480,6 +524,7 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
             state: State::Drawing,
             clear_next: true,
             draws_retained: false,
+            uploaded_images: Vec::new(),
         };
         // Publish a transparent first frame so WebRender always has a surface to sample.
         target.flush();
@@ -522,11 +567,30 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
 
     fn copy_surface(
         &mut self,
-        _surface: Self::SourceSurface,
-        _source: Rect<i32>,
-        _destination: Point2D<i32>,
+        surface: Self::SourceSurface,
+        source: Rect<i32>,
+        destination: Point2D<i32>,
     ) {
-        warn_once(&WARNED_IMAGE, "image draws are not implemented in the prototype");
+        // Mirrors the CPU backend, including its unclipped source-over fill.
+        self.ensure_drawing();
+        let Some(id) = self.upload_image(&surface) else {
+            return;
+        };
+        let destination: kurbo::Point = destination.cast::<f64>().into();
+        let rect = kurbo::Rect::from_origin_size(destination, source.size.cast());
+        self.scene.set_transform(kurbo::Affine::IDENTITY);
+        self.ignore_clips(|self_| {
+            self_.scene.set_paint(vello_cpu::Image {
+                image: vello_cpu::ImageSource::opaque_id(id),
+                sampler: peniko::ImageSampler {
+                    x_extend: peniko::Extend::Pad,
+                    y_extend: peniko::Extend::Pad,
+                    quality: peniko::ImageQuality::Low,
+                    alpha: 1.0,
+                },
+            });
+            self_.scene.fill_rect(&rect);
+        });
     }
 
     fn create_similar_draw_target(&self, size: &Size2D<i32>) -> Self {
@@ -535,14 +599,46 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
 
     fn draw_surface(
         &mut self,
-        _surface: Self::SourceSurface,
-        _dest: Rect<f64>,
-        _source: Rect<f64>,
-        _filter: Filter,
-        _composition_options: CompositionOptions,
-        _transform: Transform2D<f64>,
+        mut surface: Self::SourceSurface,
+        dest: Rect<f64>,
+        source: Rect<f64>,
+        filter: Filter,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
     ) {
-        warn_once(&WARNED_IMAGE, "image draws are not implemented in the prototype");
+        self.ensure_drawing();
+        let scale_up = dest.size.width > source.size.width || dest.size.height > source.size.height;
+        if composition_options.alpha != 1.0 {
+            Arc::make_mut(&mut surface).multiply_alpha((composition_options.alpha * 255.0) as u8);
+        }
+        let Some(id) = self.upload_image(&surface) else {
+            return;
+        };
+        self.with_composition(composition_options.composition_operation, move |self_| {
+            self_.scene.set_transform(transform.cast().into());
+            self_.scene.set_paint(vello_cpu::Image {
+                image: vello_cpu::ImageSource::opaque_id(id),
+                sampler: peniko::ImageSampler {
+                    x_extend: peniko::Extend::Pad,
+                    y_extend: peniko::Extend::Pad,
+                    // Bicubic/bilinear only when scaling up, as in the CPU backend.
+                    quality: if scale_up {
+                        filter.convert()
+                    } else {
+                        peniko::ImageQuality::Low
+                    },
+                    alpha: 1.0,
+                },
+            });
+            self_.scene.set_paint_transform(
+                kurbo::Affine::translate((dest.origin.x, dest.origin.y)).pre_scale_non_uniform(
+                    dest.size.width / source.size.width,
+                    dest.size.height / source.size.height,
+                ),
+            );
+            self_.scene.fill_rect(&dest.into());
+            self_.scene.reset_paint_transform();
+        })
     }
 
     fn draw_surface_with_shadow(
@@ -563,15 +659,14 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     ) {
-        if matches!(style, FillOrStrokeStyle::Surface(_)) {
-            warn_once(&WARNED_IMAGE, "pattern fills are not implemented in the prototype");
-            return;
-        }
         self.ensure_drawing();
+        let Some(paint) = self.paint(style, composition_options.alpha) else {
+            return;
+        };
         self.with_composition(composition_options.composition_operation, |self_| {
             self_.scene.set_transform(transform.cast().into());
             self_.scene.set_fill_rule(fill_rule.convert());
-            self_.scene.set_paint(paint(style, composition_options.alpha));
+            self_.scene.set_paint(paint);
             self_.scene.fill_path(&path.0);
         });
         self.scene.set_fill_rule(peniko::Fill::NonZero);
@@ -584,13 +679,12 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     ) {
-        if matches!(style, FillOrStrokeStyle::Surface(_)) {
-            warn_once(&WARNED_IMAGE, "pattern text is not implemented yet");
-            return;
-        }
         self.ensure_drawing();
+        let Some(paint) = self.paint(style, composition_options.alpha) else {
+            return;
+        };
         self.scene
-            .set_paint(paint(style, composition_options.alpha));
+            .set_paint(paint);
         self.scene.set_transform(transform.cast().into());
         self.with_composition(composition_options.composition_operation, |self_| {
             for text_run in &text_runs {
@@ -612,14 +706,13 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     ) {
-        if matches!(style, FillOrStrokeStyle::Surface(_)) {
-            warn_once(&WARNED_IMAGE, "pattern fills are not implemented in the prototype");
-            return;
-        }
         self.ensure_drawing();
+        let Some(paint) = self.paint(style, composition_options.alpha) else {
+            return;
+        };
         self.with_composition(composition_options.composition_operation, |self_| {
             self_.scene.set_transform(transform.cast().into());
-            self_.scene.set_paint(paint(style, composition_options.alpha));
+            self_.scene.set_paint(paint);
             self_.scene.fill_rect(&rect.cast().into());
         })
     }
@@ -663,14 +756,13 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     ) {
-        if matches!(style, FillOrStrokeStyle::Surface(_)) {
-            warn_once(&WARNED_IMAGE, "pattern strokes are not implemented in the prototype");
-            return;
-        }
         self.ensure_drawing();
+        let Some(paint) = self.paint(style, composition_options.alpha) else {
+            return;
+        };
         self.with_composition(composition_options.composition_operation, |self_| {
             self_.scene.set_transform(transform.cast().into());
-            self_.scene.set_paint(paint(style, composition_options.alpha));
+            self_.scene.set_paint(paint);
             self_.scene.set_stroke(line_options.convert());
             self_.scene.stroke_path(&path.0);
         })
@@ -684,13 +776,12 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     ) {
-        if matches!(style, FillOrStrokeStyle::Surface(_)) {
-            warn_once(&WARNED_IMAGE, "pattern text is not implemented yet");
-            return;
-        }
         self.ensure_drawing();
+        let Some(paint) = self.paint(style, composition_options.alpha) else {
+            return;
+        };
         self.scene
-            .set_paint(paint(style, composition_options.alpha));
+            .set_paint(paint);
         self.scene.set_stroke(line_options.convert());
         self.scene.set_transform(transform.cast().into());
         self.with_composition(composition_options.composition_operation, |self_| {
@@ -714,14 +805,13 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     ) {
-        if matches!(style, FillOrStrokeStyle::Surface(_)) {
-            warn_once(&WARNED_IMAGE, "pattern strokes are not implemented in the prototype");
-            return;
-        }
         self.ensure_drawing();
+        let Some(paint) = self.paint(style, composition_options.alpha) else {
+            return;
+        };
         self.with_composition(composition_options.composition_operation, |self_| {
             self_.scene.set_transform(transform.cast().into());
-            self_.scene.set_paint(paint(style, composition_options.alpha));
+            self_.scene.set_paint(paint);
             self_.scene.set_stroke(line_options.convert());
             self_.scene.stroke_rect(&rect.cast().into());
         })
@@ -754,10 +844,10 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
     }
 
     fn surface(&mut self) -> Self::SourceSurface {
-        warn_once(&WARNED_IMAGE, "canvas-as-image sources are not implemented in the prototype");
+        snapshot_as_pixmap(self.snapshot())
     }
 
-    fn create_source_surface_from_data(&self, _data: Snapshot) -> Option<Self::SourceSurface> {
-        Some(())
+    fn create_source_surface_from_data(&self, data: Snapshot) -> Option<Self::SourceSurface> {
+        Some(snapshot_as_pixmap(data))
     }
 }

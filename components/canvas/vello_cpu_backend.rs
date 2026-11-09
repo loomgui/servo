@@ -530,7 +530,7 @@ impl GenericDrawTarget for VelloCPUDrawTarget {
     }
 }
 
-fn snapshot_as_pixmap(mut snapshot: Snapshot) -> Arc<vello_cpu::Pixmap> {
+pub(crate) fn snapshot_as_pixmap(mut snapshot: Snapshot) -> Arc<vello_cpu::Pixmap> {
     let size = snapshot.size().cast();
     snapshot.transform(
         SnapshotAlphaMode::Transparent {
