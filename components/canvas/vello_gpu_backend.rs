@@ -627,6 +627,16 @@ impl VelloGpuDrawTarget {
             f(self);
             return;
         }
+        // `lighter` is plain additive blending. Outside clip layers it can blend straight into
+        // the canvas instead of through a layer per draw (two GPU passes each).
+        if composition_operation == CompositionOrBlending::Composition(CompositionStyle::Lighter) &&
+            self.clips.is_empty()
+        {
+            self.scene.set_additive(true);
+            f(self);
+            self.scene.set_additive(false);
+            return;
+        }
         self.scene.push_blend_layer(composition_operation.convert());
         f(self);
         self.scene.pop_layer();

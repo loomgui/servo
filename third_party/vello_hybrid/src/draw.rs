@@ -38,24 +38,42 @@ impl Draw {
         strips: &mut Vec<GpuStrip>,
         gpu_strip: GpuStrip,
         external_texture_id: Option<TextureId>,
+        additive: bool,
     ) {
-        if let Some(texture_id) = external_texture_id {
-            let needs_new_run = self
-                .external_texture_runs
-                .last()
-                .is_none_or(|run| run.texture_id != texture_id);
-
-            if needs_new_run {
-                let strips_start = if self.external_texture_runs.is_empty() {
-                    0
-                } else {
-                    self.strip_ranges.len()
-                };
-
-                self.external_texture_runs.push(ExternalTextureRun {
-                    strips_start,
-                    texture_id,
-                });
+        // Loom: runs split on the external texture binding and on additive blending. Without
+        // any run, every strip draws source-over with no external texture.
+        let position = self.strip_ranges.len();
+        match self.external_texture_runs.last_mut() {
+            None => {
+                if external_texture_id.is_some() || additive {
+                    if additive && position > 0 {
+                        self.external_texture_runs.push(ExternalTextureRun {
+                            strips_start: 0,
+                            texture_id: None,
+                            additive: false,
+                        });
+                    }
+                    self.external_texture_runs.push(ExternalTextureRun {
+                        // A texture-only first run also covers earlier strips: binding a
+                        // texture they do not sample is harmless.
+                        strips_start: if additive { position } else { 0 },
+                        texture_id: external_texture_id,
+                        additive,
+                    });
+                }
+            }
+            Some(run) => {
+                let texture_conflict = external_texture_id
+                    .is_some_and(|id| run.texture_id.is_some_and(|current| current != id));
+                if run.additive != additive || texture_conflict {
+                    self.external_texture_runs.push(ExternalTextureRun {
+                        strips_start: position,
+                        texture_id: external_texture_id,
+                        additive,
+                    });
+                } else if run.texture_id.is_none() {
+                    run.texture_id = external_texture_id;
+                }
             }
         }
 
@@ -107,7 +125,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         match draw {
             RecordedDraw::Path(path) => self.push_path(path, strip_storage, paint_resolver),
             RecordedDraw::Rect(rect) => {
-                self.push_rect(&rect.rect, &rect.paint, paint_resolver);
+                self.push_rect(&rect.rect, &rect.paint, rect.additive, paint_resolver);
             }
         }
     }
@@ -130,10 +148,13 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         let strips = &strip_storage.strips[path.strips.clone()];
 
         let paint = paint_resolver.pack(&path.paint);
+        let additive = path.additive;
+        // Loom: additive draws blend with what is below, so they are never opaque.
+        let opaque = paint.opaque && !additive;
         // Note: This will also advance the depth index for layer root draws even though
         // those _currently_ never use the depth buffer, but it's better to keep the
         // condition simple, and it's not incorrect to do so.
-        let depth_index = self.state.depth_counter.next(paint.opaque);
+        let depth_index = self.state.depth_counter.next(opaque);
         let tile_bounds = self.state.target_bbox.to_tile_bounds();
         let geometry_shift = self.state.target.geometry_shift();
 
@@ -158,7 +179,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
 
                 builder
                     .draw
-                    .push(builder.strips, strip, paint.external_texture_id);
+                    .push(builder.strips, strip, paint.external_texture_id, additive);
             },
             |builder, segment| {
                 let shifted = segment.shift(geometry_shift);
@@ -172,16 +193,22 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
                     depth_index,
                 );
 
-                if !paint.opaque || !builder.push_opaque(strip) {
+                if !opaque || !builder.push_opaque(strip) {
                     builder
                         .draw
-                        .push(builder.strips, strip, paint.external_texture_id);
+                        .push(builder.strips, strip, paint.external_texture_id, additive);
                 }
             },
         );
     }
 
-    fn push_rect(&mut self, rect: &Rect, paint: &Paint, paint_resolver: PaintResolver<'_>) {
+    fn push_rect(
+        &mut self,
+        rect: &Rect,
+        paint: &Paint,
+        additive: bool,
+        paint_resolver: PaintResolver<'_>,
+    ) {
         // Recordings might contain geometry that exceeds the actual layer
         // bounding box. This can happen when a clip path is associated with the layer.
         // Recordings will not cull those for us, so we need to do this manually here.
@@ -193,7 +220,8 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         }
 
         let paint = paint_resolver.pack(paint);
-        let depth_index = self.state.depth_counter.next(paint.opaque);
+        let opaque = paint.opaque && !additive;
+        let depth_index = self.state.depth_counter.next(opaque);
 
         let split = split_rect(&clipped_rect);
 
@@ -217,9 +245,9 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
                 depth_index,
             );
 
-            if !(paint.opaque && part.frac == 0 && self.push_opaque(strip)) {
+            if !(opaque && part.frac == 0 && self.push_opaque(strip)) {
                 self.draw
-                    .push(self.strips, strip, paint.external_texture_id);
+                    .push(self.strips, strip, paint.external_texture_id, additive);
             }
         }
     }
@@ -284,6 +312,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
                     depth_index,
                 ),
                 None,
+                false,
             );
         }
     }
@@ -302,7 +331,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         let shifted = segment.shift(self.state.target.geometry_shift());
         let strip = GpuStrip::from_fill_segment(shifted, col_idx, payload, paint, depth_index);
 
-        self.draw.push(self.strips, strip, None);
+        self.draw.push(self.strips, strip, None, false);
     }
 }
 
@@ -401,11 +430,13 @@ impl LayerTextureRegion {
 }
 
 /// Specifies a run of strips inside a draw that can be drawn with the same external texture
-/// binding.
+/// binding and blending.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternalTextureRun {
-    /// External texture bound for the run.
-    pub(crate) texture_id: TextureId,
+    /// External texture bound for the run, if any strip in it samples one.
+    pub(crate) texture_id: Option<TextureId>,
+    /// Loom: the run composites additively (`plus`) instead of source-over.
+    pub(crate) additive: bool,
     /// Start index of the strip range for this run. The end is implicitly the start of the next
     /// run, or, for the last run, the total number of strips.
     pub(crate) strips_start: usize,

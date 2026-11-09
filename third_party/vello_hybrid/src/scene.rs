@@ -55,6 +55,8 @@ pub(crate) struct RecordedPath {
     pub(crate) strips: Range<usize>,
     /// Paint applied to the path.
     pub(crate) paint: Paint,
+    /// Loom: composite with additive (`plus`) blending instead of source-over.
+    pub(crate) additive: bool,
 }
 
 /// Recorded rectangle and its paint.
@@ -64,15 +66,34 @@ pub(crate) struct RecordedRect {
     pub(crate) rect: Rect,
     /// Paint applied to the rectangle.
     pub(crate) paint: Paint,
+    /// Loom: composite with additive (`plus`) blending instead of source-over.
+    pub(crate) additive: bool,
 }
 
 impl RecordedDraw {
     fn new_path(strips: Range<usize>, paint: Paint) -> Self {
-        Self::Path(RecordedPath { strips, paint })
+        Self::Path(RecordedPath {
+            strips,
+            paint,
+            additive: false,
+        })
     }
 
     fn new_rect(rect: Rect, paint: Paint) -> Self {
-        Self::Rect(RecordedRect { rect, paint })
+        Self::Rect(RecordedRect {
+            rect,
+            paint,
+            additive: false,
+        })
+    }
+
+    /// Loom: mark the draw as additive.
+    fn with_additive(mut self, additive: bool) -> Self {
+        match &mut self {
+            Self::Path(path) => path.additive = additive,
+            Self::Rect(rect) => rect.additive = additive,
+        }
+        self
     }
 }
 
@@ -225,6 +246,8 @@ pub struct Scene {
     filter: Option<Filter>,
     /// The command recorder.
     pub(crate) recorder: CommandRecorder<RecordedDraw>,
+    /// Loom: draws are composited additively (see [`Scene::set_additive`]).
+    additive: bool,
 }
 
 impl Scene {
@@ -251,6 +274,7 @@ impl Scene {
             strip_storage: RefCell::new(StripStorage::new(GenerationMode::Append)),
             filter: None,
             recorder: CommandRecorder::new(width, height),
+            additive: false,
         }
     }
 
@@ -459,8 +483,10 @@ impl Scene {
             let paint = ctx.encode_current_paint();
 
             if let Some(bounds) = ctx.fast_rect_bounds(rect) {
-                ctx.recorder
-                    .push_draw(RecordedDraw::new_rect(bounds, paint), &[]);
+                ctx.recorder.push_draw(
+                    RecordedDraw::new_rect(bounds, paint).with_additive(ctx.additive),
+                    &[],
+                );
 
                 return;
             }
@@ -551,8 +577,10 @@ impl Scene {
                         transform,
                     );
 
-                    ctx.recorder
-                        .push_draw(RecordedDraw::new_rect(transformed_rect, paint), &[]);
+                    ctx.recorder.push_draw(
+                        RecordedDraw::new_rect(transformed_rect, paint).with_additive(ctx.additive),
+                        &[],
+                    );
                 } else {
                     let paint = ctx.encode_external_texture_paint(
                         texture_id,
@@ -593,7 +621,7 @@ impl Scene {
             return;
         }
 
-        let draw = RecordedDraw::new_path(strips.clone(), paint);
+        let draw = RecordedDraw::new_path(strips.clone(), paint).with_additive(self.additive);
         let strip_storage = self.strip_storage.borrow();
         self.recorder.push_draw(draw, &strip_storage.strips[strips]);
     }
@@ -841,6 +869,16 @@ impl Scene {
         self.render_state.blend_mode = blend_mode;
     }
 
+    /// Loom: composite subsequent fills and strokes additively (`plus`, as canvas `lighter`)
+    /// straight into their target, instead of through a blend layer per draw.
+    ///
+    /// Equivalent to `push_layer(None, Some(Compose::Plus), ..)` around each draw only when the
+    /// target is the surface the draw would otherwise be blended into, so callers must not use it
+    /// inside clip or other layers. Additive draws are never treated as opaque.
+    pub fn set_additive(&mut self, additive: bool) {
+        self.additive = additive;
+    }
+
     /// Set the stroke settings for subsequent stroke operations.
     pub fn set_stroke(&mut self, stroke: Stroke) {
         self.render_state.stroke = stroke;
@@ -967,6 +1005,7 @@ impl Scene {
 
         self.recorder.reset(self.width, self.height);
         self.filter = None;
+        self.additive = false;
     }
 
     /// Get the width of the render context.

@@ -2636,12 +2636,24 @@ impl WebGlRendererContext<'_> {
                 let end = external_texture_runs
                     .get(i + 1)
                     .map_or(count, |next| i32::try_from(next.strips_start).unwrap());
-                let texture = self
-                    .texture_bindings
-                    .get(run.texture_id)
-                    .expect("external texture bindings were validated during paint preparation");
-                self.bind_external_texture(Some(texture));
+                let texture = run.texture_id.map(|texture_id| {
+                    self.texture_bindings.get(texture_id).expect(
+                        "external texture bindings were validated during paint preparation",
+                    )
+                });
+                self.bind_external_texture(texture);
+                // Loom: additive (`plus`) runs blend straight into the target.
+                if run.additive {
+                    self.gl
+                        .blend_func(WebGl2RenderingContext::ONE, WebGl2RenderingContext::ONE);
+                }
                 self.draw_strip_range(first_instance + start, end - start);
+                if run.additive {
+                    self.gl.blend_func(
+                        WebGl2RenderingContext::ONE,
+                        WebGl2RenderingContext::ONE_MINUS_SRC_ALPHA,
+                    );
+                }
             }
             self.bind_external_texture(None);
         }
