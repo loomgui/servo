@@ -386,6 +386,7 @@ impl Painter {
                 enable_subpixel_aa: pref!(gfx_subpixel_text_antialiasing_enabled),
                 allow_texture_swizzling: pref!(gfx_texture_swizzling_enabled),
                 enable_dithering: true,
+                enable_gpu_markers: pref!(gfx_gpu_markers_enabled),
                 clear_color,
                 cached_programs,
                 upload_method,

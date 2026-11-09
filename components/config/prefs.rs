@@ -244,6 +244,10 @@ pub struct Preferences {
     /// <https://drafts.csswg.org/cssom-view/#the-visualviewport-interface>
     // feature: VisualViewport | #41341 | Web/API/VisualViewport
     pub dom_visual_viewport_enabled: bool,
+    /// Whether WebRender emits GPU debug markers (`KHR_debug` push/pop groups) around its
+    /// passes. They help GPU debuggers and profilers label work, but every marker is a GL
+    /// call on the paint thread; embedders that do not capture GPU traces can disable them.
+    pub gfx_gpu_markers_enabled: bool,
     /// True to compile all WebRender shaders when Servo initializes. This is mostly
     /// useful when modifying the shaders, to ensure they all compile after each change is
     /// made.
@@ -513,6 +517,7 @@ impl Preferences {
             fonts_monospace: String::new(),
             fonts_sans_serif: String::new(),
             fonts_serif: String::new(),
+            gfx_gpu_markers_enabled: true,
             gfx_precache_shaders: false,
             gfx_text_antialiasing_enabled: true,
             gfx_subpixel_text_antialiasing_enabled: true,
