@@ -82,6 +82,11 @@ impl PaintProxy {
     }
 }
 
+/// How long after an applied seal a WebView counts as seal-driven: its embedder is supplying
+/// rendering opportunities, so Servo does not generate its own for it. Long enough to bridge
+/// slow embedder frames, short enough that a stalled embedder does not freeze the page.
+pub const SEAL_DRIVEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Correlation of one already-applied embedder seal; this is not readiness.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AppliedSeal {

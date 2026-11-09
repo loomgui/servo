@@ -411,6 +411,8 @@ pub struct ScriptThread {
     pending_rendering_update_callbacks: RefCell<Vec<GenericCallback<bool>>>,
     #[no_trace]
     pending_applied_seal_updates: RefCell<Vec<paint_api::AppliedSealOpportunity>>,
+    /// When this thread last received a seal-tagged rendering opportunity from the embedder.
+    last_applied_seal_opportunity: Cell<Option<Instant>>,
 
     /// Whether an animation tick or ScriptThread-triggered rendering update is pending. This might
     /// either be because the Servo renderer is managing animations and the [`ScriptThread`] has
@@ -990,6 +992,7 @@ impl ScriptThread {
                     scheduled_update_the_rendering: Default::default(),
                     pending_rendering_update_callbacks: Default::default(),
                     pending_applied_seal_updates: Default::default(),
+                    last_applied_seal_opportunity: Default::default(),
                     needs_rendering_update: Arc::new(AtomicBool::new(false)),
                     debugger_global: debugger_global.as_traced(),
                     debugger_paused: Cell::new(false),
@@ -1130,7 +1133,17 @@ impl ScriptThread {
                 continue;
             }
 
-            if document.waiting_on_canvas_image_updates() {
+            // An embedder's applied seal promises a scene of the DOM state it acknowledged, so
+            // its rendering opportunity always updates the document. Skipping it because an
+            // earlier update's canvas image is still rasterizing would build that scene from a
+            // display list laid out before the acknowledged state. The renderer keeps the frame
+            // delayed until the newest canvas epoch arrives.
+            let has_applied_seal = self
+                .pending_applied_seal_updates
+                .borrow()
+                .iter()
+                .any(|opportunity| opportunity.seal.webview_id == document.webview_id());
+            if document.waiting_on_canvas_image_updates() && !has_applied_seal {
                 continue;
             }
 
@@ -1320,6 +1333,18 @@ impl ScriptThread {
         // necessary, just exit early and schedule the next rendering update
         // when it becomes necessary.
         if !needs_rendering_update && !running_animations {
+            return;
+        }
+
+        // While the embedder is applying frame seals, each seal is the rendering opportunity
+        // for its frame. An update scheduled here would run between seals, where its result
+        // can never be shown on its own, and its canvas work could still be rasterizing when
+        // the next seal arrives.
+        if self
+            .last_applied_seal_opportunity
+            .get()
+            .is_some_and(|at| at.elapsed() < paint_api::SEAL_DRIVEN_WINDOW)
+        {
             return;
         }
 
@@ -1936,6 +1961,7 @@ impl ScriptThread {
             },
             ScriptThreadMessage::TickAllAnimations(_webviews, callback, opportunity) => {
                 if let Some(opportunity) = opportunity {
+                    self.last_applied_seal_opportunity.set(Some(Instant::now()));
                     self.pending_applied_seal_updates
                         .borrow_mut()
                         .push(opportunity);
