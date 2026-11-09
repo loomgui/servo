@@ -372,6 +372,10 @@ impl WebGlRenderer {
             height: atlas_height,
         };
 
+        // Loom: glyph rasterization runs inside `render_to_texture`; keep its target.
+        let outer_override = self.programs.resources.view_framebuffer_override.take();
+        let outer_negate_ndc =
+            core::mem::replace(&mut self.programs.resources.view_override_negate_ndc, false);
         let atlas_framebuffer = self
             .programs
             .resources
@@ -425,6 +429,8 @@ impl WebGlRenderer {
         // Restore the default view framebuffer and cache the atlas FBO for reuse.
         self.programs.resources.atlas_render_framebuffer =
             self.programs.resources.view_framebuffer_override.take();
+        self.programs.resources.view_framebuffer_override = outer_override;
+        self.programs.resources.view_override_negate_ndc = outer_negate_ndc;
 
         result
     }
@@ -525,12 +531,22 @@ impl WebGlRenderer {
                 WebGl2RenderingContext::FRAMEBUFFER,
                 self.programs.resources.view_framebuffer_override.as_deref(),
             );
-            self.gl
-                .invalidate_framebuffer(
-                    WebGl2RenderingContext::FRAMEBUFFER,
-                    &self.programs.resources.depth_attachment_array,
-                )
-                .unwrap();
+            // Loom: a framebuffer object names its depth buffer DEPTH_ATTACHMENT.
+            if self.programs.resources.view_framebuffer_override.is_some() {
+                self.gl
+                    .invalidate_framebuffer(
+                        WebGl2RenderingContext::FRAMEBUFFER,
+                        &js_sys::Array::of1(&WebGl2RenderingContext::DEPTH_ATTACHMENT.into()),
+                    )
+                    .unwrap();
+            } else {
+                self.gl
+                    .invalidate_framebuffer(
+                        WebGl2RenderingContext::FRAMEBUFFER,
+                        &self.programs.resources.depth_attachment_array,
+                    )
+                    .unwrap();
+            }
         }
 
         self.gradient_cache.maintain();
@@ -555,6 +571,61 @@ impl WebGlRenderer {
         writer: &T,
     ) -> ImageId {
         self.upload_image_with(&mut resources.image_cache, writer, IMAGE_PADDING)
+    }
+
+    /// Loom: render `scene` into `texture` (a `texture_target` texture of at least `render_size`)
+    /// instead of the default framebuffer, with the same bottom-up orientation. An internal
+    /// framebuffer with a depth buffer (for the opaque early-z pass) is reused across calls.
+    pub fn render_to_texture(
+        &mut self,
+        scene: &Scene,
+        resources: &mut Resources,
+        render_size: &RenderSize,
+        texture_bindings: &WebGlTextureBindings,
+        clear: bool,
+        texture: WebGlTexture,
+        texture_target: u32,
+    ) -> Result<(), RenderError> {
+        let mut target = self
+            .programs
+            .resources
+            .output_target
+            .take()
+            .unwrap_or_else(|| OutputTarget::new(&self.gl));
+        target.bind(&self.gl, texture, texture_target, render_size);
+        self.programs.resources.view_framebuffer_override = Some(target.framebuffer);
+        self.programs.resources.view_override_negate_ndc = true;
+        let result =
+            self.render_with_clear(scene, resources, render_size, texture_bindings, clear);
+        let framebuffer = self
+            .programs
+            .resources
+            .view_framebuffer_override
+            .take()
+            .expect("render_to_texture's framebuffer");
+        self.programs.resources.view_override_negate_ndc = false;
+        self.programs.resources.output_target = Some(OutputTarget {
+            framebuffer,
+            ..target
+        });
+        self.gl
+            .bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, None);
+        result
+    }
+
+    /// Like [`upload_image`](Self::upload_image), but returns `None` instead of panicking when
+    /// the atlas has no room for the image (Loom).
+    pub fn try_upload_image<T: WebGlAtlasWriter>(
+        &mut self,
+        resources: &mut Resources,
+        writer: &T,
+    ) -> Option<ImageId> {
+        let image_id = resources
+            .image_cache
+            .allocate(writer.width(), writer.height(), IMAGE_PADDING)
+            .ok()?;
+        self.write_to_atlas(&resources.image_cache, image_id, writer, None);
+        Some(image_id)
     }
 
     pub(crate) fn upload_image_with<T: WebGlAtlasWriter>(
@@ -976,6 +1047,8 @@ pub(crate) struct WebGlResources {
     alphas_texture: Texture,
     /// Height of alpha texture.
     alpha_texture_height: u32,
+    /// Loom: rows currently allocated for the alphas texture.
+    alpha_texture_allocated: u32,
     /// Texture array for atlas data (multiple atlases supported)
     pub(crate) atlas_texture_array: WebGlTextureArray,
     /// Configured dimensions used when promoting the placeholder to a real atlas.
@@ -986,17 +1059,26 @@ pub(crate) struct WebGlResources {
     encoded_paints_texture: Texture,
     /// Height of encoded paints texture.
     encoded_paints_texture_height: u32,
+    /// Loom: rows currently allocated for the encoded paints texture.
+    encoded_paints_texture_allocated: u32,
     /// Gradient texture for gradient ramp data.
     gradient_texture: Texture,
     /// Placeholder texture bound to the strip shader's `external_texture` sampler.
     placeholder_external_texture: Texture,
     /// Height of gradient texture.
     gradient_texture_height: u32,
+    /// Loom: rows currently allocated for the gradient texture.
+    gradient_texture_allocated: u32,
 
     /// Config buffer for rendering strips into the root target.
     view_config_buffer: Buffer,
 
     pub(crate) view_framebuffer_override: Option<Framebuffer>,
+    /// Loom: keep the default framebuffer's bottom-up orientation while rendering into
+    /// `view_framebuffer_override` (see `WebGlRenderer::render_to_texture`).
+    pub(crate) view_override_negate_ndc: bool,
+    /// Loom: framebuffer and depth buffer for `WebGlRenderer::render_to_texture`.
+    output_target: Option<OutputTarget>,
     /// Whether the depth buffer has been cleared this frame.
     depth_cleared_this_frame: bool,
     /// Pre-allocated JS array for `invalidateFramebuffer` calls.
@@ -1492,7 +1574,8 @@ impl WebGlPrograms {
         new_render_size: &RenderSize,
     ) {
         // Only negate if we are rendering to the main frame buffer.
-        let negate_ndc = self.resources.view_framebuffer_override.is_none();
+        let negate_ndc = self.resources.view_framebuffer_override.is_none()
+            || self.resources.view_override_negate_ndc;
 
         // TODO: Collect all attributes that influence the config buffer into a
         // single struct and compare that, such that we cannot forget to update the
@@ -1532,19 +1615,22 @@ impl WebGlPrograms {
 
         let alpha_texture_width = self.resources.max_texture_dimension_2d;
         let alpha_texture_height = self.resources.alpha_texture_height;
-        let total_size = alpha_texture_width as usize * alpha_texture_height as usize * 16;
 
         let original_len = alphas.len();
 
-        // Temporarily pad the length of the alphas to the texture size before uploading.
-        alphas.resize(total_size, 0);
-
-        upload_data_to_rgba32_texture(
+        // Loom: pad to whole texels and upload only those; the texture is reallocated only when
+        // it grows. Upstream padded to, and re-specified, the whole texture every frame (at
+        // least one 16384-texel row: 256 KiB).
+        let texels = original_len.div_ceil(16);
+        alphas.resize(texels * 16, 0);
+        upload_texels(
             gl,
             &self.resources.alphas_texture,
-            bytemuck::cast_slice::<u8, u32>(alphas),
+            TexelFormat::RGBA32UI,
+            alphas,
             alpha_texture_width,
             alpha_texture_height,
+            &mut self.resources.alpha_texture_allocated,
         );
 
         // Truncate back to the original size.
@@ -1563,12 +1649,16 @@ impl WebGlPrograms {
 
             GpuEncodedPaint::serialize_to_buffer(encoded_paints, &mut self.encoded_paints_data);
 
-            upload_data_to_rgba32_texture(
+            // Loom: upload only the serialized paints, without reallocating the texture.
+            let used_bytes = paint_bytes(encoded_paints).min(self.encoded_paints_data.len());
+            upload_texels(
                 gl,
                 &self.resources.encoded_paints_texture,
-                bytemuck::cast_slice::<u8, u32>(&self.encoded_paints_data),
+                TexelFormat::RGBA32UI,
+                &self.encoded_paints_data[..used_bytes],
                 encoded_paints_texture_width,
                 encoded_paints_texture_height,
+                &mut self.resources.encoded_paints_texture_allocated,
             );
         }
     }
@@ -1585,31 +1675,22 @@ impl WebGlPrograms {
 
         let gradient_texture_width = self.resources.max_texture_dimension_2d;
         let gradient_texture_height = self.resources.gradient_texture_height;
-        let total_capacity = (gradient_texture_width * gradient_texture_height * 4) as usize;
 
-        // Take ownership of the luts to avoid copying, then resize for texture padding.
+        // Take ownership of the luts to avoid copying, then pad to whole texels.
         let mut luts = gradient_cache.take_luts();
         let old_luts_len = luts.len();
-        luts.resize(total_capacity, 0);
+        luts.resize(old_luts_len.div_ceil(4) * 4, 0);
 
-        gl.active_texture(WebGl2RenderingContext::TEXTURE0);
-        gl.bind_texture(
-            WebGl2RenderingContext::TEXTURE_2D,
-            Some(&self.resources.gradient_texture),
+        // Loom: upload only the ramps, without reallocating the texture.
+        upload_texels(
+            gl,
+            &self.resources.gradient_texture,
+            TexelFormat::RGBA8,
+            &luts,
+            gradient_texture_width,
+            gradient_texture_height,
+            &mut self.resources.gradient_texture_allocated,
         );
-
-        gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
-            WebGl2RenderingContext::TEXTURE_2D,
-            0,
-            WebGl2RenderingContext::RGBA8 as i32,
-            gradient_texture_width as i32,
-            gradient_texture_height as i32,
-            0,
-            WebGl2RenderingContext::RGBA,
-            WebGl2RenderingContext::UNSIGNED_BYTE,
-            Some(&luts),
-        )
-        .unwrap();
 
         // Restore the luts back to the cache.
         luts.truncate(old_luts_len);
@@ -2365,16 +2446,21 @@ fn create_webgl_resources(
         strips_buffer,
         alphas_texture,
         alpha_texture_height: 0,
+        alpha_texture_allocated: 0,
         atlas_texture_array,
         atlas_size,
         atlas_layer_count,
         encoded_paints_texture,
         encoded_paints_texture_height: 0,
+        encoded_paints_texture_allocated: 0,
         gradient_texture,
         placeholder_external_texture,
         gradient_texture_height: 0,
+        gradient_texture_allocated: 0,
         view_config_buffer,
         view_framebuffer_override: None,
+        view_override_negate_ndc: false,
+        output_target: None,
         depth_cleared_this_frame: false,
         // Note: we use DEPTH (not DEPTH_ATTACHMENT) because we render to the default
         // framebuffer. If we ever support non-default framebuffers, this must change
@@ -3383,4 +3469,187 @@ fn upload_data_to_rgba32_texture(
         Some(&packed_array),
     )
     .unwrap();
+}
+
+/// Loom: the framebuffer `WebGlRenderer::render_to_texture` renders through. ANGLE rejects depth
+/// attachments larger than the color attachment, so depth buffers are kept per target size (a few
+/// most recently used sizes).
+#[derive(Debug)]
+struct OutputTarget {
+    framebuffer: Framebuffer,
+    depth: Vec<((u32, u32), glow::NativeRenderbuffer)>,
+}
+
+/// Depth buffers kept for distinct target sizes.
+const MAX_OUTPUT_DEPTH_BUFFERS: usize = 8;
+
+impl OutputTarget {
+    fn new(gl: &WebGl2RenderingContext) -> Self {
+        Self {
+            framebuffer: Framebuffer::new(gl),
+            depth: Vec::new(),
+        }
+    }
+
+    fn depth_buffer(
+        &mut self,
+        glow: &glow::Context,
+        size: (u32, u32),
+    ) -> glow::NativeRenderbuffer {
+        use glow::HasContext;
+        if let Some(index) = self.depth.iter().position(|(s, _)| *s == size) {
+            // Most recently used first.
+            let entry = self.depth.remove(index);
+            self.depth.insert(0, entry);
+            return entry.1;
+        }
+        // SAFETY: plain GL calls on the renderer's current context.
+        unsafe {
+            if self.depth.len() == MAX_OUTPUT_DEPTH_BUFFERS
+                && let Some((_, oldest)) = self.depth.pop()
+            {
+                glow.delete_renderbuffer(oldest);
+            }
+            let depth = glow.create_renderbuffer().expect("depth renderbuffer");
+            glow.bind_renderbuffer(glow::RENDERBUFFER, Some(depth));
+            glow.renderbuffer_storage(
+                glow::RENDERBUFFER,
+                glow::DEPTH24_STENCIL8,
+                size.0 as i32,
+                size.1 as i32,
+            );
+            glow.bind_renderbuffer(glow::RENDERBUFFER, None);
+            self.depth.insert(0, (size, depth));
+            depth
+        }
+    }
+
+    fn bind(
+        &mut self,
+        gl: &WebGl2RenderingContext,
+        texture: WebGlTexture,
+        texture_target: u32,
+        size: &RenderSize,
+    ) {
+        use glow::HasContext;
+        let glow = gl.glow();
+        let depth = self.depth_buffer(glow, (size.width, size.height));
+        // SAFETY: plain GL calls on the renderer's current context.
+        unsafe {
+            glow.bind_framebuffer(glow::FRAMEBUFFER, Some(*self.framebuffer));
+            glow.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                texture_target,
+                Some(texture),
+                0,
+            );
+            glow.framebuffer_renderbuffer(
+                glow::FRAMEBUFFER,
+                glow::DEPTH_STENCIL_ATTACHMENT,
+                glow::RENDERBUFFER,
+                Some(depth),
+            );
+        }
+    }
+}
+
+/// Loom: texel formats `upload_texels` handles.
+#[derive(Clone, Copy, Debug)]
+enum TexelFormat {
+    RGBA32UI,
+    RGBA8,
+}
+
+impl TexelFormat {
+    fn bytes(self) -> usize {
+        match self {
+            Self::RGBA32UI => 16,
+            Self::RGBA8 => 4,
+        }
+    }
+
+    fn gl(self) -> (i32, u32, u32) {
+        match self {
+            Self::RGBA32UI => (glow::RGBA32UI as i32, glow::RGBA_INTEGER, glow::UNSIGNED_INT),
+            Self::RGBA8 => (glow::RGBA8 as i32, glow::RGBA, glow::UNSIGNED_BYTE),
+        }
+    }
+}
+
+/// Loom: bytes the serialized `encoded_paints` occupy, rounded up to whole RGBA32UI texels.
+fn paint_bytes(encoded_paints: &[GpuEncodedPaint]) -> usize {
+    let bytes: usize = encoded_paints.iter().map(|paint| paint.as_bytes().len()).sum();
+    bytes.div_ceil(16) * 16
+}
+
+/// Loom: upload `data` (whole texels, row-major, `width` texels per row) to the start of
+/// `texture`, allocating `width`×`height` storage only when that exceeds `allocated` rows.
+/// Uploads full rows in one call and the final partial row in another; texels past `data` keep
+/// stale contents, which the shaders never address.
+fn upload_texels(
+    gl: &WebGl2RenderingContext,
+    texture: &WebGlTexture,
+    format: TexelFormat,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    allocated: &mut u32,
+) {
+    use glow::HasContext;
+    let glow = gl.glow();
+    let (internal_format, pixel_format, ty) = format.gl();
+    let texel_bytes = format.bytes();
+    debug_assert_eq!(data.len() % texel_bytes, 0, "upload_texels takes whole texels");
+    let texels = data.len() / texel_bytes;
+    let width_texels = width as usize;
+    // SAFETY: plain GL calls on the renderer's current context; GL copies client memory before
+    // returning.
+    unsafe {
+        glow.active_texture(glow::TEXTURE0);
+        glow.bind_texture(glow::TEXTURE_2D, Some(*texture));
+        if *allocated < height {
+            glow.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                internal_format,
+                width as i32,
+                height as i32,
+                0,
+                pixel_format,
+                ty,
+                glow::PixelUnpackData::Slice(None),
+            );
+            *allocated = height;
+        }
+        let full_rows = texels / width_texels;
+        let remainder = texels % width_texels;
+        if full_rows > 0 {
+            glow.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                width as i32,
+                full_rows as i32,
+                pixel_format,
+                ty,
+                glow::PixelUnpackData::Slice(Some(&data[..full_rows * width_texels * texel_bytes])),
+            );
+        }
+        if remainder > 0 {
+            let start = full_rows * width_texels * texel_bytes;
+            glow.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                full_rows as i32,
+                remainder as i32,
+                1,
+                pixel_format,
+                ty,
+                glow::PixelUnpackData::Slice(Some(&data[start..start + remainder * texel_bytes])),
+            );
+        }
+    }
 }

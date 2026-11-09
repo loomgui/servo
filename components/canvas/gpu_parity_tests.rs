@@ -513,6 +513,10 @@ fn lato() -> &'static (uuid::Uuid, Vec<u8>) {
     })
 }
 
+thread_local! {
+    static LATO_DATA: FontData = FontData::from_bytes(&lato().1);
+}
+
 /// Lay `text` out on one line with the font's own advances (no shaping; enough for parity).
 fn text_run(text: &str, x: f32, y: f32, pt_size: f32) -> TextRun {
     use skrifa::MetadataProvider;
@@ -537,7 +541,8 @@ fn text_run(text: &str, x: f32, y: f32, pt_size: f32) -> TextRun {
         font: CanvasFont {
             identifier: FontIdentifier::ArrayBuffer(*id),
             data: Some(FontDataAndIndex {
-                data: FontData::from_bytes(bytes),
+                // Shared once per thread, like a loaded web font (not copied per text run).
+                data: LATO_DATA.with(|data| data.clone()),
                 index: 0,
             }),
         },
@@ -829,3 +834,6 @@ parity!(ember_particles, 256, 192, |t| {
         t.fill(&circle(x, y, size * 0.7), FillRule::Nonzero, color(255, 240, 220, alpha), lighter, identity());
     }
 });
+
+#[path = "gpu_bench.rs"]
+mod gpu_bench;

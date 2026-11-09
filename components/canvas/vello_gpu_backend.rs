@@ -16,7 +16,8 @@
 //! back as the background when later draws are not preceded by a full-canvas clear.
 //!
 //! Images (`drawImage`, `putImageData`, patterns) are uploaded into `vello_hybrid`'s image atlas
-//! for the next rasterization and released right after it.
+//! once per distinct content: uploads are cached per thread by a content hash, pinned while a
+//! pending scene samples them, and evicted when idle or over budget.
 
 #![allow(
     unsafe_code,
@@ -25,6 +26,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -63,6 +65,47 @@ use crate::vello_cpu_backend::{paint, snapshot_as_pixmap};
 const RETAINED_TEXTURE: TextureId = TextureId(1);
 /// Largest image side the renderer's atlas pages hold (`AtlasConfig::default().atlas_size`).
 const MAX_ATLAS_IMAGE_SIDE: u16 = 4096;
+/// Atlas bytes cached uploads may hold before unpinned ones are evicted, oldest first.
+const UPLOAD_CACHE_BUDGET: usize = 64 << 20;
+/// Rasterizations (on any canvas of the thread) after which an unused upload is evicted.
+const UPLOAD_CACHE_MAX_IDLE: u64 = 600;
+
+/// Identifies uploaded image content: its size and a hash of its premultiplied pixels.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct UploadKey {
+    width: u16,
+    height: u16,
+    hash: u64,
+}
+
+impl UploadKey {
+    fn of(pixmap: &vello_cpu::Pixmap) -> Self {
+        let mut hasher = rustc_hash::FxHasher::default();
+        pixmap.data_as_u8_slice().hash(&mut hasher);
+        Self {
+            width: pixmap.width(),
+            height: pixmap.height(),
+            hash: hasher.finish(),
+        }
+    }
+}
+
+struct Upload {
+    id: ImageId,
+    /// Pending scenes that sample this upload; pinned uploads are never evicted.
+    pins: u32,
+    last_used: u64,
+    bytes: usize,
+}
+
+/// Atlas uploads shared by every canvas of a thread.
+#[derive(Default)]
+struct ImageUploads {
+    entries: HashMap<UploadKey, Upload>,
+    bytes: usize,
+    /// Counts rasterizations; drives idle eviction.
+    epoch: u64,
+}
 
 fn warn_once(flag: &'static std::thread::LocalKey<Cell<bool>>, message: &str) {
     flag.with(|warned| {
@@ -119,9 +162,9 @@ fn shared() -> Option<&'static GpuCanvasShared> {
 
 /// GL state shared by every GPU canvas on a canvas thread: a surfman device and context on
 /// WebRender's adapter, one `vello_hybrid` renderer and its resources (image and glyph atlases,
-/// gradient ramps). Canvases own only a swap chain on this context and a retained texture. Before
-/// a canvas renders, its swap chain takes the context's surface attachment; a 1×1 anchor swap
-/// chain holds the attachment while no canvas does.
+/// gradient ramps). Canvases own only a detached swap chain on this context and a retained
+/// texture. A canvas renders into its swap chain's back buffer as a texture, so the context's own
+/// (1×1) surface never changes: rebinding surfaces makes ANGLE wait on every switch.
 struct GpuThread {
     device: Device,
     /// Never dropped: this lives until the canvas thread exits, and tearing down EGL objects from
@@ -130,10 +173,10 @@ struct GpuThread {
     gl: WebGl2RenderingContext,
     renderer: RefCell<WebGlRenderer>,
     resources: RefCell<Resources>,
+    uploads: RefCell<ImageUploads>,
     shared: &'static GpuCanvasShared,
-    anchor: ExternalImageId,
-    /// The swap chain whose back buffer is bound to the context.
-    attached: Cell<ExternalImageId>,
+    /// Reads a canvas's back buffer into its retained texture.
+    copy_framebuffer: glow::NativeFramebuffer,
 }
 
 thread_local! {
@@ -188,10 +231,6 @@ impl GpuThread {
         let mut context = device
             .create_context(&descriptor, None)
             .map_err(|e| format!("context: {e:?}"))?;
-        let anchor = shared
-            .external_image_id_manager
-            .clone()
-            .next_id(WebRenderImageHandlerType::Canvas2d);
         let setup = (|| {
             let surface = device
                 .create_surface(
@@ -207,20 +246,16 @@ impl GpuThread {
                 .map_err(|(e, _)| format!("bind surface: {e:?}"))?;
             device
                 .make_context_current(&context)
-                .map_err(|e| format!("make current: {e:?}"))?;
-            shared
-                .swap_chains
-                .create_attached_swap_chain(anchor, &device, &mut context, SurfaceAccess::GPUOnly)
-                .map_err(|e| format!("swap chain: {e:?}"))
+                .map_err(|e| format!("make current: {e:?}"))
         })();
         if let Err(error) = setup {
             let _ = device.destroy_context(&mut context);
-            shared.external_image_id_manager.clone().remove(&anchor);
             return Err(error);
         }
         let glow = unsafe {
             glow::Context::from_loader_function(|symbol| device.get_proc_address(&context, symbol))
         };
+        let copy_framebuffer = unsafe { glow.create_framebuffer()? };
         let gl = WebGl2RenderingContext::from_glow(glow, 1, 1);
         let (renderer, resources) = WebGlRenderer::new(gl.clone());
         Ok(Self {
@@ -229,9 +264,9 @@ impl GpuThread {
             gl,
             renderer: RefCell::new(renderer),
             resources: RefCell::new(resources),
+            uploads: RefCell::default(),
             shared,
-            anchor,
-            attached: Cell::new(anchor),
+            copy_framebuffer,
         })
     }
 
@@ -241,32 +276,109 @@ impl GpuThread {
         }
     }
 
-    /// Bind the back buffer of `id`'s swap chain to the context.
-    fn attach(&self, id: ExternalImageId) -> bool {
-        let current = self.attached.get();
-        if current == id {
-            return true;
+    /// The atlas image for `pixmap`, uploading it if this content is not cached, pinned once.
+    fn pin_upload(&self, pixmap: &vello_cpu::Pixmap) -> Option<(UploadKey, ImageId)> {
+        let key = UploadKey::of(pixmap);
+        let mut uploads = self.uploads.borrow_mut();
+        let epoch = uploads.epoch;
+        if let Some(upload) = uploads.entries.get_mut(&key) {
+            upload.pins += 1;
+            upload.last_used = epoch;
+            return Some((key, upload.id));
         }
-        let (Some(chain), Some(current_chain)) = (
-            self.shared.swap_chains.get(id),
-            self.shared.swap_chains.get(current),
-        ) else {
-            warn!("GPU canvas: missing swap chain for {id:?} or {current:?}");
-            return false;
+        self.make_current();
+        let bytes = usize::from(key.width) * usize::from(key.height) * 4;
+        let mut id = self.try_upload(pixmap);
+        if id.is_none() {
+            // The atlas is full: drop every unpinned upload and retry once.
+            self.evict(&mut uploads, |_, _| true);
+            id = self.try_upload(pixmap);
+        }
+        let Some(id) = id else {
+            warn_once(&WARNED_IMAGE, "the image atlas is full; skipping an image draw");
+            return None;
         };
-        match chain.take_attachment_from(
-            &self.device,
-            &mut self.context.borrow_mut(),
-            &current_chain,
-        ) {
-            Ok(()) => {
-                self.attached.set(id);
-                true
+        uploads.bytes += bytes;
+        uploads.entries.insert(
+            key,
+            Upload {
+                id,
+                pins: 1,
+                last_used: epoch,
+                bytes,
             },
-            Err(error) => {
-                warn!("GPU canvas: could not attach {id:?}: {error:?}");
-                false
-            },
+        );
+        Some((key, id))
+    }
+
+    fn try_upload(&self, pixmap: &vello_cpu::Pixmap) -> Option<ImageId> {
+        self.renderer
+            .borrow_mut()
+            .try_upload_image(&mut self.resources.borrow_mut(), pixmap)
+    }
+
+    fn unpin_uploads(&self, keys: impl Iterator<Item = UploadKey>) {
+        let mut uploads = self.uploads.borrow_mut();
+        for key in keys {
+            if let Some(upload) = uploads.entries.get_mut(&key) {
+                upload.pins = upload.pins.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Advance the upload epoch after a rasterization and evict idle or over-budget uploads.
+    fn end_rasterization(&self) {
+        let mut uploads = self.uploads.borrow_mut();
+        uploads.epoch += 1;
+        let epoch = uploads.epoch;
+        if uploads.bytes > UPLOAD_CACHE_BUDGET {
+            // Oldest first until under budget.
+            let mut candidates: Vec<(u64, UploadKey)> = uploads
+                .entries
+                .iter()
+                .filter(|(_, upload)| upload.pins == 0)
+                .map(|(key, upload)| (upload.last_used, *key))
+                .collect();
+            candidates.sort_unstable_by_key(|(last_used, _)| *last_used);
+            let mut excess = uploads.bytes - UPLOAD_CACHE_BUDGET;
+            let mut doomed = Vec::new();
+            for (_, key) in candidates {
+                if excess == 0 {
+                    break;
+                }
+                let bytes = uploads.entries[&key].bytes;
+                excess = excess.saturating_sub(bytes);
+                doomed.push(key);
+            }
+            self.evict(&mut uploads, |key, _| doomed.contains(key));
+        }
+        // Scan for idle uploads only occasionally; the cache is small and this is cheap anyway.
+        if epoch % 64 == 0 {
+            self.evict(&mut uploads, |_, upload| {
+                epoch.saturating_sub(upload.last_used) > UPLOAD_CACHE_MAX_IDLE
+            });
+        }
+    }
+
+    /// Destroy the unpinned uploads `doomed` selects.
+    fn evict(&self, uploads: &mut ImageUploads, doomed: impl Fn(&UploadKey, &Upload) -> bool) {
+        let keys: Vec<UploadKey> = uploads
+            .entries
+            .iter()
+            .filter(|(key, upload)| upload.pins == 0 && doomed(key, upload))
+            .map(|(key, _)| *key)
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        self.make_current();
+        let (mut renderer, mut resources) =
+            (self.renderer.borrow_mut(), self.resources.borrow_mut());
+        for key in keys {
+            if let Some(upload) = uploads.entries.remove(&key) {
+                uploads.bytes -= upload.bytes;
+                renderer.destroy_image(&mut resources, upload.id);
+            }
         }
     }
 }
@@ -346,54 +458,87 @@ impl Gpu {
     fn render(&mut self, scene: &Scene, size: Size2D<u32>, clear: bool, draw_retained: bool) {
         let thread = &self.thread;
         thread.make_current();
-        if !thread.attach(self.image_id) {
+        let Some(swap_chain) = thread.shared.swap_chains.get(self.image_id) else {
             return;
-        }
-        thread
-            .gl
-            .set_drawing_buffer_size(size.width as i32, size.height as i32);
-        let mut bindings = WebGlTextureBindings::new();
-        if draw_retained {
-            bindings.insert(RETAINED_TEXTURE, self.retained);
-        }
-        let render_size = RenderSize {
-            width: size.width,
-            height: size.height,
         };
-        if let Err(error) = thread.renderer.borrow_mut().render_with_clear(
-            scene,
-            &mut thread.resources.borrow_mut(),
-            &render_size,
-            &bindings,
-            clear,
-        ) {
-            warn!("GPU canvas: render failed: {error:?}");
+        let surface_texture =
+            match swap_chain.take_surface_texture(&thread.device, &mut thread.context.borrow_mut())
+            {
+                Ok(surface_texture) => surface_texture,
+                Err(error) => {
+                    warn!("GPU canvas: could not take the back buffer: {error:?}");
+                    return;
+                },
+            };
+        let target = thread.device.surface_gl_texture_target();
+        if let Some(texture) = thread.device.surface_texture_object(&surface_texture) {
+            thread
+                .gl
+                .set_drawing_buffer_size(size.width as i32, size.height as i32);
+            let mut bindings = WebGlTextureBindings::new();
+            if draw_retained {
+                bindings.insert(RETAINED_TEXTURE, self.retained);
+            }
+            let render_size = RenderSize {
+                width: size.width,
+                height: size.height,
+            };
+            if let Err(error) = thread.renderer.borrow_mut().render_to_texture(
+                scene,
+                &mut thread.resources.borrow_mut(),
+                &render_size,
+                &bindings,
+                clear,
+                texture,
+                target,
+            ) {
+                warn!("GPU canvas: render failed: {error:?}");
+            }
+            let glow = thread.gl.glow();
+            unsafe {
+                // Retain this frame on the GPU before the buffer moves to WebRender.
+                glow.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(thread.copy_framebuffer));
+                glow.framebuffer_texture_2d(
+                    glow::READ_FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    target,
+                    Some(texture),
+                    0,
+                );
+                glow.bind_texture(glow::TEXTURE_2D, Some(self.retained));
+                glow.copy_tex_sub_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    size.width as i32,
+                    size.height as i32,
+                );
+                glow.bind_texture(glow::TEXTURE_2D, None);
+                glow.framebuffer_texture_2d(
+                    glow::READ_FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    target,
+                    None,
+                    0,
+                );
+                glow.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+                glow.flush();
+            }
         }
-        let glow = thread.gl.glow();
-        unsafe {
-            // Retain this frame on the GPU before the surface moves to WebRender.
-            glow.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
-            glow.bind_texture(glow::TEXTURE_2D, Some(self.retained));
-            glow.copy_tex_sub_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                0,
-                0,
-                0,
-                0,
-                size.width as i32,
-                size.height as i32,
-            );
-            glow.bind_texture(glow::TEXTURE_2D, None);
-            glow.flush();
-        }
-        if let Some(swap_chain) = thread.shared.swap_chains.get(self.image_id) &&
-            let Err(error) = swap_chain.swap_buffers(
-                &thread.device,
-                &mut thread.context.borrow_mut(),
-                surfman::chains::PreserveBuffer::No,
-            )
+        let mut context = thread.context.borrow_mut();
+        if let Err(error) =
+            swap_chain.recycle_surface_texture(&thread.device, &mut context, surface_texture)
         {
+            warn!("GPU canvas: could not return the back buffer: {error:?}");
+        }
+        if let Err(error) = swap_chain.swap_buffers(
+            &thread.device,
+            &mut context,
+            surfman::chains::PreserveBuffer::No,
+        ) {
             warn!("GPU canvas: swap failed: {error:?}");
         }
     }
@@ -444,9 +589,6 @@ impl Drop for Gpu {
         let thread = &self.thread;
         thread.make_current();
         unsafe { thread.gl.glow().delete_texture(self.retained) };
-        if thread.attached.get() == self.image_id {
-            thread.attach(thread.anchor);
-        }
         let _ = thread.shared.swap_chains.destroy(
             self.image_id,
             &thread.device,
@@ -470,8 +612,8 @@ pub(crate) struct VelloGpuDrawTarget {
     clear_next: bool,
     /// The scene's first command draws the retained texture back.
     draws_retained: bool,
-    /// Atlas images the pending scene samples; released after the next rasterization.
-    uploaded_images: Vec<ImageId>,
+    /// Cached uploads the pending scene samples; unpinned after the next rasterization.
+    pinned_uploads: Vec<UploadKey>,
 }
 
 impl VelloGpuDrawTarget {
@@ -541,7 +683,8 @@ impl VelloGpuDrawTarget {
             self_.gpu.render(&self_.scene, size, clear, draw_retained);
             self_.scene.reset();
         });
-        self.release_images();
+        self.unpin_uploads();
+        self.gpu.thread.end_rasterization();
         self.state = State::Rendered;
         self.clear_next = true;
         self.draws_retained = false;
@@ -563,33 +706,21 @@ impl VelloGpuDrawTarget {
         transformed_rect.cast().contains_rect(&viewport) && clip.contains_rect(&viewport)
     }
 
-    /// Upload `pixmap` into the atlas for the pending scene. Returns `None` for images the atlas
-    /// cannot hold.
+    /// The atlas image holding `pixmap`, pinned until the pending scene is rasterized. Returns
+    /// `None` for images the atlas cannot hold.
     fn upload_image(&mut self, pixmap: &vello_cpu::Pixmap) -> Option<ImageId> {
         if pixmap.width() > MAX_ATLAS_IMAGE_SIDE || pixmap.height() > MAX_ATLAS_IMAGE_SIDE {
             warn_once(&WARNED_IMAGE, "images larger than 4096 px are not drawn yet");
             return None;
         }
-        let thread = &self.gpu.thread;
-        thread.make_current();
-        let id = thread
-            .renderer
-            .borrow_mut()
-            .upload_image(&mut thread.resources.borrow_mut(), pixmap);
-        self.uploaded_images.push(id);
+        let (key, id) = self.gpu.thread.pin_upload(pixmap)?;
+        self.pinned_uploads.push(key);
         Some(id)
     }
 
-    fn release_images(&mut self) {
-        if self.uploaded_images.is_empty() {
-            return;
-        }
-        let thread = &self.gpu.thread;
-        thread.make_current();
-        let (mut renderer, mut resources) =
-            (thread.renderer.borrow_mut(), thread.resources.borrow_mut());
-        for id in self.uploaded_images.drain(..) {
-            renderer.destroy_image(&mut resources, id);
+    fn unpin_uploads(&mut self) {
+        if !self.pinned_uploads.is_empty() {
+            self.gpu.thread.unpin_uploads(self.pinned_uploads.drain(..));
         }
     }
 
@@ -605,6 +736,13 @@ impl VelloGpuDrawTarget {
             },
             other => Some(other),
         }
+    }
+
+    /// Block until the GPU has executed every submitted command (benchmarks).
+    #[cfg(test)]
+    pub(crate) fn finish_gpu(&self) {
+        self.gpu.thread.make_current();
+        unsafe { self.gpu.thread.gl.glow().finish() };
     }
 
     /// The external image id WebRender samples this canvas through.
@@ -623,6 +761,12 @@ impl VelloGpuDrawTarget {
     }
 }
 
+impl Drop for VelloGpuDrawTarget {
+    fn drop(&mut self) {
+        self.unpin_uploads();
+    }
+}
+
 impl GenericDrawTarget for VelloGpuDrawTarget {
     type SourceSurface = Arc<vello_cpu::Pixmap>;
 
@@ -637,7 +781,7 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
             state: State::Drawing,
             clear_next: true,
             draws_retained: false,
-            uploaded_images: Vec::new(),
+            pinned_uploads: Vec::new(),
         };
         // Publish a transparent first frame so WebRender always has a surface to sample.
         target.flush();
@@ -658,6 +802,7 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
     fn clear_rect(&mut self, rect: &Rect<f32>, transform: Transform2D<f64>) {
         if self.is_viewport_cleared(rect, transform) {
             self.scene.reset();
+            self.unpin_uploads();
             self.clips.clear();
             self.state = State::Drawing;
             self.clear_next = true;
@@ -712,7 +857,7 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
 
     fn draw_surface(
         &mut self,
-        mut surface: Self::SourceSurface,
+        surface: Self::SourceSurface,
         dest: Rect<f64>,
         source: Rect<f64>,
         filter: Filter,
@@ -721,13 +866,18 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
     ) {
         self.ensure_drawing();
         let scale_up = dest.size.width > source.size.width || dest.size.height > source.size.height;
-        if composition_options.alpha != 1.0 {
-            Arc::make_mut(&mut surface).multiply_alpha((composition_options.alpha * 255.0) as u8);
-        }
         let Some(id) = self.upload_image(&surface) else {
             return;
         };
+        // Global alpha as a multiply tint, so the cached upload is reused at any alpha. Quantized
+        // to 8 bits like the CPU backend's `multiply_alpha`.
+        let alpha = (composition_options.alpha * 255.0) as u8;
+        let tint = (alpha != u8::MAX).then(|| vello_hybrid::Tint {
+            color: peniko::Color::new([1.0, 1.0, 1.0, f32::from(alpha) / 255.0]),
+            mode: vello_hybrid::TintMode::Multiply,
+        });
         self.with_composition(composition_options.composition_operation, move |self_| {
+            self_.scene.set_tint(tint);
             self_.scene.set_transform(transform.cast().into());
             self_.scene.set_paint(vello_cpu::Image {
                 image: vello_cpu::ImageSource::opaque_id(id),
@@ -751,6 +901,7 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
             );
             self_.scene.fill_rect(&dest.into());
             self_.scene.reset_paint_transform();
+            self_.scene.reset_tint();
         })
     }
 

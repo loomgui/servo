@@ -738,6 +738,7 @@ impl WebGl2RenderingContext {
     pub const COLOR_BUFFER_BIT: u32 = glow::COLOR_BUFFER_BIT;
     pub const COMPILE_STATUS: u32 = glow::COMPILE_STATUS;
     pub const DEPTH: u32 = glow::DEPTH;
+    pub const DEPTH_ATTACHMENT: u32 = glow::DEPTH_ATTACHMENT;
     pub const DEPTH_BITS: u32 = glow::DEPTH_BITS;
     pub const DEPTH_BUFFER_BIT: u32 = glow::DEPTH_BUFFER_BIT;
     pub const DEPTH_TEST: u32 = glow::DEPTH_TEST;
