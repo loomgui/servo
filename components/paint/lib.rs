@@ -22,6 +22,7 @@ pub use crate::paint::{Paint, WebRenderDebugOption};
 #[macro_use]
 mod tracing;
 
+mod gpu_canvas_external_images;
 mod paint;
 mod painter;
 mod pinch_zoom;

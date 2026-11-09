@@ -338,6 +338,8 @@ enum Canvas {
     #[cfg(feature = "vello")]
     Vello(CanvasData<crate::vello_backend::VelloDrawTarget>),
     VelloCPU(CanvasData<crate::vello_cpu_backend::VelloCPUDrawTarget>),
+    /// GPU-rasterized canvas (Loom prototype), selected with `dom_canvas_backend = "gpu"`.
+    VelloGpu(CanvasData<crate::vello_gpu_backend::VelloGpuDrawTarget>),
 }
 
 impl Canvas {
@@ -348,6 +350,9 @@ impl Canvas {
         {
             #[cfg(feature = "vello")]
             "vello" => Some(Self::Vello(CanvasData::new(size, paint_api))),
+            "gpu" if crate::vello_gpu_backend::available() => {
+                Some(Self::VelloGpu(CanvasData::new(size, paint_api)))
+            },
             _ => Some(Self::VelloCPU(CanvasData::new(size, paint_api))),
         }
     }
@@ -361,6 +366,7 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.collect_memory_report(canvas_id, ops),
             Canvas::VelloCPU(canvas_data) => canvas_data.collect_memory_report(canvas_id, ops),
+            Canvas::VelloGpu(canvas_data) => canvas_data.collect_memory_report(canvas_id, ops),
         }
     }
 
@@ -369,6 +375,7 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.set_image_key(image_key),
             Canvas::VelloCPU(canvas_data) => canvas_data.set_image_key(image_key),
+            Canvas::VelloGpu(canvas_data) => canvas_data.set_image_key(image_key),
         }
     }
 
@@ -377,6 +384,7 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.pop_clips(clips),
             Canvas::VelloCPU(canvas_data) => canvas_data.pop_clips(clips),
+            Canvas::VelloGpu(canvas_data) => canvas_data.pop_clips(clips),
         }
     }
 
@@ -402,6 +410,15 @@ impl Canvas {
                 transform,
             ),
             Canvas::VelloCPU(canvas_data) => canvas_data.stroke_text(
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+            Canvas::VelloGpu(canvas_data) => canvas_data.stroke_text(
                 text_bounds,
                 text_runs,
                 fill_or_stroke_style,
@@ -440,6 +457,14 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            Canvas::VelloGpu(canvas_data) => canvas_data.fill_text(
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
         }
     }
 
@@ -457,6 +482,9 @@ impl Canvas {
                 canvas_data.fill_rect(rect, style, shadow_options, composition_options, transform)
             },
             Canvas::VelloCPU(canvas_data) => {
+                canvas_data.fill_rect(rect, style, shadow_options, composition_options, transform)
+            },
+            Canvas::VelloGpu(canvas_data) => {
                 canvas_data.fill_rect(rect, style, shadow_options, composition_options, transform)
             },
         }
@@ -482,6 +510,14 @@ impl Canvas {
                 transform,
             ),
             Canvas::VelloCPU(canvas_data) => canvas_data.stroke_rect(
+                rect,
+                style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+            Canvas::VelloGpu(canvas_data) => canvas_data.stroke_rect(
                 rect,
                 style,
                 line_options,
@@ -519,6 +555,14 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            Canvas::VelloGpu(canvas_data) => canvas_data.fill_path(
+                path,
+                fill_rule,
+                style,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
         }
     }
 
@@ -549,6 +593,14 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            Canvas::VelloGpu(canvas_data) => canvas_data.stroke_path(
+                path,
+                style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
         }
     }
 
@@ -557,6 +609,7 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.clear_rect(rect, transform),
             Canvas::VelloCPU(canvas_data) => canvas_data.clear_rect(rect, transform),
+            Canvas::VelloGpu(canvas_data) => canvas_data.clear_rect(rect, transform),
         }
     }
 
@@ -591,6 +644,15 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            Canvas::VelloGpu(canvas_data) => canvas_data.draw_image(
+                snapshot,
+                dest_rect,
+                source_rect,
+                smoothing_enabled,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
         }
     }
 
@@ -599,6 +661,7 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.read_pixels(read_rect),
             Canvas::VelloCPU(canvas_data) => canvas_data.read_pixels(read_rect),
+            Canvas::VelloGpu(canvas_data) => canvas_data.read_pixels(read_rect),
         }
     }
 
@@ -607,6 +670,7 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.clip_path(path, fill_rule, transform),
             Canvas::VelloCPU(canvas_data) => canvas_data.clip_path(path, fill_rule, transform),
+            Canvas::VelloGpu(canvas_data) => canvas_data.clip_path(path, fill_rule, transform),
         }
     }
 
@@ -615,6 +679,7 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.put_image_data(snapshot, rect),
             Canvas::VelloCPU(canvas_data) => canvas_data.put_image_data(snapshot, rect),
+            Canvas::VelloGpu(canvas_data) => canvas_data.put_image_data(snapshot, rect),
         }
     }
 
@@ -623,6 +688,7 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.update_image_rendering(canvas_epoch),
             Canvas::VelloCPU(canvas_data) => canvas_data.update_image_rendering(canvas_epoch),
+            Canvas::VelloGpu(canvas_data) => canvas_data.update_image_rendering(canvas_epoch),
         }
     }
 
@@ -631,6 +697,7 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.recreate(size),
             Canvas::VelloCPU(canvas_data) => canvas_data.recreate(size),
+            Canvas::VelloGpu(canvas_data) => canvas_data.recreate(size),
         }
     }
 }

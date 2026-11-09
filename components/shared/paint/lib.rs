@@ -624,6 +624,34 @@ impl PainterSurfmanDetailsMap {
         let mut map = self.0.lock().expect("poisoned");
         map.remove(&painter_id);
     }
+
+    /// Any registered painter's details. Embedders with a single WebView (Loom) have exactly one.
+    pub fn any(&self) -> Option<PainterSurfmanDetails> {
+        let map = self.0.lock().expect("poisoned");
+        map.values().next().cloned()
+    }
+}
+
+/// State shared between the paint thread and the canvas thread for GPU-rasterized 2D canvases
+/// (Loom prototype). The canvas thread renders into surfman surfaces published through
+/// `swap_chains`; the paint thread's external-image handler samples their front buffers.
+#[derive(Clone)]
+pub struct GpuCanvasShared {
+    pub surfman_details: PainterSurfmanDetailsMap,
+    pub swap_chains: surfman::chains::SwapChains<webrender_api::ExternalImageId, surfman::Device>,
+    pub external_image_id_manager: WebRenderExternalImageIdManager,
+}
+
+static GPU_CANVAS_SHARED: std::sync::OnceLock<GpuCanvasShared> = std::sync::OnceLock::new();
+
+/// Publish the GPU canvas state. Only the first call has an effect.
+pub fn set_gpu_canvas_shared(shared: GpuCanvasShared) {
+    let _ = GPU_CANVAS_SHARED.set(shared);
+}
+
+/// The GPU canvas state, if the paint thread has published it (single-process embedders only).
+pub fn gpu_canvas_shared() -> Option<&'static GpuCanvasShared> {
+    GPU_CANVAS_SHARED.get()
 }
 
 /// This trait is used as a bridge between the different GL clients
@@ -675,6 +703,8 @@ pub enum WebRenderImageHandlerType {
     Media,
     WebGpu,
     Embedder,
+    /// GPU-rasterized 2D canvases (Loom prototype).
+    Canvas2d,
 }
 
 /// List of WebRender external images to be shared among all external image
@@ -719,6 +749,8 @@ pub struct WebRenderExternalImageHandlers {
     webgpu_handler: Option<Box<dyn WebRenderExternalImageApi>>,
     /// Optional handler installed by an embedder for GPU-native image URLs.
     embedder_handler: Option<Box<dyn WebRenderExternalImageApi>>,
+    /// GPU-rasterized 2D canvas handler.
+    canvas2d_handler: Option<Box<dyn WebRenderExternalImageApi>>,
     /// A [`WebRenderExternalImageIdManager`] responsible for creating new [`ExternalImageId`]s.
     /// This is shared with the WebGL, WebGPU, and hardware-accelerated media threads and
     /// all other instances of [`WebRenderExternalImageHandlers`] -- one per WebRender instance.
@@ -732,6 +764,7 @@ impl WebRenderExternalImageHandlers {
             media_handler: Default::default(),
             webgpu_handler: Default::default(),
             embedder_handler: Default::default(),
+            canvas2d_handler: Default::default(),
             id_manager,
         }
     }
@@ -750,6 +783,7 @@ impl WebRenderExternalImageHandlers {
             WebRenderImageHandlerType::Media => self.media_handler = Some(handler),
             WebRenderImageHandlerType::WebGpu => self.webgpu_handler = Some(handler),
             WebRenderImageHandlerType::Embedder => self.embedder_handler = Some(handler),
+            WebRenderImageHandlerType::Canvas2d => self.canvas2d_handler = Some(handler),
         }
     }
 }
@@ -813,6 +847,13 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
                     source,
                 }
             },
+            WebRenderImageHandlerType::Canvas2d => {
+                let (source, size) = self.canvas2d_handler.as_mut().unwrap().lock(key.0);
+                ExternalImage {
+                    uv: TexelRect::new(0.0, size.height as f32, size.width as f32, 0.0),
+                    source,
+                }
+            },
         }
     }
 
@@ -838,6 +879,9 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
             },
             WebRenderImageHandlerType::Embedder => {
                 self.embedder_handler.as_mut().unwrap().unlock(key.0)
+            },
+            WebRenderImageHandlerType::Canvas2d => {
+                self.canvas2d_handler.as_mut().unwrap().unlock(key.0)
             },
         };
     }

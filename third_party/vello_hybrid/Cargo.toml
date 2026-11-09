@@ -1,0 +1,42 @@
+# Vendored from vello_hybrid 0.2.0 (https://github.com/linebender/vello, Apache-2.0 OR MIT)
+# for Loom's GPU 2D canvas prototype. Local changes:
+# - the `webgl` backend runs on native OpenGL ES through `glow` (see
+#   `src/render/webgl/native.rs`) instead of `web-sys`;
+# - `std` no longer implies `wgpu`;
+# - browser-only dependencies, dev-dependencies and examples are dropped.
+[package]
+edition = "2024"
+rust-version = "1.88"
+name = "vello_hybrid"
+version = "0.2.0"
+description = "A hybrid CPU/GPU renderer for Vello (Loom native-GL prototype fork)."
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/linebender/vello"
+publish = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[features]
+default = ["webgl", "text"]
+libm = ["vello_common/libm", "glifo?/libm"]
+probe = ["vello_common/probe"]
+std = ["vello_common/std", "glifo?/std"]
+text = ["dep:glifo", "glifo/std"]
+webgl = ["dep:glow", "dep:vello_sparse_shaders", "vello_sparse_shaders/glsl"]
+wgpu = ["dep:wgpu", "dep:vello_sparse_shaders"]
+
+[lib]
+name = "vello_hybrid"
+path = "src/lib.rs"
+
+[dependencies]
+bytemuck = { version = "1.25.0", features = ["derive"] }
+glifo = { version = "0.3.0", optional = true, default-features = false }
+glow = { version = "0.17.0", optional = true }
+hashbrown = { version = "0.17.1", features = ["default-hasher"], default-features = false }
+log = "0.4.29"
+thiserror = { version = "2.0.18", default-features = false }
+vello_common = { version = "0.2.0", features = ["std"], default-features = false }
+vello_sparse_shaders = { version = "0.2.0", optional = true }
+wgpu = { version = "29.0.3", features = ["std", "wgsl"], optional = true, default-features = false }

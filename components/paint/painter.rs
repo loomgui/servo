@@ -305,6 +305,16 @@ impl Painter {
             WebRenderImageHandlerType::WebGpu,
         );
 
+        if let Some(gpu_canvas) = paint_api::gpu_canvas_shared() {
+            external_image_handlers.set_handler(
+                Box::new(crate::gpu_canvas_external_images::GpuCanvasExternalImages::new(
+                    rendering_context.clone(),
+                    gpu_canvas.swap_chains.clone(),
+                )),
+                WebRenderImageHandlerType::Canvas2d,
+            );
+        }
+
         WindowGLContext::initialize_image_handler(&mut external_image_handlers);
 
         if let Some(handler) = paint.embedder_external_image_handler.borrow_mut().take() {

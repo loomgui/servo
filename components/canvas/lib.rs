@@ -12,3 +12,4 @@ mod peniko_conversions;
 #[cfg(feature = "vello")]
 mod vello_backend;
 mod vello_cpu_backend;
+mod vello_gpu_backend;

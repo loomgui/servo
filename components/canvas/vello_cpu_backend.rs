@@ -594,7 +594,7 @@ impl Convert<vello_cpu::PaintType> for FillOrStrokeStyle {
     }
 }
 
-fn paint(style: FillOrStrokeStyle, alpha: f64) -> vello_cpu::PaintType {
+pub(crate) fn paint(style: FillOrStrokeStyle, alpha: f64) -> vello_cpu::PaintType {
     assert!((0.0..=1.0).contains(&alpha));
     let paint = style.convert();
     if alpha == 1.0 {
