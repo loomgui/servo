@@ -114,7 +114,15 @@ impl GradientRampCache {
             .cache
             .len()
             .saturating_sub(self.retained_count as usize);
-        self.evict(stale.max(over_cap));
+        // Evicting compacts the packed ramps, and everything after the first removed ramp must
+        // be uploaded again. Content that creates new ramps every frame has stale ramps every
+        // frame, so evicting them at once would compact and re-upload the whole table per
+        // frame. Let stale ramps accumulate until they are half the cache: the table stays
+        // within twice its live size and the compaction cost is amortized over many renders.
+        let worth_compacting = stale > 0 && stale * 2 >= self.cache.len();
+        if over_cap > 0 || worth_compacting {
+            self.evict(stale.max(over_cap));
+        }
         self.epoch += 1;
     }
 
@@ -218,7 +226,8 @@ impl GradientRampCache {
 
         // See comment in `remove_lru_entries`, the entries are not sorted yet but need to be
         // for the prefix sum to work correctly.
-        ramps_to_remove.sort_by_key(|(_, ramp)| ramp.lut_start);
+        // Loom: unstable sort; the entries are large and `lut_start` values are unique.
+        ramps_to_remove.sort_unstable_by_key(|(_, ramp)| ramp.lut_start);
         // Loom: everything from the first removed ramp moves.
         self.dirty_from = self
             .dirty_from
