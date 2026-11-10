@@ -8519,6 +8519,7 @@ name = "servo-canvas-traits"
 version = "0.7.0"
 dependencies = [
  "crossbeam-channel",
+ "cssparser",
  "euclid",
  "glow",
  "kurbo",
@@ -8533,6 +8534,8 @@ dependencies = [
  "servo-webxr-api",
  "strum",
  "stylo",
+ "stylo_traits",
+ "url",
  "webrender_api",
 ]
 

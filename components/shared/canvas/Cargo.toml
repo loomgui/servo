@@ -34,5 +34,10 @@ stylo = { workspace = true }
 webrender_api = { workspace = true }
 webxr-api = { workspace = true }
 
+[dev-dependencies]
+cssparser = { workspace = true }
+stylo_traits = { workspace = true }
+url = { workspace = true }
+
 [lints]
 workspace = true
