@@ -55,10 +55,12 @@ use http::header::REFRESH;
 use hyper_serde::Serde;
 use js::context::{JSContext, NoGC};
 use js::glue::GetWindowProxyClass;
-use js::jsapi::{GCReason, JSContext as UnsafeJSContext};
+use js::jsapi::{GCReason, JSContext as UnsafeJSContext, JSGCParamKey};
 use js::jsval::UndefinedValue;
 use js::rust::ParentRuntime;
-use js::rust::wrappers2::{JS_AddInterruptCallback, JS_GC, SetWindowProxyClass};
+use js::rust::wrappers2::{
+    JS_AddInterruptCallback, JS_GC, JS_GetGCParameter, SetWindowProxyClass,
+};
 use layout_api::{LayoutConfig, LayoutFactory, RestyleReason, ScriptThreadFactory};
 use media::WindowGLContext;
 use metrics::MAX_TASK_NS;
@@ -413,6 +415,9 @@ pub struct ScriptThread {
     pending_applied_seal_updates: RefCell<Vec<paint_api::AppliedSealOpportunity>>,
     /// When this thread last received a seal-tagged rendering opportunity from the embedder.
     last_applied_seal_opportunity: Cell<Option<Instant>>,
+    /// The JS heap size right after the last collection started from
+    /// [`Self::maybe_collect_garbage_after_applied_seal`].
+    js_heap_bytes_after_idle_collection: Cell<u32>,
 
     /// Whether an animation tick or ScriptThread-triggered rendering update is pending. This might
     /// either be because the Servo renderer is managing animations and the [`ScriptThread`] has
@@ -993,6 +998,7 @@ impl ScriptThread {
                     pending_rendering_update_callbacks: Default::default(),
                     pending_applied_seal_updates: Default::default(),
                     last_applied_seal_opportunity: Default::default(),
+                    js_heap_bytes_after_idle_collection: Default::default(),
                     needs_rendering_update: Arc::new(AtomicBool::new(false)),
                     debugger_global: debugger_global.as_traced(),
                     debugger_paused: Cell::new(false),
@@ -1311,6 +1317,46 @@ impl ScriptThread {
         Some(painters_generating_frames)
     }
 
+    /// Collect JS garbage while this thread is idle between two embedder frames.
+    ///
+    /// Collections are not incremental here, so the engine's own trigger, which waits for tens
+    /// of megabytes of garbage, pauses for as long as it takes to finalize all of it: about
+    /// 100 ms for the half a million DOM objects an animated canvas leaves behind. A
+    /// seal-driven embedder shows every frame, so that pause is a visibly dropped frame.
+    ///
+    /// The frame's display list and its completion have just been sent, and the next seal has
+    /// not arrived. Collecting here, as soon as a small amount of garbage has built up, keeps
+    /// each pause short and puts it where nothing is waiting for this thread.
+    fn maybe_collect_garbage_after_applied_seal(&self, cx: &mut JSContext) {
+        let threshold_kb = pref!(js_mem_gc_applied_seal_idle_threshold_kb);
+        if threshold_kb <= 0 {
+            return;
+        }
+        let heap_bytes = unsafe { JS_GetGCParameter(cx, JSGCParamKey::JSGC_BYTES) };
+        let after_last_collection = self.js_heap_bytes_after_idle_collection.get();
+        if heap_bytes < after_last_collection {
+            // The engine collected on its own in the meantime.
+            self.js_heap_bytes_after_idle_collection.set(heap_bytes);
+            return;
+        }
+        let threshold_bytes = u32::try_from(threshold_kb.saturating_mul(1024)).unwrap_or(u32::MAX);
+        if heap_bytes - after_last_collection < threshold_bytes {
+            return;
+        }
+        let started = Instant::now();
+        unsafe { JS_GC(cx, GCReason::API) };
+        let heap_bytes_after = unsafe { JS_GetGCParameter(cx, JSGCParamKey::JSGC_BYTES) };
+        self.js_heap_bytes_after_idle_collection
+            .set(heap_bytes_after);
+        debug!(
+            target: "script::gc",
+            "Collected JS garbage after an applied seal: {} KB -> {} KB in {:?}",
+            heap_bytes / 1024,
+            heap_bytes_after / 1024,
+            started.elapsed()
+        );
+    }
+
     /// Schedule a rendering update ("update the rendering"), if necessary. This
     /// can be necessary for a couple reasons. For instance, when the DOM
     /// changes a scheduled rendering update becomes necessary if one isn't
@@ -1584,6 +1630,7 @@ impl ScriptThread {
             let _ = callback.send(built_any_display_lists);
         }
 
+        let mut completed_applied_seal = false;
         if let Some(changed_painters) = changed_painters {
             for opportunity in self.pending_applied_seal_updates.borrow_mut().drain(..) {
                 let changed = changed_painters.contains(&servo_base::id::PainterId::from(
@@ -1592,7 +1639,11 @@ impl ScriptThread {
                 // This same sender already sent this loop's DL/color updates above.
                 self.paint_api
                     .complete_applied_seal_rendering_update(opportunity, changed);
+                completed_applied_seal = true;
             }
+        }
+        if completed_applied_seal {
+            self.maybe_collect_garbage_after_applied_seal(cx);
         }
 
         self.maybe_fulfill_font_ready_promises(cx);
