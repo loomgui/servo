@@ -59,7 +59,8 @@ use js::jsapi::{GCReason, JSContext as UnsafeJSContext, JSGCParamKey};
 use js::jsval::UndefinedValue;
 use js::rust::ParentRuntime;
 use js::rust::wrappers2::{
-    JS_AddInterruptCallback, JS_GC, JS_GetGCParameter, SetWindowProxyClass,
+    GetTestingFunctions, JS_AddInterruptCallback, JS_DefineProperty3, JS_GC, JS_GetGCParameter,
+    SetWindowProxyClass,
 };
 use layout_api::{LayoutConfig, LayoutFactory, RestyleReason, ScriptThreadFactory};
 use media::WindowGLContext;
@@ -79,6 +80,7 @@ use profile_traits::time::ProfilerCategory;
 use profile_traits::time_profile;
 use rustc_hash::{FxHashMap, FxHashSet};
 use script_bindings::cell::DomRefCell;
+use script_bindings::reflector::DomObject;
 use script_traits::{
     ConstellationInputEvent, DiscardBrowsingContext, DocumentActivity, InitialScriptState,
     NewPipelineInfo, Painter, ScriptThreadMessage, UpdatePipelineIdReason, WebViewState,
@@ -1317,6 +1319,44 @@ impl ScriptThread {
         Some(painters_generating_frames)
     }
 
+    /// DIAGNOSTIC, not for merging: with `SERVO_EXPOSE_JS_TESTING_FUNCTIONS` set, give every
+    /// document SpiderMonkey's testing functions as `__jsTesting`, so a page can call
+    /// `__jsTesting.dumpHeap(path)` while a live-heap leak is being tracked down.
+    fn expose_js_testing_functions_for_diagnosis(&self, cx: &mut JSContext) {
+        static EXPOSED: AtomicBool = AtomicBool::new(false);
+        if EXPOSED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        if std::env::var_os("SERVO_EXPOSE_JS_TESTING_FUNCTIONS").is_none() {
+            return;
+        }
+        let windows: Vec<_> = self
+            .documents
+            .borrow()
+            .iter()
+            .map(|(_, document)| DomRoot::from_ref(document.window()))
+            .collect();
+        for window in windows {
+            let mut realm = enter_auto_realm(cx, &*window);
+            let cx = &mut realm.current_realm();
+            let testing_functions = unsafe { GetTestingFunctions(cx) };
+            if testing_functions.is_null() {
+                continue;
+            }
+            rooted!(&in(cx) let testing_functions = testing_functions);
+            let defined = unsafe {
+                JS_DefineProperty3(
+                    cx,
+                    window.reflector().get_jsobject(),
+                    c"__jsTesting".as_ptr(),
+                    testing_functions.handle(),
+                    0,
+                )
+            };
+            debug!(target: "script::gc", "Exposed __jsTesting to a document: {defined}");
+        }
+    }
+
     /// Collect JS garbage while this thread is idle between two embedder frames.
     ///
     /// Collections are not incremental here, so the engine's own trigger, which waits for tens
@@ -1328,6 +1368,7 @@ impl ScriptThread {
     /// not arrived. Collecting here, as soon as a small amount of garbage has built up, keeps
     /// each pause short and puts it where nothing is waiting for this thread.
     fn maybe_collect_garbage_after_applied_seal(&self, cx: &mut JSContext) {
+        self.expose_js_testing_functions_for_diagnosis(cx);
         let threshold_kb = pref!(js_mem_gc_applied_seal_idle_threshold_kb);
         if threshold_kb <= 0 {
             return;
