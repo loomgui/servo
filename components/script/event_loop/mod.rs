@@ -5,6 +5,7 @@
 mod devtools;
 pub(crate) mod document_collection;
 pub(crate) mod document_loader;
+mod idle_collection;
 mod script_mutation_observers;
 #[expect(unsafe_code)]
 pub(crate) mod script_thread;

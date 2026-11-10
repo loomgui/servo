@@ -148,6 +148,7 @@ use crate::dom::windowproxy::{CreatorBrowsingContextInfo, WindowProxy};
 use crate::event_loop::devtools::{self, DevtoolsState};
 use crate::event_loop::document_collection::DocumentCollection;
 use crate::event_loop::document_loader::DocumentLoader;
+use crate::event_loop::idle_collection::IdleCollection;
 use crate::event_loop::script_mutation_observers::ScriptMutationObservers;
 use crate::event_loop::script_window_proxies::ScriptWindowProxies;
 use crate::event_loop::svg_font::SvgFontResolver;
@@ -417,9 +418,9 @@ pub struct ScriptThread {
     pending_applied_seal_updates: RefCell<Vec<paint_api::AppliedSealOpportunity>>,
     /// When this thread last received a seal-tagged rendering opportunity from the embedder.
     last_applied_seal_opportunity: Cell<Option<Instant>>,
-    /// The JS heap size right after the last collection started from
-    /// [`Self::maybe_collect_garbage_after_applied_seal`].
-    js_heap_bytes_after_idle_collection: Cell<u32>,
+    /// When to collect JS garbage in the gap between two embedder frames.
+    #[no_trace]
+    idle_collection: IdleCollection,
 
     /// Whether an animation tick or ScriptThread-triggered rendering update is pending. This might
     /// either be because the Servo renderer is managing animations and the [`ScriptThread`] has
@@ -1000,7 +1001,7 @@ impl ScriptThread {
                     pending_rendering_update_callbacks: Default::default(),
                     pending_applied_seal_updates: Default::default(),
                     last_applied_seal_opportunity: Default::default(),
-                    js_heap_bytes_after_idle_collection: Default::default(),
+                    idle_collection: Default::default(),
                     needs_rendering_update: Arc::new(AtomicBool::new(false)),
                     debugger_global: debugger_global.as_traced(),
                     debugger_paused: Cell::new(false),
@@ -1365,37 +1366,39 @@ impl ScriptThread {
     /// seal-driven embedder shows every frame, so that pause is a visibly dropped frame.
     ///
     /// The frame's display list and its completion have just been sent, and the next seal has
-    /// not arrived. Collecting here, as soon as a small amount of garbage has built up, keeps
-    /// each pause short and puts it where nothing is waiting for this thread.
+    /// not arrived. Collecting here, while only a little garbage has built up, keeps each
+    /// pause short and puts it where nothing is waiting for this thread. [`IdleCollection`]
+    /// decides when.
     fn maybe_collect_garbage_after_applied_seal(&self, cx: &mut JSContext) {
         self.expose_js_testing_functions_for_diagnosis(cx);
-        let threshold_kb = pref!(js_mem_gc_applied_seal_idle_threshold_kb);
-        if threshold_kb <= 0 {
+        let bound_kb = pref!(js_mem_gc_applied_seal_idle_threshold_kb);
+        if bound_kb <= 0 {
             return;
         }
         let heap_bytes = unsafe { JS_GetGCParameter(cx, JSGCParamKey::JSGC_BYTES) };
-        let after_last_collection = self.js_heap_bytes_after_idle_collection.get();
-        if heap_bytes < after_last_collection {
-            // The engine collected on its own in the meantime.
-            self.js_heap_bytes_after_idle_collection.set(heap_bytes);
+        let Some(reason) = self.idle_collection.update_completed(
+            heap_bytes,
+            bound_kb as f64,
+            pref!(js_mem_gc_applied_seal_idle_fit_gap),
+        ) else {
             return;
-        }
-        let threshold_bytes = u32::try_from(threshold_kb.saturating_mul(1024)).unwrap_or(u32::MAX);
-        if heap_bytes - after_last_collection < threshold_bytes {
-            return;
-        }
+        };
         let started = Instant::now();
         unsafe { JS_GC(cx, GCReason::API) };
+        let pause = started.elapsed();
         let heap_bytes_after = unsafe { JS_GetGCParameter(cx, JSGCParamKey::JSGC_BYTES) };
-        self.js_heap_bytes_after_idle_collection
-            .set(heap_bytes_after);
         debug!(
             target: "script::gc",
-            "Collected JS garbage after an applied seal: {} KB -> {} KB in {:?}",
+            "Collected JS garbage after an applied seal: {} KB -> {} KB in {:?} \
+             ({reason:?}, pause budget {:.2?} ms, pause model {:.3?})",
             heap_bytes / 1024,
             heap_bytes_after / 1024,
-            started.elapsed()
+            pause,
+            self.idle_collection.budget_ms(),
+            self.idle_collection.pause_model(),
         );
+        self.idle_collection
+            .collected(heap_bytes, heap_bytes_after, pause);
     }
 
     /// Schedule a rendering update ("update the rendering"), if necessary. This
@@ -1511,11 +1514,13 @@ impl ScriptThread {
         // Receive at least one message so we don't spinloop.
         debug!("Waiting for event.");
         let fully_active = self.get_fully_active_document_ids();
+        let waiting_since = Instant::now();
         let mut event = self.receivers.recv(
             &self.task_queue,
             &self.timer_scheduler.borrow(),
             &fully_active,
         );
+        self.idle_collection.waited(waiting_since.elapsed());
 
         loop {
             debug!("Handling event: {event:?}");
@@ -2058,6 +2063,7 @@ impl ScriptThread {
             },
             ScriptThreadMessage::TickAllAnimations(_webviews, callback, opportunity) => {
                 if let Some(opportunity) = opportunity {
+                    self.idle_collection.next_frame_sealed();
                     self.last_applied_seal_opportunity.set(Some(Instant::now()));
                     self.pending_applied_seal_updates
                         .borrow_mut()
