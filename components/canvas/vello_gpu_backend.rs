@@ -475,6 +475,12 @@ impl Gpu {
                 .remove(&image_id);
             return Err(format!("swap chain: {error:?}"));
         }
+        thread
+            .shared
+            .canvas_image_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(image_id);
         let glow = thread.gl.glow();
         let retained = unsafe {
             let texture = glow.create_texture()?;
@@ -642,6 +648,12 @@ impl Drop for Gpu {
         let thread = &self.thread;
         thread.make_current();
         unsafe { thread.gl.glow().delete_texture(self.retained) };
+        thread
+            .shared
+            .canvas_image_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|id| *id != self.image_id);
         let _ = thread.shared.swap_chains.destroy(
             self.image_id,
             &thread.device,

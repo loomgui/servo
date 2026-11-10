@@ -64,6 +64,7 @@ fn init_gpu() {
             surfman_details: details,
             swap_chains: surfman::chains::SwapChains::new(),
             external_image_id_manager: WebRenderExternalImageIdManager::default(),
+            canvas_image_ids: Default::default(),
         });
     });
 }

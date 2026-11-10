@@ -211,6 +211,9 @@ pub(crate) struct Painter {
     /// safely hold one prepared scene at a time.
     prepared_frame_tag: Option<u64>,
 
+    /// The GPU canvas front buffers held for the prepared frame (Loom prototype).
+    gpu_canvas_latch: Option<Rc<crate::gpu_canvas_external_images::GpuCanvasLatch>>,
+
     /// Registered applied seal and exact distinct-loop completion join.
     applied_seal_join: Option<AppliedSealJoin>,
     /// A completed request delayed by the existing canvas-image gate.
@@ -310,11 +313,17 @@ impl Painter {
             WebRenderImageHandlerType::WebGpu,
         );
 
-        if let Some(gpu_canvas) = paint_api::gpu_canvas_shared() {
+        let gpu_canvas_latch = paint_api::gpu_canvas_shared().map(|gpu_canvas| {
+            Rc::new(crate::gpu_canvas_external_images::GpuCanvasLatch::new(
+                gpu_canvas.swap_chains.clone(),
+                gpu_canvas.canvas_image_ids.clone(),
+            ))
+        });
+        if let Some(latch) = &gpu_canvas_latch {
             external_image_handlers.set_handler(
                 Box::new(crate::gpu_canvas_external_images::GpuCanvasExternalImages::new(
                     rendering_context.clone(),
-                    gpu_canvas.swap_chains.clone(),
+                    latch.clone(),
                 )),
                 WebRenderImageHandlerType::Canvas2d,
             );
@@ -441,6 +450,7 @@ impl Painter {
             webrender_renderer: Some(webrender_renderer),
             shader_program_cache,
             prepared_frame_tag: None,
+            gpu_canvas_latch,
             applied_seal_join: None,
             pending_applied_scene: None,
             last_applied_seal: Default::default(),
@@ -763,6 +773,13 @@ impl Painter {
             }
         );
 
+        // The canvases have presented this frame's content by now: the frame's scene waited for
+        // their image updates. Hold those buffers until the frame is drawn, so a canvas that
+        // presents again before then cannot change what this frame shows.
+        if let Some(latch) = &self.gpu_canvas_latch {
+            latch.latch();
+        }
+
         probe.checkpoint();
         self.prepared_frame_tag = Some(frame_tag);
         probe.finish(true);
@@ -811,6 +828,10 @@ impl Painter {
         // the scene no longer needs to be repainted.
         self.needs_repaint.set(RepaintReason::empty());
 
+        if let Some(latch) = &self.gpu_canvas_latch {
+            latch.release();
+        }
+
         self.screenshot_taker.maybe_take_screenshots(self);
         self.send_pending_paint_metrics_messages_after_composite();
         self.prepared_frame_tag = None;
@@ -821,6 +842,9 @@ impl Painter {
     pub(crate) fn discard_prepared_render(&mut self, frame_tag: u64) -> bool {
         if self.prepared_frame_tag != Some(frame_tag) {
             return false;
+        }
+        if let Some(latch) = &self.gpu_canvas_latch {
+            latch.release();
         }
         self.prepared_frame_tag = None;
         true

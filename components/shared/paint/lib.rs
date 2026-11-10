@@ -649,6 +649,9 @@ pub struct GpuCanvasShared {
     pub surfman_details: PainterSurfmanDetailsMap,
     pub swap_chains: surfman::chains::SwapChains<webrender_api::ExternalImageId, surfman::Device>,
     pub external_image_id_manager: WebRenderExternalImageIdManager,
+    /// The external image ids of the live GPU canvases. The paint thread latches each one's
+    /// front buffer when it prepares a frame.
+    pub canvas_image_ids: Arc<Mutex<Vec<webrender_api::ExternalImageId>>>,
 }
 
 static GPU_CANVAS_SHARED: std::sync::OnceLock<GpuCanvasShared> = std::sync::OnceLock::new();
