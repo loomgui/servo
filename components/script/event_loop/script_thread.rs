@@ -55,7 +55,7 @@ use http::header::REFRESH;
 use hyper_serde::Serde;
 use js::context::{JSContext, NoGC};
 use js::glue::GetWindowProxyClass;
-use js::jsapi::{GCReason, JSContext as UnsafeJSContext, JSGCParamKey};
+use js::jsapi::{GCReason, JSContext as UnsafeJSContext, JSGCParamKey, NotifyAnimationActivity};
 use js::jsval::UndefinedValue;
 use js::rust::ParentRuntime;
 use js::rust::wrappers2::{
@@ -1358,6 +1358,20 @@ impl ScriptThread {
         }
     }
 
+    /// Tell the JS engine that every document of this thread is animating.
+    ///
+    /// A major collection discards a realm's JIT code unless the realm animated within the
+    /// last second, which Gecko reports from its refresh driver and Servo never did. A
+    /// seal-driven embedder runs the page's script once per frame, so the discarded code is
+    /// needed again at once: the frame after a collection ran its script about 2 ms slower
+    /// while the code was recompiled, and was presented late.
+    fn note_animation_activity(&self) {
+        for (_, document) in self.documents.borrow().iter() {
+            let global = document.window().reflector().get_jsobject();
+            unsafe { NotifyAnimationActivity(global.get()) };
+        }
+    }
+
     /// Collect JS garbage while this thread is idle between two embedder frames.
     ///
     /// Collections are not incremental here, so the engine's own trigger, which waits for tens
@@ -1689,6 +1703,7 @@ impl ScriptThread {
             }
         }
         if completed_applied_seal {
+            self.note_animation_activity();
             self.maybe_collect_garbage_after_applied_seal(cx);
         }
 
