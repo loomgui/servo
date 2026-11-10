@@ -605,6 +605,11 @@ pub(crate) struct Document {
     /// A set of dirty HTML canvas elements that need their WebRender images updated the
     /// next time the rendering is updated.
     dirty_canvases: DomRefCell<Vec<Dom<HTMLCanvasElement>>>,
+    /// Canvas images flushed by [`Self::flush_dirty_canvases_before_layout`] in the current
+    /// rendering update, with the epoch each batch was flushed at.
+    #[no_trace]
+    #[ignore_malloc_size_of = "Small and emptied on every rendering update"]
+    early_canvas_flushes: DomRefCell<Vec<(Epoch, Vec<webrender_api::ImageKey>)>>,
     /// Whether or not animated images need to have their contents updated.
     has_pending_animated_image_update: Cell<bool>,
     /// <https://w3c.github.io/slection-api/#dfn-selection>
@@ -3212,6 +3217,37 @@ impl Document {
         );
     }
 
+    /// Start rasterizing the canvases dirtied so far, before layout runs.
+    ///
+    /// Called right after the animation frame callbacks, where canvases are normally drawn. The
+    /// resize-observer and intersection-observer steps that follow need up-to-date layout, so
+    /// flushing canvases only in [`Self::update_the_rendering`] delays their rasterization by a
+    /// whole layout pass. A canvas drawn to again after this point is flushed again there, at a
+    /// newer epoch, so the renderer still waits for its final contents.
+    pub(crate) fn flush_dirty_canvases_before_layout(&self) {
+        if self.dirty_canvases.borrow().is_empty() {
+            return;
+        }
+        let epoch = self.current_rendering_epoch.get().next();
+        self.current_rendering_epoch.set(epoch);
+        let dirty_canvases: Vec<_> = self.dirty_canvases.borrow_mut().drain(..).collect();
+        let mut image_keys = Vec::new();
+        let mut unflushed = Vec::new();
+        for canvas in dirty_canvases {
+            match canvas.update_rendering(epoch) {
+                Some(image_key) => image_keys.push(image_key),
+                // No image key or nothing pending yet: leave it for the regular flush.
+                None => unflushed.push(canvas),
+            }
+        }
+        self.dirty_canvases.borrow_mut().extend(unflushed);
+        if !image_keys.is_empty() {
+            self.early_canvas_flushes
+                .borrow_mut()
+                .push((epoch, image_keys));
+        }
+    }
+
     pub(crate) fn mark_canvas_as_dirty(&self, canvas: &Dom<HTMLCanvasElement>) {
         let mut dirty_canvases = self.dirty_canvases.borrow_mut();
         if dirty_canvases
@@ -3317,13 +3353,28 @@ impl Document {
 
         // The renderer should wait to display the frame until all canvas images are
         // uploaded. This allows canvas image uploading to happen asynchronously.
+        //
+        // Canvases flushed before layout wait at the epoch they were flushed at. One that was
+        // drawn to again since then is in `image_keys` too, and its newer epoch replaces the
+        // earlier one in the renderer.
         let pipeline_id = self.window().pipeline_id();
-        if !image_keys.is_empty() {
+        let early_canvas_flushes = std::mem::take(&mut *self.early_canvas_flushes.borrow_mut());
+        if !image_keys.is_empty() || !early_canvas_flushes.is_empty() {
             phases.insert(ReflowPhasesRun::UpdatedImageData);
             self.waiting_on_canvas_image_updates.set(true);
+        }
+        for (canvas_epoch, early_image_keys) in early_canvas_flushes {
             self.window().paint_api().delay_new_frame_for_canvas(
                 self.webview_id(),
-                self.window().pipeline_id(),
+                pipeline_id,
+                canvas_epoch,
+                early_image_keys,
+            );
+        }
+        if !image_keys.is_empty() {
+            self.window().paint_api().delay_new_frame_for_canvas(
+                self.webview_id(),
+                pipeline_id,
                 current_rendering_epoch,
                 image_keys,
             );
@@ -4188,6 +4239,7 @@ impl Document {
             shadow_roots_styles_changed: Cell::new(false),
             media_controls: DomRefCell::new(HashMap::new()),
             dirty_canvases: DomRefCell::new(Default::default()),
+            early_canvas_flushes: DomRefCell::new(Default::default()),
             has_pending_animated_image_update: Cell::new(false),
             selection: MutNullableDom::new(None),
             timeline: Dom::from_ref(timeline),
