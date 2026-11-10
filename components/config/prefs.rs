@@ -296,6 +296,10 @@ pub struct Preferences {
     pub js_mem_gc_incremental_slice_ms: i64,
     pub js_mem_gc_low_frequency_heap_growth: i64,
     pub js_mem_gc_malloc_threshold_base_mb: i64,
+    /// Collect garbage right after a seal-tagged rendering update once the JS heap has grown
+    /// by this many kilobytes since the last collection. Zero leaves collection entirely to
+    /// the engine's own triggers.
+    pub js_mem_gc_applied_seal_idle_threshold_kb: i64,
     pub js_mem_gc_per_zone_enabled: bool,
     pub js_mem_gc_urgent_threshold_mb: i64,
     pub js_mem_gc_zeal_frequency: i64,
@@ -558,6 +562,7 @@ impl Preferences {
             js_mem_gc_incremental_slice_ms: 10,
             js_mem_gc_low_frequency_heap_growth: 150,
             js_mem_gc_malloc_threshold_base_mb: 38,
+            js_mem_gc_applied_seal_idle_threshold_kb: 0,
             js_mem_gc_per_zone_enabled: false,
             js_mem_gc_urgent_threshold_mb: 16,
             js_mem_gc_zeal_frequency: 100,
