@@ -167,6 +167,11 @@ use crate::tasks::task_queue::TaskQueue;
 
 thread_local!(static SCRIPT_THREAD_ROOT: Cell<Option<*const ScriptThread>> = const { Cell::new(None) });
 
+/// A collection in the idle gap after a seal-tagged rendering update starts no sooner than
+/// this many times the previous one's pause after it, so that these collections take at
+/// most about 3% of the script thread's time.
+const IDLE_COLLECTION_INTERVAL_IN_PAUSES: u32 = 32;
+
 fn with_optional_script_thread<R>(f: impl FnOnce(Option<&ScriptThread>) -> R) -> R {
     SCRIPT_THREAD_ROOT.with(|root| {
         f(root
@@ -417,6 +422,8 @@ pub struct ScriptThread {
     /// The JS heap size right after the last collection started from
     /// [`Self::maybe_collect_garbage_after_applied_seal`].
     js_heap_bytes_after_idle_collection: Cell<u32>,
+    /// When the last such collection finished and how long it paused this thread.
+    last_idle_collection: Cell<Option<(Instant, Duration)>>,
 
     /// Whether an animation tick or ScriptThread-triggered rendering update is pending. This might
     /// either be because the Servo renderer is managing animations and the [`ScriptThread`] has
@@ -998,6 +1005,7 @@ impl ScriptThread {
                     pending_applied_seal_updates: Default::default(),
                     last_applied_seal_opportunity: Default::default(),
                     js_heap_bytes_after_idle_collection: Default::default(),
+                    last_idle_collection: Default::default(),
                     needs_rendering_update: Arc::new(AtomicBool::new(false)),
                     debugger_global: debugger_global.as_traced(),
                     debugger_paused: Cell::new(false),
@@ -1356,8 +1364,19 @@ impl ScriptThread {
         if heap_bytes - after_last_collection < threshold_bytes {
             return;
         }
+        // A collection's pause grows with the live heap, which every collection has to mark,
+        // and the threshold is reached sooner the faster frames come. Without a limit a page
+        // with a large heap at several hundred frames per second spent over a tenth of its
+        // time collecting. Waiting lets more garbage build up, which costs less per kilobyte.
+        if let Some((finished, pause)) = self.last_idle_collection.get()
+            && finished.elapsed() < pause * IDLE_COLLECTION_INTERVAL_IN_PAUSES
+        {
+            return;
+        }
         let started = Instant::now();
         unsafe { JS_GC(cx, GCReason::API) };
+        let pause = started.elapsed();
+        self.last_idle_collection.set(Some((Instant::now(), pause)));
         let heap_bytes_after = unsafe { JS_GetGCParameter(cx, JSGCParamKey::JSGC_BYTES) };
         self.js_heap_bytes_after_idle_collection
             .set(heap_bytes_after);
@@ -1366,7 +1385,7 @@ impl ScriptThread {
             "Collected JS garbage after an applied seal: {} KB -> {} KB in {:?}",
             heap_bytes / 1024,
             heap_bytes_after / 1024,
-            started.elapsed()
+            pause
         );
     }
 
