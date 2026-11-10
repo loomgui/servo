@@ -1668,7 +1668,10 @@ impl Painter {
             }
         }
 
-        if self.frame_delayer.needs_new_frame() {
+        // When an applied seal's scene was waiting for these images, `try_generate_applied_scene`
+        // below generates its tagged frame. Generating an untagged frame here as well would
+        // make WebRender build a frame nobody presents, ahead of the one the embedder waits for.
+        if self.frame_delayer.needs_new_frame() && self.pending_applied_scene.is_none() {
             self.frame_delayer.set_pending_frame(false);
             self.generate_frame(&mut txn, RenderReasons::SCENE);
             let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();

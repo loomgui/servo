@@ -1224,6 +1224,11 @@ impl ScriptThread {
                 document.run_the_animation_frame_callbacks(cx);
             }
 
+            // Canvases are normally drawn in the callbacks above. Start rasterizing them now so
+            // that work overlaps the layout the following steps need, instead of starting after
+            // it.
+            document.flush_dirty_canvases_before_layout();
+
             // Run the resize observer steps.
             let mut depth = Default::default();
             while document.gather_active_resize_observations_at_depth(cx.no_gc(), &depth) {
