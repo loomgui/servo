@@ -800,6 +800,31 @@ impl WebRenderExternalImageHandlers {
     }
 }
 
+impl WebRenderExternalImageHandlers {
+    /// The handler that serves `key`, or `None` when no handler knows the id any more.
+    ///
+    /// An id leaves the id manager as soon as its source is destroyed, while WebRender may
+    /// still draw a frame that was built earlier and refers to it. Handlers that keep such an
+    /// image alive for the frame claim it through `owns_unregistered_id`.
+    fn handler_type_for(&self, key: ExternalImageId) -> Option<WebRenderImageHandlerType> {
+        if let Some(handler_type) = self.id_manager().get(&key) {
+            return Some(handler_type);
+        }
+        let owns = |handler: &Option<Box<dyn WebRenderExternalImageApi>>| {
+            handler
+                .as_ref()
+                .is_some_and(|handler| handler.owns_unregistered_id(key.0))
+        };
+        if owns(&self.embedder_handler) {
+            Some(WebRenderImageHandlerType::Embedder)
+        } else if owns(&self.canvas2d_handler) {
+            Some(WebRenderImageHandlerType::Canvas2d)
+        } else {
+            None
+        }
+    }
+}
+
 impl ExternalImageHandler for WebRenderExternalImageHandlers {
     /// Lock the external image. Then, WR could start to read the
     /// image content.
@@ -811,17 +836,16 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
         _channel_index: u8,
         _is_composited: bool,
     ) -> ExternalImage<'_> {
-        let handler_type = self.id_manager().get(&key).unwrap_or_else(|| {
-            if self
-                .embedder_handler
-                .as_ref()
-                .is_some_and(|handler| handler.owns_unregistered_id(key.0))
-            {
-                WebRenderImageHandlerType::Embedder
-            } else {
-                panic!("Tried to get unknown external image")
-            }
-        });
+        let Some(handler_type) = self.handler_type_for(key) else {
+            // The image's source was destroyed after the frame being drawn was built, for
+            // example a canvas that was resized or removed. Draw the frame without it: a
+            // panic here would end the embedder's rendering for good.
+            warn!("Skipping external image {key:?}: its source no longer exists");
+            return ExternalImage {
+                uv: TexelRect::invalid(),
+                source: ExternalImageSource::Invalid,
+            };
+        };
         match handler_type {
             WebRenderImageHandlerType::WebGl => {
                 let (source, size) = self.webgl_handler.as_mut().unwrap().lock(key.0);
@@ -872,17 +896,10 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
     /// Unlock the external image. The WR should not read the image
     /// content after this call.
     fn unlock(&mut self, key: ExternalImageId, _channel_index: u8) {
-        let handler_type = self.id_manager().get(&key).unwrap_or_else(|| {
-            if self
-                .embedder_handler
-                .as_ref()
-                .is_some_and(|handler| handler.owns_unregistered_id(key.0))
-            {
-                WebRenderImageHandlerType::Embedder
-            } else {
-                panic!("Tried to get unknown external image")
-            }
-        });
+        // An id no handler knows was skipped by `lock`; there is nothing to release.
+        let Some(handler_type) = self.handler_type_for(key) else {
+            return;
+        };
         match handler_type {
             WebRenderImageHandlerType::WebGl => self.webgl_handler.as_mut().unwrap().unlock(key.0),
             WebRenderImageHandlerType::Media => self.media_handler.as_mut().unwrap().unlock(key.0),

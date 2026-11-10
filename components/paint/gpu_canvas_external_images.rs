@@ -75,6 +75,11 @@ impl GpuCanvasLatch {
         }
     }
 
+    /// Whether a surface is latched for `id`.
+    fn holds(&self, id: u64) -> bool {
+        self.latched.borrow().contains_key(&id)
+    }
+
     /// The surface to draw for `id`: the latched one, or the canvas's current front buffer when
     /// the canvas was not latched (it was created after the frame was prepared).
     fn take(&self, id: u64) -> Option<Surface> {
@@ -116,6 +121,12 @@ impl GpuCanvasExternalImages {
 }
 
 impl WebRenderExternalImageApi for GpuCanvasExternalImages {
+    /// A canvas that is resized or removed drops its image id at once, but the frame prepared
+    /// before that still shows the canvas. Its latched surface is all that frame needs.
+    fn owns_unregistered_id(&self, id: u64) -> bool {
+        self.latch.holds(id) || self.locked.contains_key(&id)
+    }
+
     fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, Size2D<i32>) {
         let Some(surface) = self.latch.take(id) else {
             return (ExternalImageSource::NativeTexture(0), Size2D::zero());
