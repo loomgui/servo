@@ -20,6 +20,11 @@
 //! are read back or uploaded. A frame that another canvas still has to draw is never
 //! overwritten; the source keeps its next frame in a new texture instead.
 //!
+//! Recording a path means turning it into strips, which is nearly all the canvas thread does
+//! for a path-heavy canvas. Path fills and strokes are therefore not recorded as they arrive:
+//! consecutive ones are collected, their strips are generated on a few worker threads, and
+//! they are recorded in order when anything else has to happen to the scene.
+//!
 //! If the thread's GL context is lost, or the renderer fails in a way it reports by panicking,
 //! the thread stops using the GPU for good: GPU canvases draw nothing from then on and
 //! [`take_context_loss`] tells the canvas thread to rebuild them on the CPU backend. Their
@@ -38,7 +43,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
 use fonts::FontIdentifier;
@@ -59,8 +65,8 @@ use surfman::{
 };
 use vello_cpu::{kurbo, peniko};
 use vello_hybrid::{
-    ImageId, RenderSize, Resources, SampleRect, Scene, TextureId, WebGl2RenderingContext,
-    WebGlRenderer, WebGlTextureBindings,
+    ImageId, PathStripGenerator, PathStripSettings, PathStrips, RenderSize, Resources,
+    SampleRect, Scene, TextureId, WebGl2RenderingContext, WebGlRenderer, WebGlTextureBindings,
 };
 use webrender_api::{
     ExternalImageData, ExternalImageId, ExternalImageType, ImageBufferKind, ImageDescriptor,
@@ -81,6 +87,43 @@ const MAX_ATLAS_IMAGE_SIDE: u16 = 4096;
 const UPLOAD_CACHE_BUDGET: usize = 64 << 20;
 /// Rasterizations (on any canvas of the thread) after which an unused upload is evicted.
 const UPLOAD_CACHE_MAX_IDLE: u64 = 600;
+
+/// Consecutive path draws from which generating their strips on the worker threads beats
+/// doing it on the canvas thread. A path takes around 20 µs; waking the workers, about as long.
+const MIN_PARALLEL_PATHS: usize = 16;
+/// How many paths a thread takes from a batch at a time.
+const PATHS_PER_CLAIM: usize = 4;
+
+/// What generating the strips of a pending path draw needs. Shared with the worker threads.
+struct PathJob {
+    path: kurbo::BezPath,
+    /// The stroke of a stroked path; a filled path has none.
+    stroke: Option<kurbo::Stroke>,
+    fill_rule: peniko::Fill,
+    settings: PathStripSettings,
+}
+
+/// How a pending path is drawn once its strips exist.
+struct PathDraw {
+    transform: kurbo::Affine,
+    paint: vello_cpu::PaintType,
+    composition: CompositionOrBlending,
+}
+
+thread_local! {
+    /// This thread's strip generator: the canvas thread's, or a path worker's.
+    static PATH_STRIP_GENERATOR: RefCell<PathStripGenerator> = RefCell::default();
+}
+
+fn path_strips(job: &PathJob) -> PathStrips {
+    PATH_STRIP_GENERATOR.with(|generator| {
+        let mut generator = generator.borrow_mut();
+        match &job.stroke {
+            Some(stroke) => generator.stroke(&job.path, stroke, &job.settings),
+            None => generator.fill(&job.path, job.fill_rule, &job.settings),
+        }
+    })
+}
 
 /// Identifies uploaded image content: its size and a hash of its premultiplied pixels.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -250,6 +293,9 @@ struct GpuThread {
     shared: GpuCanvasShared,
     /// Reads a canvas's back buffer into its retained texture.
     copy_framebuffer: glow::NativeFramebuffer,
+    /// Threads that generate path strips, started with the first batch that is worth it.
+    /// `None` inside if they could not be started; paths are then prepared on this thread.
+    path_workers: std::cell::OnceCell<Option<rayon::ThreadPool>>,
     /// A texture that only exists to be asked about. A context whose calls have stopped
     /// having any effect answers false to `glIsTexture`, without raising an error or a reset
     /// status (surfman creates contexts without reset notification).
@@ -399,6 +445,7 @@ impl GpuThread {
             uploads: RefCell::default(),
             shared,
             copy_framebuffer,
+            path_workers: Default::default(),
             canary,
             lost: Cell::new(false),
         })
@@ -417,6 +464,67 @@ impl GpuThread {
         if !unsafe { self.gl.glow().is_texture(self.canary) } {
             self.lose("its GL calls have no effect");
         }
+    }
+
+    /// The strips of `jobs`, in order, generated on the worker threads when there are enough
+    /// paths for that to pay off.
+    fn generate_path_strips(&self, jobs: &[PathJob]) -> Vec<PathStrips> {
+        let workers = (jobs.len() >= MIN_PARALLEL_PATHS)
+            .then(|| {
+                self.path_workers.get_or_init(|| {
+                    let threads = servo_config::pref!(thread_pool_canvas_workers).max(1) as usize;
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .thread_name(|index| format!("CanvasPaths#{index}"))
+                        .build()
+                        .inspect_err(|error| warn!("GPU canvas: no path workers: {error}"))
+                        .ok()
+                })
+            })
+            .and_then(Option::as_ref);
+        let Some(workers) = workers else {
+            return jobs.iter().map(path_strips).collect();
+        };
+        // This thread works alongside the workers instead of waiting for them. Everyone
+        // claims a few paths at a time until none are left, which keeps them balanced
+        // whatever the paths cost.
+        let next = AtomicUsize::new(0);
+        let work = || {
+            let mut done = Vec::new();
+            loop {
+                let start = next.fetch_add(PATHS_PER_CLAIM, Ordering::Relaxed);
+                if start >= jobs.len() {
+                    return done;
+                }
+                for index in start..(start + PATHS_PER_CLAIM).min(jobs.len()) {
+                    done.push((index, path_strips(&jobs[index])));
+                }
+            }
+        };
+        let parts = Mutex::new(Vec::new());
+        workers.in_place_scope(|scope| {
+            for _ in 0..workers.current_num_threads() {
+                scope.spawn(|_| {
+                    let done = work();
+                    parts.lock().unwrap_or_else(|error| error.into_inner()).push(done);
+                });
+            }
+            let done = work();
+            parts.lock().unwrap_or_else(|error| error.into_inner()).push(done);
+        });
+        let mut strips: Vec<Option<PathStrips>> = jobs.iter().map(|_| None).collect();
+        for (index, path_strips) in parts
+            .into_inner()
+            .unwrap_or_else(|error| error.into_inner())
+            .into_iter()
+            .flatten()
+        {
+            strips[index] = Some(path_strips);
+        }
+        strips
+            .into_iter()
+            .map(|strips| strips.expect("every path was claimed"))
+            .collect()
     }
 
     /// Stop using the GPU on this thread.
@@ -910,6 +1018,10 @@ pub(crate) struct VelloGpuDrawTarget {
     /// Other canvases' frames the pending scene draws; released after the next rasterization.
     /// The frame at index `i` is bound as texture `FIRST_SOURCE_TEXTURE + i`.
     source_frames: Vec<Rc<GpuFrame>>,
+    /// Path draws that are not in the scene yet, and how to draw each, index for index. They
+    /// go in together, before anything else does; see [`Self::draw_pending_paths`].
+    pending_path_jobs: Vec<PathJob>,
+    pending_path_draws: Vec<PathDraw>,
     /// Open shadow (filter) layers: draws inside them do not target the canvas directly.
     shadow_depth: u32,
 }
@@ -952,8 +1064,83 @@ impl VelloGpuDrawTarget {
         }
     }
 
-    /// Before new commands after a rasterization, draw the retained content back as background.
+    /// Record the pending path draws, in the order they were made. Everything that changes
+    /// the scene other than another path draw calls this first.
+    fn draw_pending_paths(&mut self) {
+        if self.pending_path_jobs.is_empty() {
+            return;
+        }
+        let jobs = std::mem::take(&mut self.pending_path_jobs);
+        let strips = self.gpu.thread.generate_path_strips(&jobs);
+        let draws = std::mem::take(&mut self.pending_path_draws);
+        for (draw, strips) in draws.into_iter().zip(&strips) {
+            self.with_composition(draw.composition, |self_| {
+                self_.scene.set_transform(draw.transform);
+                self_.scene.set_paint(draw.paint);
+                self_.scene.draw_path_strips(strips);
+            });
+        }
+    }
+
+    /// Queue a path fill (`stroke` is `None`) or stroke. Its strips are generated together
+    /// with those of the path draws around it.
+    fn draw_path(
+        &mut self,
+        path: &Path,
+        stroke: Option<kurbo::Stroke>,
+        fill_rule: peniko::Fill,
+        style: FillOrStrokeStyle,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        // Not `ensure_drawing`: that would record the path draws before this one first.
+        self.start_drawing();
+        let Some(paint) = self.paint(style, composition_options.alpha) else {
+            return;
+        };
+        let transform: kurbo::Affine = transform.cast().into();
+        self.scene.set_transform(transform);
+        let Some(settings) = self.scene.path_strip_settings() else {
+            // The scene has to generate these strips itself.
+            self.draw_pending_paths();
+            self.with_composition(composition_options.composition_operation, |self_| {
+                self_.scene.set_paint(paint);
+                match stroke {
+                    Some(stroke) => {
+                        self_.scene.set_stroke(stroke);
+                        self_.scene.stroke_path(&path.0);
+                    },
+                    None => {
+                        self_.scene.set_fill_rule(fill_rule);
+                        self_.scene.fill_path(&path.0);
+                        self_.scene.set_fill_rule(peniko::Fill::NonZero);
+                    },
+                }
+            });
+            return;
+        };
+        self.pending_path_jobs.push(PathJob {
+            path: path.0.clone(),
+            stroke,
+            fill_rule,
+            settings,
+        });
+        self.pending_path_draws.push(PathDraw {
+            transform,
+            paint,
+            composition: composition_options.composition_operation,
+        });
+    }
+
+    /// Before new commands after a rasterization, draw the retained content back as
+    /// background. Records the pending path draws first.
     fn ensure_drawing(&mut self) {
+        self.draw_pending_paths();
+        self.start_drawing();
+    }
+
+    /// [`Self::ensure_drawing`] for a path draw, which joins the pending ones.
+    fn start_drawing(&mut self) {
         if self.state == State::Drawing {
             return;
         }
@@ -983,6 +1170,7 @@ impl VelloGpuDrawTarget {
 
     /// Rasterize pending commands, if any.
     fn flush(&mut self) {
+        self.draw_pending_paths();
         if self.state != State::Drawing {
             return;
         }
@@ -1043,6 +1231,8 @@ impl VelloGpuDrawTarget {
             draws_retained: false,
             pinned_uploads: Vec::new(),
             source_frames: Vec::new(),
+            pending_path_jobs: Vec::new(),
+            pending_path_draws: Vec::new(),
             shadow_depth: 0,
         };
         // Publish a transparent first frame so WebRender always has a surface to sample.
@@ -1222,6 +1412,9 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
 
     fn clear_rect(&mut self, rect: &Rect<f32>, transform: Transform2D<f64>) {
         if self.is_viewport_cleared(rect, transform) {
+            // The pending path draws would be cleared too.
+            self.pending_path_jobs.clear();
+            self.pending_path_draws.clear();
             self.scene.reset();
             self.source_frames.clear();
             self.unpin_uploads();
@@ -1337,6 +1530,7 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
     }
 
     fn pop_shadow(&mut self) {
+        self.draw_pending_paths();
         self.scene.pop_layer();
         self.shadow_depth -= 1;
     }
@@ -1359,17 +1553,14 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     ) {
-        self.ensure_drawing();
-        let Some(paint) = self.paint(style, composition_options.alpha) else {
-            return;
-        };
-        self.with_composition(composition_options.composition_operation, |self_| {
-            self_.scene.set_transform(transform.cast().into());
-            self_.scene.set_fill_rule(fill_rule.convert());
-            self_.scene.set_paint(paint);
-            self_.scene.fill_path(&path.0);
-        });
-        self.scene.set_fill_rule(peniko::Fill::NonZero);
+        self.draw_path(
+            path,
+            None,
+            fill_rule.convert(),
+            style,
+            composition_options,
+            transform,
+        );
     }
 
     fn fill_text(
@@ -1422,12 +1613,14 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
     }
 
     fn pop_clip(&mut self) {
+        self.draw_pending_paths();
         if self.clips.pop().is_some() {
             self.scene.pop_layer();
         }
     }
 
     fn push_clip(&mut self, path: &Path, fill_rule: FillRule, transform: Transform2D<f64>) {
+        self.draw_pending_paths();
         let affine = transform.cast().into();
         self.scene.set_transform(affine);
         self.scene.set_fill_rule(fill_rule.convert());
@@ -1456,16 +1649,14 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     ) {
-        self.ensure_drawing();
-        let Some(paint) = self.paint(style, composition_options.alpha) else {
-            return;
-        };
-        self.with_composition(composition_options.composition_operation, |self_| {
-            self_.scene.set_transform(transform.cast().into());
-            self_.scene.set_paint(paint);
-            self_.scene.set_stroke(line_options.convert());
-            self_.scene.stroke_path(&path.0);
-        })
+        self.draw_path(
+            path,
+            Some(line_options.convert()),
+            peniko::Fill::NonZero,
+            style,
+            composition_options,
+            transform,
+        );
     }
 
     fn stroke_text(

@@ -902,11 +902,32 @@ mod canvas_tests {
     }
 
     /// A CPU canvas of 512x512 or more rasterizes on worker threads, where `vello_cpu` has no
-    /// filter layers and panics on one. A shadowed draw there must still draw its shape.
+    /// filter layers and panics on one. A shadowed draw there must draw its shape and its
+    /// shadow, and keep what the canvas showed before.
     #[test]
-    fn shadow_on_a_large_cpu_canvas_draws_the_shape() {
+    fn shadow_on_a_large_cpu_canvas() {
         let size = Size2D::new(600, 600);
         let mut canvas = Canvas::VelloCPU(CanvasData::new(size, CrossProcessPaintApi::dummy()));
+        let no_shadow = ShadowOptions {
+            offset_x: 0.0,
+            offset_y: 0.0,
+            blur: 0.0,
+            color: AbsoluteColor::TRANSPARENT_BLACK,
+        };
+        let source_over = CompositionOptions {
+            alpha: 1.0,
+            composition_operation: CompositionOrBlending::Composition(
+                CompositionStyle::SourceOver,
+            ),
+        };
+        // Drawn while the canvas still rasterizes on worker threads.
+        canvas.fill_rect(
+            &Rect::new((20.0, 20.0).into(), Size2D::new(60.0, 60.0)),
+            FillOrStrokeStyle::Color(AbsoluteColor::srgb_legacy(250, 200, 10, 1.0)),
+            no_shadow,
+            source_over,
+            Transform2D::identity(),
+        );
         canvas.fill_rect(
             &Rect::new((200.0, 200.0).into(), Size2D::new(200.0, 200.0)),
             FillOrStrokeStyle::Color(AbsoluteColor::srgb_legacy(40, 120, 220, 1.0)),
@@ -925,8 +946,20 @@ mod canvas_tests {
             Transform2D::identity(),
         );
         let pixels = canvas.read_pixels(None);
-        let offset = (300 * 600 + 300) * 4;
-        assert_eq!(&pixels.as_raw_bytes()[offset..offset + 4], &[40, 120, 220, 255]);
+        let at = |x: usize, y: usize| -> [u8; 4] {
+            let offset = (y * 600 + x) * 4;
+            pixels.as_raw_bytes()[offset..offset + 4].try_into().unwrap()
+        };
+        assert_eq!(at(300, 300), [40, 120, 220, 255], "the shape");
+        assert_eq!(at(50, 50), [250, 200, 10, 255], "what was drawn before the shadow");
+        // Right of the shape and inside its shadow, which is offset by 8 and blurred by 6.
+        let [red, green, blue, alpha] = at(404, 300);
+        assert!(
+            alpha > 100 && red < 8 && green < 8 && blue < 8,
+            "the shadow: {:?}",
+            at(404, 300)
+        );
+        assert_eq!(at(450, 300)[3], 0, "nothing beyond the shadow");
     }
 
     /// A GPU canvas whose GL context is lost must neither panic nor take the canvas thread

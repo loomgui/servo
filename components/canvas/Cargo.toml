@@ -32,6 +32,7 @@ peniko = { workspace = true }
 pixels = { workspace = true }
 pollster = { workspace = true, optional = true }
 profile_traits = { workspace = true }
+rayon = { workspace = true }
 rustc-hash = { workspace = true }
 servo-base = { workspace = true }
 servo-canvas-traits = { workspace = true }

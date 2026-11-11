@@ -87,6 +87,54 @@ fn embers<T: GenericDrawTarget>(t: &mut T, frame: u32) {
     }
 }
 
+/// 260 curved shapes on a 1920×1080 canvas, redrawn every frame: a third filled, all stroked
+/// with varying widths and joins, a quarter dashed. This is the `paths` workload of Loom's
+/// canvas benchmark, where preparing the paths dominates.
+fn paths<T: GenericDrawTarget>(t: &mut T, frame: u32) {
+    t.clear_rect(&rect(0.0, 0.0, 1920.0, 1080.0), identity());
+    let mut rng = Rng(0x9e37_79b9);
+    let time = f64::from(frame) / 60.0;
+    for i in 0..260_u32 {
+        let (x, y) = (rng.next() * 1920.0, rng.next() * 1080.0);
+        let wobble = (time * 2.0 + f64::from(i)).sin() * 30.0;
+        let mut path = Path::new();
+        path.move_to(x, y);
+        path.bezier_curve_to(
+            x + 80.0,
+            y - 60.0 + wobble,
+            x + 160.0,
+            y + 60.0 - wobble,
+            x + 240.0,
+            y,
+        );
+        path.line_to(x + 200.0, y + 70.0);
+        path.quadratic_curve_to(x + 120.0, y + 110.0 + wobble, x + 20.0, y + 60.0);
+        path.close_path();
+        if i % 3 == 0 {
+            t.fill(
+                &path,
+                FillRule::Nonzero,
+                color((i * 37 % 255) as u8, 150, (255 - i * 53 % 255) as u8, 0.55),
+                normal(),
+                identity(),
+            );
+        }
+        let join = [
+            LineJoinStyle::Miter,
+            LineJoinStyle::Round,
+            LineJoinStyle::Bevel,
+        ][(i % 3) as usize];
+        let dash = if i % 4 == 0 { vec![12.0, 6.0] } else { vec![] };
+        t.stroke(
+            &path,
+            color((i * 53 % 255) as u8, 200, (i * 91 % 255) as u8, 0.9),
+            line(1.0 + f64::from(i % 5), LineCapStyle::Butt, join, dash),
+            normal(),
+            identity(),
+        );
+    }
+}
+
 /// One player's HUD panel (400×140), redrawn every frame: background, health and energy bars
 /// with gradients, a score and labels, and a row of item icons.
 fn hud_panel<T: GenericDrawTarget>(t: &mut T, frame: u32, player: u32, icon: &pixels::Snapshot) {
@@ -198,12 +246,24 @@ fn run<T: GenericDrawTarget>(
     }
     let frames = frames();
     let start = Instant::now();
+    let mut recording = Duration::ZERO;
     for frame in WARMUP_FRAMES..WARMUP_FRAMES + frames {
+        let frame_start = Instant::now();
         workload(targets, frame);
+        recording += frame_start.elapsed();
         for target in targets.iter_mut() {
             let _ = target.image_descriptor_and_serializable_data();
         }
         after_frame(targets);
+    }
+    // `GPU_BENCH_SPLIT=1`: how much of a frame is the page's drawing calls, the rest being the
+    // presentation (rasterization on the CPU backend, submission on the GPU backend).
+    if std::env::var_os("GPU_BENCH_SPLIT").is_some() {
+        eprintln!(
+            "    drawing calls {:.2} ms of {:.2} ms per frame",
+            ms(recording / frames),
+            ms(start.elapsed() / frames)
+        );
     }
     Timing {
         per_frame: start.elapsed() / frames,
@@ -213,6 +273,7 @@ fn run<T: GenericDrawTarget>(
 #[derive(Clone, Copy)]
 enum Workload {
     Embers,
+    Paths,
     Hud,
     Sprites,
 }
@@ -221,6 +282,7 @@ impl Workload {
     fn key(self) -> &'static str {
         match self {
             Self::Embers => "embers",
+            Self::Paths => "paths",
             Self::Hud => "hud",
             Self::Sprites => "sprites",
         }
@@ -229,6 +291,7 @@ impl Workload {
     fn name(self) -> &'static str {
         match self {
             Self::Embers => "embers 1920x1080 (116 gradient embers, lighter)",
+            Self::Paths => "paths 1920x1080 (260 curves, filled and stroked)",
             Self::Hud => "hud 4x 400x140 (bars, text, 6 icons each)",
             Self::Sprites => "sprites 1920x1080 (500 drawImage)",
         }
@@ -236,7 +299,7 @@ impl Workload {
 
     fn targets<T: GenericDrawTarget>(self) -> Vec<T> {
         match self {
-            Self::Embers | Self::Sprites => vec![T::new(Size2D::new(1920, 1080))],
+            Self::Embers | Self::Paths | Self::Sprites => vec![T::new(Size2D::new(1920, 1080))],
             Self::Hud => (0..4).map(|_| T::new(Size2D::new(400, 140))).collect(),
         }
     }
@@ -249,6 +312,7 @@ impl Workload {
     ) {
         match self {
             Self::Embers => embers(&mut targets[0], frame),
+            Self::Paths => paths(&mut targets[0], frame),
             Self::Hud => {
                 for (player, target) in targets.iter_mut().enumerate() {
                     hud_panel(target, frame, player as u32, &images[0]);
@@ -477,7 +541,12 @@ fn gpu_bench() {
     // CPU backend (for profiling the GPU path).
     let only = std::env::var("GPU_BENCH_ONLY").ok();
     let gpu_only = std::env::var_os("GPU_BENCH_GPU_ONLY").is_some();
-    let workloads = [Workload::Embers, Workload::Hud, Workload::Sprites]
+    let workloads = [
+        Workload::Embers,
+        Workload::Paths,
+        Workload::Hud,
+        Workload::Sprites,
+    ]
         .into_iter()
         .filter(|workload| only.as_deref().is_none_or(|only| only == workload.key()));
     let mut report = String::from(

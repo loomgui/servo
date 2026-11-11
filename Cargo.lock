@@ -8493,6 +8493,7 @@ dependencies = [
  "log",
  "peniko",
  "pollster",
+ "rayon",
  "rustc-hash 2.1.3",
  "servo-base",
  "servo-canvas-traits",
