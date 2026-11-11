@@ -153,6 +153,9 @@ pub struct Paint {
     /// are specific to a particular [`Painter`].
     pub(crate) painter_surfman_details_map: PainterSurfmanDetailsMap,
 
+    /// Surfaces and ids of GPU-rasterized 2D canvases, shared with the canvas thread.
+    pub(crate) gpu_canvas_shared: paint_api::GpuCanvasShared,
+
     #[cfg(feature = "webgl")]
     /// Keeps track of all webgl related elements.
     pub(crate) webgl_paint: WebGLPaint,
@@ -205,14 +208,12 @@ impl Paint {
 
         let webrender_external_image_id_manager = WebRenderExternalImageIdManager::default();
         let painter_surfman_details_map = PainterSurfmanDetailsMap::default();
-        // Loom prototype: share surfman details and a swap-chain table with the canvas thread so
-        // 2D canvases can be rasterized on the GPU and sampled by WebRender without CPU copies.
-        paint_api::set_gpu_canvas_shared(paint_api::GpuCanvasShared {
-            surfman_details: painter_surfman_details_map.clone(),
-            swap_chains: surfman::chains::SwapChains::new(),
-            external_image_id_manager: webrender_external_image_id_manager.clone(),
-            canvas_image_ids: Default::default(),
-        });
+        // Shared with the canvas thread so that 2D canvases can be rasterized on the GPU and
+        // sampled by WebRender without CPU copies.
+        let gpu_canvas_shared = paint_api::GpuCanvasShared::new(
+            painter_surfman_details_map.clone(),
+            webrender_external_image_id_manager.clone(),
+        );
         #[cfg(feature = "webgl")]
         let WebGLComm {
             webgl_threads,
@@ -256,6 +257,7 @@ impl Paint {
             time_profiler_chan: state.time_profiler_chan,
             _mem_profiler_registration: registration,
             painter_surfman_details_map,
+            gpu_canvas_shared,
             #[cfg(feature = "webxr")]
             webxr_main_thread: RefCell::new(webxr_main_thread),
             #[cfg(feature = "webgpu")]
@@ -372,6 +374,11 @@ impl Paint {
 
     pub fn webrender_external_image_id_manager(&self) -> WebRenderExternalImageIdManager {
         self.webrender_external_image_id_manager.clone()
+    }
+
+    /// The state the canvas thread needs to rasterize 2D canvases on the GPU.
+    pub fn gpu_canvas_shared(&self) -> paint_api::GpuCanvasShared {
+        self.gpu_canvas_shared.clone()
     }
 
     pub fn webxr_running(&self) -> bool {

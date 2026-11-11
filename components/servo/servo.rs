@@ -1283,6 +1283,7 @@ fn create_constellation(
         #[cfg(feature = "webgl")]
         webgl_threads: Some(paint.webgl_threads()),
         webrender_external_image_id_manager: paint.webrender_external_image_id_manager(),
+        gpu_canvas_shared: paint.gpu_canvas_shared(),
         #[cfg(feature = "webgpu")]
         wgpu_image_map: paint.webgpu_image_map(),
         async_runtime,

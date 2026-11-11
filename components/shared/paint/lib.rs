@@ -641,9 +641,12 @@ impl PainterSurfmanDetailsMap {
     }
 }
 
-/// State shared between the paint thread and the canvas thread for GPU-rasterized 2D canvases
-/// (Loom prototype). The canvas thread renders into surfman surfaces published through
-/// `swap_chains`; the paint thread's external-image handler samples their front buffers.
+/// State shared between the paint thread and the canvas thread for GPU-rasterized 2D canvases.
+/// The canvas thread renders into surfman surfaces published through `swap_chains`; the paint
+/// thread's external-image handler samples their front buffers.
+///
+/// `Paint` creates it and hands a clone to the constellation, which gives it to the canvas
+/// thread it starts.
 #[derive(Clone)]
 pub struct GpuCanvasShared {
     pub surfman_details: PainterSurfmanDetailsMap,
@@ -654,16 +657,18 @@ pub struct GpuCanvasShared {
     pub canvas_image_ids: Arc<Mutex<Vec<webrender_api::ExternalImageId>>>,
 }
 
-static GPU_CANVAS_SHARED: std::sync::OnceLock<GpuCanvasShared> = std::sync::OnceLock::new();
-
-/// Publish the GPU canvas state. Only the first call has an effect.
-pub fn set_gpu_canvas_shared(shared: GpuCanvasShared) {
-    let _ = GPU_CANVAS_SHARED.set(shared);
-}
-
-/// The GPU canvas state, if the paint thread has published it (single-process embedders only).
-pub fn gpu_canvas_shared() -> Option<&'static GpuCanvasShared> {
-    GPU_CANVAS_SHARED.get()
+impl GpuCanvasShared {
+    pub fn new(
+        surfman_details: PainterSurfmanDetailsMap,
+        external_image_id_manager: WebRenderExternalImageIdManager,
+    ) -> Self {
+        Self {
+            surfman_details,
+            swap_chains: surfman::chains::SwapChains::new(),
+            external_image_id_manager,
+            canvas_image_ids: Default::default(),
+        }
+    }
 }
 
 /// This trait is used as a bridge between the different GL clients

@@ -17,7 +17,6 @@
 //! with `libEGL.dll` / `libGLESv2.dll` on `PATH`.
 
 use std::path::PathBuf;
-use std::sync::Once;
 
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
 use fonts::{FontData, FontDataAndIndex, FontIdentifier};
@@ -43,30 +42,26 @@ use crate::vello_gpu_backend::VelloGpuDrawTarget;
 const CHANNEL_TOLERANCE: u8 = 3;
 const MISMATCH_BUDGET: f64 = 0.002;
 
-static INIT: Once = Once::new();
-
-/// Publish a GPU canvas context the way the paint thread does in a running Servo.
-fn init_gpu() {
-    INIT.call_once(|| {
-        let connection = surfman::Connection::new().expect("surfman connection");
-        let adapter = connection
-            .create_hardware_adapter()
-            .expect("hardware adapter");
-        let details = PainterSurfmanDetailsMap::default();
-        details.insert(
-            PainterId::next(),
-            PainterSurfmanDetails {
-                connection,
-                adapter,
-            },
-        );
-        paint_api::set_gpu_canvas_shared(GpuCanvasShared {
-            surfman_details: details,
-            swap_chains: surfman::chains::SwapChains::new(),
-            external_image_id_manager: WebRenderExternalImageIdManager::default(),
-            canvas_image_ids: Default::default(),
-        });
-    });
+/// The state a running Servo's paint thread shares with its canvas thread.
+fn gpu_shared() -> GpuCanvasShared {
+    static SHARED: std::sync::OnceLock<GpuCanvasShared> = std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            let connection = surfman::Connection::new().expect("surfman connection");
+            let adapter = connection
+                .create_hardware_adapter()
+                .expect("hardware adapter");
+            let details = PainterSurfmanDetailsMap::default();
+            details.insert(
+                PainterId::next(),
+                PainterSurfmanDetails {
+                    connection,
+                    adapter,
+                },
+            );
+            GpuCanvasShared::new(details, WebRenderExternalImageIdManager::default())
+        })
+        .clone()
 }
 
 type GpuJob = Box<dyn FnOnce() -> Vec<u8> + Send>;
@@ -78,12 +73,12 @@ fn on_gpu_thread(job: impl FnOnce() -> Vec<u8> + Send + 'static) -> Vec<u8> {
         std::sync::Mutex<std::sync::mpsc::Sender<(GpuJob, std::sync::mpsc::Sender<Vec<u8>>)>>,
     > = std::sync::OnceLock::new();
     let sender = SENDER.get_or_init(|| {
-        init_gpu();
         let (sender, receiver) =
             std::sync::mpsc::channel::<(GpuJob, std::sync::mpsc::Sender<Vec<u8>>)>();
         std::thread::Builder::new()
             .name("gpu-parity".into())
             .spawn(move || {
+                crate::vello_gpu_backend::install_shared(gpu_shared());
                 for (job, reply) in receiver {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
                         .unwrap_or_default();
@@ -1311,7 +1306,7 @@ fn gpu_lifetime_stress() {
         return;
     }
     on_gpu_thread(|| {
-        let shared = paint_api::gpu_canvas_shared().expect("published");
+        let shared = gpu_shared();
         let mut ids = Vec::new();
         let mut alive = std::collections::VecDeque::new();
         for i in 0..300_u32 {

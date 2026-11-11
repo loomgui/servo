@@ -8,7 +8,7 @@ use std::{f32, thread};
 use crossbeam_channel::{Sender, select, unbounded};
 use euclid::default::{Rect, Size2D, Transform2D};
 use log::warn;
-use paint_api::CrossProcessPaintApi;
+use paint_api::{CrossProcessPaintApi, GpuCanvasShared};
 use pixels::Snapshot;
 use profile_traits::mem::{
     ProcessReports, ProfilerChan, Report, ReportsChan, perform_memory_report,
@@ -39,9 +39,13 @@ impl CanvasPaintThread {
 
     /// Creates a new `CanvasPaintThread` and returns an `IpcSender` to
     /// communicate with it.
+    ///
+    /// `gpu_canvas_shared` is what the thread needs to rasterize canvases on the GPU under the
+    /// `gpu` canvas backend. Without it every canvas uses the CPU backend.
     pub fn start(
         paint_api: CrossProcessPaintApi,
         mem_profiler_chan: ProfilerChan,
+        gpu_canvas_shared: Option<GpuCanvasShared>,
     ) -> (Sender<ConstellationCanvasMsg>, GenericSender<CanvasMsg>) {
         let (ipc_sender, ipc_receiver) = generic_channel::channel::<CanvasMsg>().unwrap();
         let msg_receiver = ipc_receiver.route_preserving_errors();
@@ -55,6 +59,9 @@ impl CanvasPaintThread {
             .name("Canvas".to_owned())
             .spawn(move || {
                 let _registration = registration;
+                if let Some(gpu_canvas_shared) = gpu_canvas_shared {
+                    crate::vello_gpu_backend::install_shared(gpu_canvas_shared);
+                }
                 let mut canvas_paint_thread = CanvasPaintThread::new(
                     paint_api);
                 loop {

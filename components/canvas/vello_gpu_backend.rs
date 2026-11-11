@@ -173,8 +173,14 @@ pub(crate) fn available() -> bool {
     GpuThread::get().is_some()
 }
 
-fn shared() -> Option<&'static GpuCanvasShared> {
-    paint_api::gpu_canvas_shared()
+/// Give this thread the state it shares with the paint thread. The canvas thread calls this
+/// once, before it creates any canvas.
+pub(crate) fn install_shared(shared: GpuCanvasShared) {
+    GPU_SHARED.with(|slot| *slot.borrow_mut() = Some(shared));
+}
+
+fn shared() -> Option<GpuCanvasShared> {
+    GPU_SHARED.with(|slot| slot.borrow().clone())
 }
 
 /// GL state shared by every GPU canvas on a canvas thread: a surfman device and context on
@@ -191,12 +197,14 @@ struct GpuThread {
     renderer: RefCell<WebGlRenderer>,
     resources: RefCell<Resources>,
     uploads: RefCell<ImageUploads>,
-    shared: &'static GpuCanvasShared,
+    shared: GpuCanvasShared,
     /// Reads a canvas's back buffer into its retained texture.
     copy_framebuffer: glow::NativeFramebuffer,
 }
 
 thread_local! {
+    /// What this thread shares with the paint thread; see [`install_shared`].
+    static GPU_SHARED: RefCell<Option<GpuCanvasShared>> = const { RefCell::new(None) };
     static GPU_THREAD: RefCell<Option<Rc<GpuThread>>> = const { RefCell::new(None) };
     /// GPU setup failed on this thread; canvases use the CPU backend.
     static GPU_FAILED: Cell<bool> = const { Cell::new(false) };
@@ -227,7 +235,7 @@ impl GpuThread {
     }
 
     fn new() -> Result<Self, String> {
-        let shared = shared().ok_or("GPU canvas state was not published")?;
+        let shared = shared().ok_or("this thread was not given the GPU canvas state")?;
         let details = shared
             .surfman_details
             .any()
