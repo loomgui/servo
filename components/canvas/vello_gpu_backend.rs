@@ -20,6 +20,11 @@
 //! are read back or uploaded. A frame that another canvas still has to draw is never
 //! overwritten; the source keeps its next frame in a new texture instead.
 //!
+//! If the thread's GL context is lost, or the renderer fails in a way it reports by panicking,
+//! the thread stops using the GPU for good: GPU canvases draw nothing from then on and
+//! [`take_context_loss`] tells the canvas thread to rebuild them on the CPU backend. Their
+//! content is gone; pages that redraw every frame recover on their next frame.
+//!
 //! Images (`drawImage`, `putImageData`, patterns) are uploaded into `vello_hybrid`'s image atlas
 //! once per distinct content: uploads are cached per thread by a content hash, pinned while a
 //! pending scene samples them, and evicted when idle or over budget.
@@ -180,6 +185,44 @@ pub(crate) fn available() -> bool {
     GpuThread::get().is_some()
 }
 
+/// Whether this thread lost its GL context since the last call. The canvas thread then
+/// rebuilds its GPU canvases, which [`available`] now sends to the CPU backend.
+pub(crate) fn take_context_loss() -> bool {
+    CONTEXT_LOSS_PENDING.with(|pending| pending.replace(false))
+}
+
+/// Behave as if the GL context had just been lost (tests).
+#[cfg(test)]
+pub(crate) fn simulate_context_loss() {
+    if let Some(thread) = GpuThread::get() {
+        thread.lose("simulated");
+    }
+}
+
+/// Have the driver mark this thread's context lost without telling this module (tests).
+/// Returns false when the driver has no `GL_CHROMIUM_lose_context`; ANGLE has it.
+///
+/// ANGLE then still makes the context current and answers queries, and reports neither a
+/// reset status nor `GL_CONTEXT_LOST`, but it drops every draw with a GL error.
+#[cfg(test)]
+pub(crate) fn lose_context_in_driver() -> bool {
+    const GUILTY_CONTEXT_RESET: u32 = 0x8253;
+    const INNOCENT_CONTEXT_RESET: u32 = 0x8254;
+    let Some(thread) = GpuThread::get() else {
+        return false;
+    };
+    thread.make_current();
+    let pointer = thread
+        .device
+        .get_proc_address(&thread.context.borrow(), "glLoseContextCHROMIUM");
+    if pointer.is_null() {
+        return false;
+    }
+    let lose_context: extern "system" fn(u32, u32) = unsafe { std::mem::transmute(pointer) };
+    lose_context(GUILTY_CONTEXT_RESET, INNOCENT_CONTEXT_RESET);
+    true
+}
+
 /// Give this thread the state it shares with the paint thread. The canvas thread calls this
 /// once, before it creates any canvas.
 pub(crate) fn install_shared(shared: GpuCanvasShared) {
@@ -207,14 +250,23 @@ struct GpuThread {
     shared: GpuCanvasShared,
     /// Reads a canvas's back buffer into its retained texture.
     copy_framebuffer: glow::NativeFramebuffer,
+    /// A texture that only exists to be asked about. A context whose calls have stopped
+    /// having any effect answers false to `glIsTexture`, without raising an error or a reset
+    /// status (surfman creates contexts without reset notification).
+    canary: glow::NativeTexture,
+    /// The GL context is gone, or the renderer is in an unknown state after a panic. Nothing
+    /// touches GL or the renderer again.
+    lost: Cell<bool>,
 }
 
 thread_local! {
     /// What this thread shares with the paint thread; see [`install_shared`].
     static GPU_SHARED: RefCell<Option<GpuCanvasShared>> = const { RefCell::new(None) };
     static GPU_THREAD: RefCell<Option<Rc<GpuThread>>> = const { RefCell::new(None) };
-    /// GPU setup failed on this thread; canvases use the CPU backend.
+    /// GPU setup failed on this thread, or its context was lost; canvases use the CPU backend.
     static GPU_FAILED: Cell<bool> = const { Cell::new(false) };
+    /// The context was lost and the canvas thread has not rebuilt its GPU canvases yet.
+    static CONTEXT_LOSS_PENDING: Cell<bool> = const { Cell::new(false) };
 }
 
 impl GpuThread {
@@ -303,6 +355,21 @@ impl GpuThread {
                 return Err(error);
             },
         };
+        // A texture name becomes a texture when it is first bound.
+        let canary = unsafe {
+            glow.create_texture().inspect(|texture| {
+                glow.bind_texture(glow::TEXTURE_2D, Some(*texture));
+                glow.bind_texture(glow::TEXTURE_2D, None);
+            })
+        };
+        let canary = match canary {
+            Ok(canary) => canary,
+            Err(error) => {
+                unsafe { glow.delete_framebuffer(copy_framebuffer) };
+                let _ = device.destroy_context(&mut context);
+                return Err(error);
+            },
+        };
         let gl = WebGl2RenderingContext::from_glow(glow, 1, 1);
         // The renderer panics rather than returning errors (shader compilation, link and
         // capability checks). Contain that here so a driver that cannot run it falls back to the
@@ -332,17 +399,42 @@ impl GpuThread {
             uploads: RefCell::default(),
             shared,
             copy_framebuffer,
+            canary,
+            lost: Cell::new(false),
         })
     }
 
+    /// Make the thread's context current and notice if it was lost. Callers must check
+    /// [`Self::lost`] afterwards before they touch GL or the renderer.
     fn make_current(&self) {
+        if self.lost.get() {
+            return;
+        }
         if let Err(error) = self.device.make_context_current(&self.context.borrow()) {
-            warn!("GPU canvas: make current failed: {error:?}");
+            self.lose(&format!("make current failed: {error:?}"));
+            return;
+        }
+        if !unsafe { self.gl.glow().is_texture(self.canary) } {
+            self.lose("its GL calls have no effect");
         }
     }
 
+    /// Stop using the GPU on this thread.
+    fn lose(&self, why: &str) {
+        if self.lost.replace(true) {
+            return;
+        }
+        warn!("GPU canvas: lost the GL context ({why}); canvases move to the CPU backend");
+        GPU_FAILED.with(|failed| failed.set(true));
+        CONTEXT_LOSS_PENDING.with(|pending| pending.set(true));
+    }
+
+
     /// The atlas image for `pixmap`, uploading it if this content is not cached, pinned once.
     fn pin_upload(&self, pixmap: &vello_cpu::Pixmap) -> Option<(UploadKey, ImageId)> {
+        if self.lost.get() {
+            return None;
+        }
         let key = UploadKey::of(pixmap);
         let mut uploads = self.uploads.borrow_mut();
         let epoch = uploads.epoch;
@@ -352,6 +444,9 @@ impl GpuThread {
             return Some((key, upload.id));
         }
         self.make_current();
+        if self.lost.get() {
+            return None;
+        }
         let bytes = usize::from(key.width) * usize::from(key.height) * 4;
         let mut id = self.try_upload(pixmap);
         if id.is_none() {
@@ -380,9 +475,19 @@ impl GpuThread {
     }
 
     fn try_upload(&self, pixmap: &vello_cpu::Pixmap) -> Option<ImageId> {
-        self.renderer
-            .borrow_mut()
-            .try_upload_image(&mut self.resources.borrow_mut(), pixmap)
+        if self.lost.get() {
+            return None;
+        }
+        // As in `Gpu::render`: the renderer panics when GL fails under it.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.renderer
+                .borrow_mut()
+                .try_upload_image(&mut self.resources.borrow_mut(), pixmap)
+        }))
+        .unwrap_or_else(|_| {
+            self.lose("the renderer panicked");
+            None
+        })
     }
 
     fn unpin_uploads(&self, keys: impl Iterator<Item = UploadKey>) {
@@ -440,6 +545,9 @@ impl GpuThread {
             return;
         }
         self.make_current();
+        if self.lost.get() {
+            return;
+        }
         let (mut renderer, mut resources) =
             (self.renderer.borrow_mut(), self.resources.borrow_mut());
         for key in keys {
@@ -472,6 +580,9 @@ pub(crate) struct GpuFrame {
 impl GpuFrame {
     /// An uninitialized frame texture of `size`. The thread's context must be current.
     fn new(thread: &Rc<GpuThread>, size: Size2D<u32>) -> Result<Self, String> {
+        if thread.lost.get() {
+            return Err("the GL context was lost".into());
+        }
         let glow = thread.gl.glow();
         let texture = unsafe {
             let texture = glow.create_texture()?;
@@ -507,7 +618,9 @@ impl GpuFrame {
 impl Drop for GpuFrame {
     fn drop(&mut self) {
         self.thread.make_current();
-        unsafe { self.thread.gl.glow().delete_texture(self.texture) };
+        if !self.thread.lost.get() {
+            unsafe { self.thread.gl.glow().delete_texture(self.texture) };
+        }
     }
 }
 
@@ -596,6 +709,9 @@ impl Gpu {
         let thread = self.thread.clone();
         let thread = &thread;
         thread.make_current();
+        if thread.lost.get() {
+            return;
+        }
         let Some(swap_chain) = thread.shared.swap_chains.get(self.image_id) else {
             return;
         };
@@ -604,7 +720,8 @@ impl Gpu {
         {
             Ok(surface_texture) => surface_texture,
             Err(error) => {
-                warn!("GPU canvas: could not take the back buffer: {error:?}");
+                // Without a back buffer this canvas would silently stop updating.
+                thread.lose(&format!("could not take the back buffer: {error:?}"));
                 return;
             },
         };
@@ -627,77 +744,102 @@ impl Gpu {
                 width: size.width,
                 height: size.height,
             };
-            if let Err(error) = thread.renderer.borrow_mut().render_to_texture(
-                scene,
-                &mut thread.resources.borrow_mut(),
-                &render_size,
-                &bindings,
-                clear,
-                texture,
-                target,
-            ) {
-                warn!("GPU canvas: render failed: {error:?}");
+            // The renderer reports GL failures by panicking, and a lost context makes object
+            // creation fail. Contain that: a panic here would take down the canvas thread and
+            // with it every canvas of the page.
+            let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                thread.renderer.borrow_mut().render_to_texture(
+                    scene,
+                    &mut thread.resources.borrow_mut(),
+                    &render_size,
+                    &bindings,
+                    clear,
+                    texture,
+                    target,
+                )
+            }));
+            match rendered {
+                Ok(Ok(())) => {},
+                Ok(Err(error)) => warn!("GPU canvas: render failed: {error:?}"),
+                Err(_) => thread.lose("the renderer panicked"),
+            }
+            // Rendering raises no GL error when it works. A context that is lost keeps
+            // answering queries, so the canary passes, but it drops every draw with an error.
+            let error = unsafe { thread.gl.glow().get_error() };
+            if error != glow::NO_ERROR {
+                thread.lose(&format!("GL error {error:#x} while rendering"));
             }
             // Another canvas may still have to draw the frame this one replaces. Leave that
             // texture to it and retain the new frame in a fresh one.
-            if Rc::strong_count(&self.retained) > 1 {
+            if !thread.lost.get() && Rc::strong_count(&self.retained) > 1 {
                 match GpuFrame::new(thread, size) {
                     Ok(frame) => self.retained = Rc::new(frame),
                     Err(error) => warn!("GPU canvas: could not allocate a frame: {error}"),
                 }
             }
-            let glow = thread.gl.glow();
-            unsafe {
-                // Retain this frame on the GPU before the buffer moves to WebRender.
-                glow.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(thread.copy_framebuffer));
-                glow.framebuffer_texture_2d(
-                    glow::READ_FRAMEBUFFER,
-                    glow::COLOR_ATTACHMENT0,
-                    target,
-                    Some(texture),
-                    0,
-                );
-                glow.bind_texture(glow::TEXTURE_2D, Some(self.retained.texture));
-                glow.copy_tex_sub_image_2d(
-                    glow::TEXTURE_2D,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    size.width as i32,
-                    size.height as i32,
-                );
-                glow.bind_texture(glow::TEXTURE_2D, None);
-                glow.framebuffer_texture_2d(
-                    glow::READ_FRAMEBUFFER,
-                    glow::COLOR_ATTACHMENT0,
-                    target,
-                    None,
-                    0,
-                );
-                glow.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
-                // This is the synchronization with WebRender, not a hint. The painter samples
-                // the buffer on its own device. Surfaces are shared between devices by share
-                // handle (Direct3D) or IOSurface (macOS), where the producer has to flush
-                // before another device reads; GL sync objects cannot cross devices. Without
-                // this flush the other device reads every frame incomplete, which
-                // `published_frame_is_complete_on_another_device` checks.
-                glow.flush();
+            if !thread.lost.get() {
+                self.retain_and_flush(target, texture, size);
             }
         }
         let mut context = thread.context.borrow_mut();
         if let Err(error) =
             swap_chain.recycle_surface_texture(&thread.device, &mut context, surface_texture)
         {
-            warn!("GPU canvas: could not return the back buffer: {error:?}");
+            thread.lose(&format!("could not return the back buffer: {error:?}"));
+            return;
         }
         if let Err(error) = swap_chain.swap_buffers(
             &thread.device,
             &mut context,
             surfman::chains::PreserveBuffer::No,
         ) {
-            warn!("GPU canvas: swap failed: {error:?}");
+            thread.lose(&format!("could not present a frame: {error:?}"));
+        }
+    }
+
+    /// Copy the back buffer, bound as `texture`, into the retained frame and flush, so that
+    /// the buffer is complete when it moves to WebRender.
+    fn retain_and_flush(&self, target: u32, texture: glow::NativeTexture, size: Size2D<u32>) {
+        let glow = self.thread.gl.glow();
+        unsafe {
+            glow.bind_framebuffer(
+                glow::READ_FRAMEBUFFER,
+                Some(self.thread.copy_framebuffer),
+            );
+            glow.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                target,
+                Some(texture),
+                0,
+            );
+            glow.bind_texture(glow::TEXTURE_2D, Some(self.retained.texture));
+            glow.copy_tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                0,
+                0,
+                size.width as i32,
+                size.height as i32,
+            );
+            glow.bind_texture(glow::TEXTURE_2D, None);
+            glow.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                target,
+                None,
+                0,
+            );
+            glow.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+            // This is the synchronization with WebRender, not a hint. The painter samples
+            // the buffer on its own device. Surfaces are shared between devices by share
+            // handle (Direct3D) or IOSurface (macOS), where the producer has to flush
+            // before another device reads; GL sync objects cannot cross devices. Without
+            // this flush the other device reads every frame incomplete, which
+            // `published_frame_is_complete_on_another_device` checks.
+            glow.flush();
         }
     }
 
@@ -707,6 +849,10 @@ impl Gpu {
         let glow = self.thread.gl.glow();
         let (width, height) = (size.width as usize, size.height as usize);
         let mut pixels = vec![0_u8; width * height * 4];
+        if self.thread.lost.get() {
+            // The content is gone with the context.
+            return pixels;
+        }
         unsafe {
             let framebuffer = glow.create_framebuffer().ok();
             glow.bind_framebuffer(glow::READ_FRAMEBUFFER, framebuffer);

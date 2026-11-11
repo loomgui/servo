@@ -43,7 +43,7 @@ const CHANNEL_TOLERANCE: u8 = 3;
 const MISMATCH_BUDGET: f64 = 0.002;
 
 /// The state a running Servo's paint thread shares with its canvas thread.
-fn gpu_shared() -> GpuCanvasShared {
+pub(crate) fn gpu_shared() -> GpuCanvasShared {
     static SHARED: std::sync::OnceLock<GpuCanvasShared> = std::sync::OnceLock::new();
     SHARED
         .get_or_init(|| {
