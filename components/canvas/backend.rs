@@ -56,6 +56,10 @@ pub(crate) trait GenericDrawTarget {
     }
     /// Loom: end the shadow started by a successful `push_shadow`.
     fn pop_shadow(&mut self) {}
+    #[allow(
+        dead_code,
+        reason = "upstream's shadow path; no backend implements it and nothing calls it"
+    )]
     fn draw_surface_with_shadow(
         &self,
         surface: Self::SourceSurface,
@@ -113,6 +117,7 @@ pub(crate) trait GenericDrawTarget {
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     );
+    #[allow(dead_code, reason = "only upstream's unused shadow path called it")]
     fn surface(&mut self) -> Self::SourceSurface;
     fn image_descriptor_and_serializable_data(
         &mut self,

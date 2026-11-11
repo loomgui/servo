@@ -424,6 +424,7 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
         );
     }
 
+    #[allow(dead_code, reason = "only upstream's unused shadow path called it")]
     fn create_draw_target_for_shadow(&self, source_rect: &Rect<f32>) -> DrawTarget {
         self.draw_target.create_similar_draw_target(&Size2D::new(
             source_rect.size.width as i32,
@@ -447,21 +448,11 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
             self.draw_target.pop_shadow();
             return;
         }
-        let shadow_src_rect = transform.outer_transformed_rect(&rect.cast());
-        // Because this comes from the rect on f32 precision, casting it down should be ok.
-        let mut new_draw_target = self.create_draw_target_for_shadow(&shadow_src_rect.cast());
-        let shadow_transform = transform
-            .then(&Transform2D::identity().pre_translate(-shadow_src_rect.origin.to_vector()));
-        draw_shadow_source(&mut new_draw_target, shadow_transform);
-        self.draw_target.draw_surface_with_shadow(
-            new_draw_target.surface(),
-            &Point2D::new(
-                shadow_src_rect.origin.x as f32,
-                shadow_src_rect.origin.y as f32,
-            ),
-            shadow_options,
-            composition_options,
-        );
+        // Loom: a backend that cannot cast this shadow still draws the shape. The path that
+        // was here rendered the shape into a second target for `draw_surface_with_shadow`,
+        // which no backend implements, so a shadowed image drew nothing at all.
+        let _ = (rect, composition_options);
+        draw_shadow_source(&mut self.draw_target, transform);
     }
 
     /// Push a clip to the draw target to respect the non-repeating bound (either x, y, or both)

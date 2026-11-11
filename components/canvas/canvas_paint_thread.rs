@@ -860,7 +860,7 @@ impl Canvas {
 }
 
 #[cfg(test)]
-mod context_loss_tests {
+mod canvas_tests {
     use euclid::default::{Rect, Size2D, Transform2D};
     use paint_api::CrossProcessPaintApi;
     use servo_canvas_traits::canvas::{
@@ -870,6 +870,7 @@ mod context_loss_tests {
     use style::color::AbsoluteColor;
 
     use super::Canvas;
+    use crate::canvas_data::CanvasData;
     use crate::gpu_parity_tests::gpu_shared;
 
     fn fill(canvas: &mut Canvas, color: (u8, u8, u8)) {
@@ -898,6 +899,34 @@ mod context_loss_tests {
         let bytes = pixels.as_raw_bytes();
         let offset = (32 * 64 + 32) * 4;
         bytes[offset..offset + 4].try_into().unwrap()
+    }
+
+    /// A CPU canvas of 512x512 or more rasterizes on worker threads, where `vello_cpu` has no
+    /// filter layers and panics on one. A shadowed draw there must still draw its shape.
+    #[test]
+    fn shadow_on_a_large_cpu_canvas_draws_the_shape() {
+        let size = Size2D::new(600, 600);
+        let mut canvas = Canvas::VelloCPU(CanvasData::new(size, CrossProcessPaintApi::dummy()));
+        canvas.fill_rect(
+            &Rect::new((200.0, 200.0).into(), Size2D::new(200.0, 200.0)),
+            FillOrStrokeStyle::Color(AbsoluteColor::srgb_legacy(40, 120, 220, 1.0)),
+            ShadowOptions {
+                offset_x: 8.0,
+                offset_y: 8.0,
+                blur: 6.0,
+                color: AbsoluteColor::srgb_legacy(0, 0, 0, 0.6),
+            },
+            CompositionOptions {
+                alpha: 1.0,
+                composition_operation: CompositionOrBlending::Composition(
+                    CompositionStyle::SourceOver,
+                ),
+            },
+            Transform2D::identity(),
+        );
+        let pixels = canvas.read_pixels(None);
+        let offset = (300 * 600 + 300) * 4;
+        assert_eq!(&pixels.as_raw_bytes()[offset..offset + 4], &[40, 120, 220, 255]);
     }
 
     /// A GPU canvas whose GL context is lost must neither panic nor take the canvas thread
