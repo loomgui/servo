@@ -53,6 +53,8 @@ pub(crate) struct VelloCPUDrawTarget {
     resources: vello_cpu::Resources,
     pixmap: vello_cpu::Pixmap,
     clips: Vec<(Path, kurbo::Affine)>,
+    /// `ctx` rasterizes on worker threads, which large canvases do.
+    multi_threaded: bool,
     state: State,
 }
 
@@ -169,12 +171,14 @@ impl GenericDrawTarget for VelloCPUDrawTarget {
             num_threads: worker_thread_count(&size),
             ..Default::default()
         };
+        let multi_threaded = settings.num_threads > 0;
         let ctx = vello_cpu::RenderContext::new_with(size.width, size.height, settings);
         Self {
             ctx,
             resources: vello_cpu::Resources::new(),
             pixmap: vello_cpu::Pixmap::new(size.width, size.height),
             clips: Vec::new(),
+            multi_threaded,
             state: State::Rendered,
         }
     }
@@ -292,6 +296,13 @@ impl GenericDrawTarget for VelloCPUDrawTarget {
     }
 
     fn push_shadow(&mut self, shadow: &ShadowOptions) -> bool {
+        // `vello_cpu` has filter layers only in its single-threaded renderer; the
+        // multi-threaded one panics on them, which would take the canvas thread and with it
+        // the page down. Canvases of 512x512 and up render multi-threaded, so they draw
+        // their shapes without shadows.
+        if self.multi_threaded {
+            return false;
+        }
         self.ensure_drawing();
         self.ctx.set_transform(kurbo::Affine::IDENTITY);
         self.ctx.push_filter_layer(shadow_filter(shadow));

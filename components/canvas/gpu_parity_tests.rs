@@ -17,7 +17,6 @@
 //! with `libEGL.dll` / `libGLESv2.dll` on `PATH`.
 
 use std::path::PathBuf;
-use std::sync::Once;
 
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
 use fonts::{FontData, FontDataAndIndex, FontIdentifier};
@@ -33,7 +32,7 @@ use servo_canvas_traits::canvas::{
     TextRun,
 };
 use style::color::AbsoluteColor;
-use surfman::chains::SwapChainsAPI;
+use surfman::chains::{SwapChainAPI, SwapChainsAPI};
 
 use crate::backend::GenericDrawTarget;
 use crate::canvas_data::Filter;
@@ -43,30 +42,26 @@ use crate::vello_gpu_backend::VelloGpuDrawTarget;
 const CHANNEL_TOLERANCE: u8 = 3;
 const MISMATCH_BUDGET: f64 = 0.002;
 
-static INIT: Once = Once::new();
-
-/// Publish a GPU canvas context the way the paint thread does in a running Servo.
-fn init_gpu() {
-    INIT.call_once(|| {
-        let connection = surfman::Connection::new().expect("surfman connection");
-        let adapter = connection
-            .create_hardware_adapter()
-            .expect("hardware adapter");
-        let details = PainterSurfmanDetailsMap::default();
-        details.insert(
-            PainterId::next(),
-            PainterSurfmanDetails {
-                connection,
-                adapter,
-            },
-        );
-        paint_api::set_gpu_canvas_shared(GpuCanvasShared {
-            surfman_details: details,
-            swap_chains: surfman::chains::SwapChains::new(),
-            external_image_id_manager: WebRenderExternalImageIdManager::default(),
-            canvas_image_ids: Default::default(),
-        });
-    });
+/// The state a running Servo's paint thread shares with its canvas thread.
+pub(crate) fn gpu_shared() -> GpuCanvasShared {
+    static SHARED: std::sync::OnceLock<GpuCanvasShared> = std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            let connection = surfman::Connection::new().expect("surfman connection");
+            let adapter = connection
+                .create_hardware_adapter()
+                .expect("hardware adapter");
+            let details = PainterSurfmanDetailsMap::default();
+            details.insert(
+                PainterId::next(),
+                PainterSurfmanDetails {
+                    connection,
+                    adapter,
+                },
+            );
+            GpuCanvasShared::new(details, WebRenderExternalImageIdManager::default())
+        })
+        .clone()
 }
 
 type GpuJob = Box<dyn FnOnce() -> Vec<u8> + Send>;
@@ -78,12 +73,12 @@ fn on_gpu_thread(job: impl FnOnce() -> Vec<u8> + Send + 'static) -> Vec<u8> {
         std::sync::Mutex<std::sync::mpsc::Sender<(GpuJob, std::sync::mpsc::Sender<Vec<u8>>)>>,
     > = std::sync::OnceLock::new();
     let sender = SENDER.get_or_init(|| {
-        init_gpu();
         let (sender, receiver) =
             std::sync::mpsc::channel::<(GpuJob, std::sync::mpsc::Sender<Vec<u8>>)>();
         std::thread::Builder::new()
             .name("gpu-parity".into())
             .spawn(move || {
+                crate::vello_gpu_backend::install_shared(gpu_shared());
                 for (job, reply) in receiver {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
                         .unwrap_or_default();
@@ -198,8 +193,9 @@ fn run_parity(
 
     // A scene that drew nothing would match trivially; `clear` legitimately wipes the canvas.
     assert!(
-        name == "composite_clear" ||
-            cpu.as_raw_bytes()
+        name == "composite_clear"
+            || cpu
+                .as_raw_bytes()
                 .chunks_exact(4)
                 .any(|pixel| pixel[3] != 0),
         "{name}: the CPU reference is blank"
@@ -1311,7 +1307,7 @@ fn gpu_lifetime_stress() {
         return;
     }
     on_gpu_thread(|| {
-        let shared = paint_api::gpu_canvas_shared().expect("published");
+        let shared = gpu_shared();
         let mut ids = Vec::new();
         let mut alive = std::collections::VecDeque::new();
         for i in 0..300_u32 {
@@ -1362,6 +1358,184 @@ fn gpu_lifetime_stress() {
     });
 }
 
+/// Reads a published canvas surface the way WebRender does: on its own surfman device, on
+/// another thread. Returns the surface and the color of its center pixel.
+#[allow(unsafe_code, reason = "GL calls on the reader thread's own context")]
+fn read_center_on_another_device(surface: surfman::Surface) -> (surfman::Surface, [u8; 4]) {
+    use glow::HasContext;
+    type Reply = std::sync::mpsc::Sender<(surfman::Surface, [u8; 4])>;
+    static READER: std::sync::OnceLock<
+        std::sync::Mutex<std::sync::mpsc::Sender<(surfman::Surface, Reply)>>,
+    > = std::sync::OnceLock::new();
+    let reader = READER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<(surfman::Surface, Reply)>();
+        let details = gpu_shared().surfman_details.any().expect("surfman details");
+        std::thread::Builder::new()
+            .name("gpu-parity-reader".into())
+            .spawn(move || {
+                let device = details
+                    .connection
+                    .create_device(&details.adapter)
+                    .expect("reader device");
+                let descriptor = device
+                    .create_context_descriptor(&surfman::ContextAttributes {
+                        version: surfman::GLVersion::new(3, 0),
+                        flags: surfman::ContextAttributeFlags::ALPHA,
+                    })
+                    .expect("reader context descriptor");
+                let mut context = device
+                    .create_context(&descriptor, None)
+                    .expect("reader context");
+                let own_surface = device
+                    .create_surface(
+                        &context,
+                        surfman::SurfaceAccess::GPUOnly,
+                        surfman::SurfaceType::Generic {
+                            size: Size2D::new(1, 1),
+                        },
+                    )
+                    .expect("reader surface");
+                device
+                    .bind_surface_to_context(&mut context, own_surface)
+                    .map_err(|(error, _)| error)
+                    .expect("bind reader surface");
+                device.make_context_current(&context).expect("make current");
+                let gl = unsafe {
+                    glow::Context::from_loader_function(|symbol| {
+                        device.get_proc_address(&context, symbol)
+                    })
+                };
+                let framebuffer = unsafe { gl.create_framebuffer() }.expect("framebuffer");
+                for (surface, reply) in receiver {
+                    let size = device.surface_info(&surface).size;
+                    let surface_texture = device
+                        .create_surface_texture(&mut context, surface)
+                        .map_err(|(error, _)| error)
+                        .expect("surface texture");
+                    let mut pixel = [0_u8; 4];
+                    unsafe {
+                        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer));
+                        gl.framebuffer_texture_2d(
+                            glow::READ_FRAMEBUFFER,
+                            glow::COLOR_ATTACHMENT0,
+                            device.surface_gl_texture_target(),
+                            device.surface_texture_object(&surface_texture),
+                            0,
+                        );
+                        gl.read_pixels(
+                            size.width / 2,
+                            size.height / 2,
+                            1,
+                            1,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelPackData::Slice(Some(&mut pixel)),
+                        );
+                        gl.framebuffer_texture_2d(
+                            glow::READ_FRAMEBUFFER,
+                            glow::COLOR_ATTACHMENT0,
+                            device.surface_gl_texture_target(),
+                            None,
+                            0,
+                        );
+                    }
+                    let surface = device
+                        .destroy_surface_texture(&mut context, surface_texture)
+                        .map_err(|(error, _)| error)
+                        .expect("destroy surface texture");
+                    let _ = reply.send((surface, pixel));
+                }
+            })
+            .expect("spawn reader thread");
+        std::sync::Mutex::new(sender)
+    });
+    let (reply, result) = std::sync::mpsc::channel();
+    reader
+        .lock()
+        .unwrap()
+        .send((surface, reply))
+        .expect("reader alive");
+    result.recv().expect("reader finished")
+}
+
+/// A canvas frame must be complete the moment it is published: the painter samples the front
+/// buffer on its own device without waiting for this one.
+///
+/// Surfaces are shared between the two Direct3D devices by share handle, without a keyed mutex
+/// under stock ANGLE, and GL sync objects cannot cross EGL displays. The contract for such a
+/// shared texture is that the producing device flushes before another device uses it, which
+/// the backend does before it swaps. Each frame here ends with an opaque full-canvas fill on
+/// top of several hundred blended gradients, so a reader that ran ahead of the rasterization
+/// would see the previous frame or the gradients instead of that fill.
+#[test]
+fn published_frame_is_complete_on_another_device() {
+    if gpu_canvas_unsupported_platform() {
+        eprintln!("published_frame_is_complete_on_another_device: skipped; needs OpenGL ES");
+        return;
+    }
+    let stale = on_gpu_thread(|| {
+        let shared = gpu_shared();
+        let size = Size2D::new(2048_u32, 2048_u32);
+        let mut target = VelloGpuDrawTarget::new(size);
+        let id = target.external_image_id();
+        let lighter = with_op(CompositionOrBlending::Composition(
+            CompositionStyle::Lighter,
+        ));
+        // `on_gpu_thread` treats an empty result as a panic.
+        let mut stale = vec![0xff];
+        for frame in 0..120_u32 {
+            target.clear_rect(&rect(0.0, 0.0, 2048.0, 2048.0), identity());
+            for i in 0..400_u32 {
+                let (x, y) = (
+                    f64::from((i * 97 + frame * 13) % 2048),
+                    f64::from((i * 211 + frame * 29) % 2048),
+                );
+                let glow = FillOrStrokeStyle::RadialGradient(RadialGradientStyle::new(
+                    x,
+                    y,
+                    0.0,
+                    x,
+                    y,
+                    220.0,
+                    vec![stop(0.0, 255, 220, 150, 0.6), stop(1.0, 150, 50, 20, 0.0)],
+                ));
+                target.fill(
+                    &circle(x, y, 220.0),
+                    FillRule::Nonzero,
+                    glow,
+                    lighter,
+                    identity(),
+                );
+            }
+            let expected = [(frame * 2 + 10) as u8, 255 - (frame * 2) as u8, 77, 255];
+            target.fill_rect(
+                &rect(0.0, 0.0, 2048.0, 2048.0),
+                color(expected[0], expected[1], expected[2], 1.0),
+                normal(),
+                identity(),
+            );
+            let _ = target.image_descriptor_and_serializable_data();
+            let swap_chain = shared.swap_chains.get(id).expect("swap chain");
+            let surface = swap_chain.take_surface().expect("published front buffer");
+            let (surface, pixel) = read_center_on_another_device(surface);
+            swap_chain.recycle_surface(surface);
+            let off = pixel
+                .iter()
+                .zip(&expected)
+                .any(|(seen, wanted)| seen.abs_diff(*wanted) > CHANNEL_TOLERANCE);
+            if off {
+                stale.push(frame as u8);
+            }
+        }
+        stale
+    });
+    assert_eq!(
+        stale,
+        vec![0xff],
+        "frames that were incomplete when read on the other device"
+    );
+}
+
 /// GPU memory shared by a thread's canvases shows up in memory reports once images are cached.
 #[test]
 fn gpu_memory_report() {
@@ -1391,6 +1565,228 @@ fn gpu_memory_report() {
         assert!(size("gpu-cached-uploads") >= 32 * 32 * 4, "{report:?}");
         vec![1]
     });
+}
+
+// ---- canvas to canvas ----------------------------------------------------------------------
+
+/// `drawImage(canvas, ...)` between two canvases of one backend. CPU canvases hand over the
+/// source's pixels; GPU canvases sample the source's frame on the GPU.
+trait DrawCanvas: GenericDrawTarget + Sized {
+    fn draw_canvas(
+        &mut self,
+        source: &mut Self,
+        source_rect: Rect<u32>,
+        dest: Rect<f64>,
+        filter: Filter,
+        composition: CompositionOptions,
+        transform: Transform2D<f64>,
+    );
+}
+
+impl DrawCanvas for VelloCPUDrawTarget {
+    fn draw_canvas(
+        &mut self,
+        source: &mut Self,
+        source_rect: Rect<u32>,
+        dest: Rect<f64>,
+        filter: Filter,
+        composition: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        let pixels = source.snapshot().get_rect(source_rect);
+        draw_image(self, pixels, dest, filter, composition, transform);
+    }
+}
+
+impl DrawCanvas for VelloGpuDrawTarget {
+    fn draw_canvas(
+        &mut self,
+        source: &mut Self,
+        source_rect: Rect<u32>,
+        dest: Rect<f64>,
+        filter: Filter,
+        composition: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        let frame = source.frame();
+        self.draw_frame(&frame, source_rect, dest, filter, composition, transform);
+    }
+}
+
+fn urect(x: u32, y: u32, w: u32, h: u32) -> Rect<u32> {
+    Rect::new(Point2D::new(x, y), Size2D::new(w, h))
+}
+
+/// A source canvas with opaque, translucent and empty regions, and no symmetry that would
+/// hide a flipped or shifted copy.
+fn canvas_source<T: GenericDrawTarget>(t: &mut T) {
+    t.fill_rect(
+        &rect(0.0, 0.0, 96.0, 20.0),
+        color(30, 60, 200, 1.0),
+        normal(),
+        identity(),
+    );
+    t.fill_rect(
+        &rect(8.0, 26.0, 40.0, 30.0),
+        color(220, 40, 40, 0.6),
+        normal(),
+        identity(),
+    );
+    t.fill(
+        &circle(70.0, 40.0, 18.0),
+        FillRule::Nonzero,
+        FillOrStrokeStyle::LinearGradient(LinearGradientStyle::new(
+            52.0,
+            22.0,
+            88.0,
+            58.0,
+            vec![stop(0.0, 255, 230, 60, 1.0), stop(1.0, 20, 160, 90, 1.0)],
+        )),
+        normal(),
+        identity(),
+    );
+    t.fill_rect(
+        &rect(2.0, 2.0, 6.0, 6.0),
+        color(255, 255, 255, 1.0),
+        normal(),
+        identity(),
+    );
+}
+
+fn canvas_to_canvas_scene<T: DrawCanvas>(t: &mut T) {
+    let mut source = T::new(Size2D::new(96, 64));
+    canvas_source(&mut source);
+
+    t.fill_rect(
+        &rect(0.0, 0.0, 320.0, 240.0),
+        color(40, 44, 52, 1.0),
+        normal(),
+        identity(),
+    );
+    // The whole canvas, unscaled.
+    t.draw_canvas(
+        &mut source,
+        urect(0, 0, 96, 64),
+        frect(8.0, 8.0, 96.0, 64.0),
+        Filter::Nearest,
+        normal(),
+        identity(),
+    );
+    // Part of it, scaled up with smoothing, at half alpha.
+    let mut faded = normal();
+    faded.alpha = 0.5;
+    t.draw_canvas(
+        &mut source,
+        urect(40, 16, 48, 40),
+        frect(120.0, 8.0, 144.0, 120.0),
+        Filter::Bilinear,
+        faded,
+        identity(),
+    );
+    // Scaled down, rotated, added to what is there.
+    t.draw_canvas(
+        &mut source,
+        urect(0, 0, 96, 64),
+        frect(0.0, 0.0, 60.0, 40.0),
+        Filter::Bilinear,
+        with_op(CompositionOrBlending::Composition(
+            CompositionStyle::Lighter,
+        )),
+        Transform2D::rotation(euclid::Angle::degrees(20.0)).then_translate((30.0, 110.0).into()),
+    );
+    // Inside a clip.
+    t.push_clip(&circle(230.0, 180.0, 40.0), FillRule::Nonzero, identity());
+    t.draw_canvas(
+        &mut source,
+        urect(0, 0, 96, 64),
+        frect(170.0, 140.0, 120.0, 80.0),
+        Filter::Bilinear,
+        normal(),
+        identity(),
+    );
+    t.pop_clip();
+
+    // A draw shows the source as it was when it was drawn. Change the source and draw it
+    // again next to the first copy, then drop it before this canvas is rasterized.
+    t.draw_canvas(
+        &mut source,
+        urect(40, 20, 48, 32),
+        frect(8.0, 170.0, 48.0, 32.0),
+        Filter::Bilinear,
+        normal(),
+        identity(),
+    );
+    source.fill_rect(
+        &rect(0.0, 0.0, 96.0, 64.0),
+        color(250, 20, 220, 1.0),
+        normal(),
+        identity(),
+    );
+    t.draw_canvas(
+        &mut source,
+        urect(40, 20, 48, 32),
+        frect(64.0, 170.0, 48.0, 32.0),
+        Filter::Bilinear,
+        normal(),
+        identity(),
+    );
+    drop(source);
+}
+
+#[test]
+fn canvas_to_canvas() {
+    run_parity(
+        "canvas_to_canvas",
+        Size2D::new(320, 240),
+        canvas_to_canvas_scene::<VelloCPUDrawTarget>,
+        canvas_to_canvas_scene::<VelloGpuDrawTarget>,
+    );
+}
+
+/// A canvas keeps drawing while another canvas still has to draw its previous frame: the
+/// frame must stay intact, and every texture involved must be released afterwards.
+#[test]
+fn canvas_frames_survive_their_source() {
+    if gpu_canvas_unsupported_platform() {
+        eprintln!("canvas_frames_survive_their_source: skipped; needs OpenGL ES");
+        return;
+    }
+    let pixels = on_gpu_thread(|| {
+        let mut dest = VelloGpuDrawTarget::new(Size2D::new(64, 64));
+        dest.clear_rect(&rect(0.0, 0.0, 64.0, 64.0), identity());
+        // Sixteen frames of one source, each a different color, drawn side by side.
+        let mut source = VelloGpuDrawTarget::new(Size2D::new(64, 64));
+        for step in 0..16_u32 {
+            source.fill_rect(
+                &rect(0.0, 0.0, 64.0, 64.0),
+                color((step * 16) as u8, 255 - (step * 16) as u8, 90, 1.0),
+                normal(),
+                identity(),
+            );
+            let frame = source.frame();
+            dest.draw_frame(
+                &frame,
+                urect(0, 0, 64, 64),
+                frect(f64::from(step * 4), 0.0, 4.0, 64.0),
+                Filter::Nearest,
+                normal(),
+                identity(),
+            );
+        }
+        drop(source);
+        dest.snapshot().as_raw_bytes().to_vec()
+    });
+    for step in 0..16_usize {
+        let pixel = &pixels[(32 * 64 + step * 4 + 2) * 4..][..4];
+        let expected = [(step * 16) as u8, 255 - (step * 16) as u8, 90, 255];
+        assert!(
+            pixel
+                .iter()
+                .zip(&expected)
+                .all(|(seen, wanted)| seen.abs_diff(*wanted) <= CHANNEL_TOLERANCE),
+            "column {step}: {pixel:?}, expected {expected:?}"
+        );
+    }
 }
 
 // ---- realistic workloads -------------------------------------------------------------------

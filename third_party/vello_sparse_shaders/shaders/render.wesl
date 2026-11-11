@@ -394,13 +394,26 @@ fn fs_main(
 
             var sample_color: vec4<f32>;
             if image_source_kind == IMAGE_SOURCE_EXTERNAL {
-                let final_xy = image_offset + extended_xy;
-                sample_color = sample_external_image(
-                    image_quality,
-                    final_xy,
-                    image_offset,
-                    image_size,
-                );
+                if image_quality == IMAGE_QUALITY_MEDIUM {
+                    // Loom: extend each bilinear tap separately, as for atlas images below. A
+                    // source region is usually part of a larger texture (one canvas drawn into
+                    // another), so its edge must neither blend with its neighbour inside the
+                    // region nor pick up texels outside it.
+                    sample_color = external_bilinear_sample_per_tap(
+                        local_xy + vec2(offset) - vec2(0.5),
+                        image_offset,
+                        image_size,
+                        image_extend_modes,
+                    );
+                } else {
+                    let final_xy = image_offset + extended_xy;
+                    sample_color = sample_external_image(
+                        image_quality,
+                        final_xy,
+                        image_offset,
+                        image_size,
+                    );
+                }
             } else if image_quality == IMAGE_QUALITY_HIGH {
                 let final_xy = image_offset + extended_xy;
                 sample_color = bicubic_sample(
@@ -707,6 +720,26 @@ fn bilinear_sample_per_tap(
 // The texel index for an integer tap position under `mode`.
 fn extend_tap(t: f32, mode: u32, max: f32) -> f32 {
     return clamp(floor(extend_mode(t, mode, max)), 0.0, max - 1.0);
+}
+
+// Loom: `bilinear_sample_per_tap` above, for the external texture.
+fn external_bilinear_sample_per_tap(
+    coords: vec2<f32>,
+    image_offset: vec2<f32>,
+    image_size: vec2<f32>,
+    extend_modes: vec2<u32>,
+) -> vec4<f32> {
+    let base = floor(coords);
+    let uv_frac = coords - base;
+    let x0 = extend_tap(base.x, extend_modes.x, image_size.x);
+    let x1 = extend_tap(base.x + 1.0, extend_modes.x, image_size.x);
+    let y0 = extend_tap(base.y, extend_modes.y, image_size.y);
+    let y1 = extend_tap(base.y + 1.0, extend_modes.y, image_size.y);
+    let a = textureLoad(external_texture, vec2<i32>(image_offset + vec2(x0, y0)), 0);
+    let b = textureLoad(external_texture, vec2<i32>(image_offset + vec2(x0, y1)), 0);
+    let c = textureLoad(external_texture, vec2<i32>(image_offset + vec2(x1, y0)), 0);
+    let d = textureLoad(external_texture, vec2<i32>(image_offset + vec2(x1, y1)), 0);
+    return mix(mix(a, b, uv_frac.y), mix(c, d, uv_frac.y), uv_frac.x);
 }
 
 // This is the same as `bilinear_sample` above, but for external textures instead of the atlas texture array.

@@ -8,7 +8,7 @@ use std::{f32, thread};
 use crossbeam_channel::{Sender, select, unbounded};
 use euclid::default::{Rect, Size2D, Transform2D};
 use log::warn;
-use paint_api::CrossProcessPaintApi;
+use paint_api::{CrossProcessPaintApi, GpuCanvasShared};
 use pixels::Snapshot;
 use profile_traits::mem::{
     ProcessReports, ProfilerChan, Report, ReportsChan, perform_memory_report,
@@ -39,9 +39,13 @@ impl CanvasPaintThread {
 
     /// Creates a new `CanvasPaintThread` and returns an `IpcSender` to
     /// communicate with it.
+    ///
+    /// `gpu_canvas_shared` is what the thread needs to rasterize canvases on the GPU under the
+    /// `gpu` canvas backend. Without it every canvas uses the CPU backend.
     pub fn start(
         paint_api: CrossProcessPaintApi,
         mem_profiler_chan: ProfilerChan,
+        gpu_canvas_shared: Option<GpuCanvasShared>,
     ) -> (Sender<ConstellationCanvasMsg>, GenericSender<CanvasMsg>) {
         let (ipc_sender, ipc_receiver) = generic_channel::channel::<CanvasMsg>().unwrap();
         let msg_receiver = ipc_receiver.route_preserving_errors();
@@ -55,6 +59,9 @@ impl CanvasPaintThread {
             .name("Canvas".to_owned())
             .spawn(move || {
                 let _registration = registration;
+                if let Some(gpu_canvas_shared) = gpu_canvas_shared {
+                    crate::vello_gpu_backend::install_shared(gpu_canvas_shared);
+                }
                 let mut canvas_paint_thread = CanvasPaintThread::new(
                     paint_api);
                 loop {
@@ -63,6 +70,7 @@ impl CanvasPaintThread {
                             match msg {
                                 Ok(Ok((canvas_id, command))) => {
                                     canvas_paint_thread.process_command(command, canvas_id);
+                                    canvas_paint_thread.recover_from_gpu_context_loss();
                                 },
                                 Ok(Err(e)) => {
                                     warn!("CanvasPaintThread message deserialization error: {e:?}");
@@ -99,6 +107,19 @@ impl CanvasPaintThread {
             .expect("Thread spawning failed");
 
         (create_sender, ipc_sender)
+    }
+
+    /// A lost GL context leaves this thread's GPU canvases unable to draw. Rebuild them on the
+    /// CPU backend. Their content is gone; they show again with the page's next drawing.
+    fn recover_from_gpu_context_loss(&mut self) {
+        if !crate::vello_gpu_backend::take_context_loss() {
+            return;
+        }
+        for canvas in self.canvases.values_mut() {
+            if canvas.is_gpu() {
+                canvas.recreate_with_backend_choice(None);
+            }
+        }
     }
 
     #[servo_tracing::instrument(skip_all)]
@@ -297,18 +318,37 @@ impl CanvasPaintThread {
                 composition_options,
                 transform,
             ) => {
-                let snapshot = self
-                    .canvas(canvas_id)
-                    .read_pixels(Some(source_rect.to_u32()));
-                self.canvas(other_canvas_id).draw_image(
-                    snapshot,
-                    dest_rect,
-                    source_rect,
-                    smoothing,
-                    shadow_options,
-                    composition_options,
-                    transform,
-                );
+                // Between two GPU canvases the destination samples the source's frame on the
+                // GPU. Any other pair goes through the source's pixels.
+                let frame = if self.canvas(other_canvas_id).is_gpu() {
+                    self.canvas(canvas_id).gpu_frame()
+                } else {
+                    None
+                };
+                if let Some(frame) = frame {
+                    self.canvas(other_canvas_id).draw_gpu_frame(
+                        frame,
+                        dest_rect,
+                        source_rect,
+                        smoothing,
+                        shadow_options,
+                        composition_options,
+                        transform,
+                    );
+                } else {
+                    let snapshot = self
+                        .canvas(canvas_id)
+                        .read_pixels(Some(source_rect.to_u32()));
+                    self.canvas(other_canvas_id).draw_image(
+                        snapshot,
+                        dest_rect,
+                        source_rect,
+                        smoothing,
+                        shadow_options,
+                        composition_options,
+                        transform,
+                    );
+                }
             },
             CanvasCommand::GetImageData(dest_rect, sender) => {
                 let snapshot = self.canvas(canvas_id).read_pixels(dest_rect);
@@ -733,6 +773,43 @@ impl Canvas {
         }
     }
 
+    fn is_gpu(&self) -> bool {
+        matches!(self, Canvas::VelloGpu(_))
+    }
+
+    /// This canvas's current content as a GPU frame, if it is a GPU canvas.
+    fn gpu_frame(&mut self) -> Option<std::rc::Rc<crate::vello_gpu_backend::GpuFrame>> {
+        match self {
+            Canvas::VelloGpu(canvas_data) => Some(canvas_data.gpu_frame()),
+            _ => None,
+        }
+    }
+
+    /// Draw another GPU canvas's frame. Only called on GPU canvases.
+    #[expect(clippy::too_many_arguments)]
+    fn draw_gpu_frame(
+        &mut self,
+        frame: std::rc::Rc<crate::vello_gpu_backend::GpuFrame>,
+        dest_rect: Rect<f64>,
+        source_rect: Rect<f64>,
+        smoothing_enabled: bool,
+        shadow_options: ShadowOptions,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        if let Canvas::VelloGpu(canvas_data) = self {
+            canvas_data.draw_gpu_frame(
+                frame,
+                dest_rect,
+                source_rect,
+                smoothing_enabled,
+                shadow_options,
+                composition_options,
+                transform,
+            );
+        }
+    }
+
     fn read_pixels(&mut self, read_rect: Option<Rect<u32>>) -> Snapshot {
         match self {
             #[cfg(feature = "vello")]
@@ -779,5 +856,157 @@ impl Canvas {
             Canvas::VelloCPU(canvas_data) => canvas_data.recreate(size),
             Canvas::VelloGpu(canvas_data) => canvas_data.recreate(size),
         }
+    }
+}
+
+#[cfg(test)]
+mod canvas_tests {
+    use euclid::default::{Rect, Size2D, Transform2D};
+    use paint_api::CrossProcessPaintApi;
+    use servo_canvas_traits::canvas::{
+        CompositionOptions, CompositionOrBlending, CompositionStyle, FillOrStrokeStyle,
+        ShadowOptions,
+    };
+    use style::color::AbsoluteColor;
+
+    use super::Canvas;
+    use crate::canvas_data::CanvasData;
+    use crate::gpu_parity_tests::gpu_shared;
+
+    fn fill(canvas: &mut Canvas, color: (u8, u8, u8)) {
+        let (r, g, b) = color;
+        canvas.fill_rect(
+            &Rect::from_size(Size2D::new(64.0, 64.0)),
+            FillOrStrokeStyle::Color(AbsoluteColor::srgb_legacy(r, g, b, 1.0)),
+            ShadowOptions {
+                offset_x: 0.0,
+                offset_y: 0.0,
+                blur: 0.0,
+                color: AbsoluteColor::TRANSPARENT_BLACK,
+            },
+            CompositionOptions {
+                alpha: 1.0,
+                composition_operation: CompositionOrBlending::Composition(
+                    CompositionStyle::SourceOver,
+                ),
+            },
+            Transform2D::identity(),
+        );
+    }
+
+    fn center(canvas: &mut Canvas) -> [u8; 4] {
+        let pixels = canvas.read_pixels(None);
+        let bytes = pixels.as_raw_bytes();
+        let offset = (32 * 64 + 32) * 4;
+        bytes[offset..offset + 4].try_into().unwrap()
+    }
+
+    /// A CPU canvas of 512x512 or more rasterizes on worker threads, where `vello_cpu` has no
+    /// filter layers and panics on one. A shadowed draw there must still draw its shape.
+    #[test]
+    fn shadow_on_a_large_cpu_canvas_draws_the_shape() {
+        let size = Size2D::new(600, 600);
+        let mut canvas = Canvas::VelloCPU(CanvasData::new(size, CrossProcessPaintApi::dummy()));
+        canvas.fill_rect(
+            &Rect::new((200.0, 200.0).into(), Size2D::new(200.0, 200.0)),
+            FillOrStrokeStyle::Color(AbsoluteColor::srgb_legacy(40, 120, 220, 1.0)),
+            ShadowOptions {
+                offset_x: 8.0,
+                offset_y: 8.0,
+                blur: 6.0,
+                color: AbsoluteColor::srgb_legacy(0, 0, 0, 0.6),
+            },
+            CompositionOptions {
+                alpha: 1.0,
+                composition_operation: CompositionOrBlending::Composition(
+                    CompositionStyle::SourceOver,
+                ),
+            },
+            Transform2D::identity(),
+        );
+        let pixels = canvas.read_pixels(None);
+        let offset = (300 * 600 + 300) * 4;
+        assert_eq!(&pixels.as_raw_bytes()[offset..offset + 4], &[40, 120, 220, 255]);
+    }
+
+    /// A GPU canvas whose GL context is lost must neither panic nor take the canvas thread
+    /// down. It moves to the CPU backend, where it draws again, and new canvases start there.
+    #[test]
+    fn lost_gpu_context_moves_canvases_to_the_cpu_backend() {
+        lose_context_and_recover("gpu-context-loss", false);
+    }
+
+    /// The same when the driver loses the context and nothing tells the backend: it has to
+    /// notice that its draws stopped working.
+    #[test]
+    fn context_lost_in_the_driver_is_noticed() {
+        lose_context_and_recover("gpu-context-loss-driver", true);
+    }
+
+    fn lose_context_and_recover(thread_name: &'static str, in_driver: bool) {
+        let supported = surfman::Connection::new()
+            .map(|connection| connection.gl_api() == surfman::GLApi::GLES)
+            .unwrap_or(false);
+        if !supported {
+            eprintln!("{thread_name}: skipped; the GPU canvas backend needs OpenGL ES");
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        // A thread of its own: the loss is permanent for the thread, and the other GPU tests
+        // share theirs. It never exits, because ANGLE can deadlock when a thread that made a
+        // context current does.
+        std::thread::Builder::new()
+            .name(thread_name.into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(|| {
+                    // Not in one expression: `set` would wait for the guard `get` returns.
+                    let mut preferences = servo_config::prefs::get().clone();
+                    preferences.dom_canvas_backend = "gpu".into();
+                    preferences.dom_canvas_gpu_min_pixels = 0;
+                    servo_config::prefs::set(preferences);
+                    crate::vello_gpu_backend::install_shared(gpu_shared());
+                    let size = Size2D::new(64, 64);
+                    let mut canvas =
+                        Canvas::new(size, CrossProcessPaintApi::dummy()).expect("canvas");
+                    assert!(canvas.is_gpu(), "the canvas starts on the GPU");
+                    fill(&mut canvas, (10, 200, 30));
+                    assert_eq!(center(&mut canvas), [10, 200, 30, 255]);
+
+                    if !in_driver {
+                        crate::vello_gpu_backend::simulate_context_loss();
+                    } else if !crate::vello_gpu_backend::lose_context_in_driver() {
+                        eprintln!("{thread_name}: skipped; no GL_CHROMIUM_lose_context");
+                        return;
+                    }
+                    // Still a GPU canvas until the thread reacts: drawing and reading must
+                    // be harmless.
+                    fill(&mut canvas, (200, 10, 30));
+                    let after_loss = center(&mut canvas);
+                    if !in_driver {
+                        assert_eq!(after_loss, [0, 0, 0, 0], "the content is gone");
+                    }
+
+                    assert!(
+                        crate::vello_gpu_backend::take_context_loss(),
+                        "the loss was noticed"
+                    );
+                    assert!(
+                        !crate::vello_gpu_backend::take_context_loss(),
+                        "reported once"
+                    );
+                    assert!(canvas.recreate_with_backend_choice(None));
+                    assert!(!canvas.is_gpu(), "the canvas moved to the CPU backend");
+                    let other = Canvas::new(size, CrossProcessPaintApi::dummy()).expect("canvas");
+                    assert!(!other.is_gpu(), "new canvases start on the CPU backend");
+                    fill(&mut canvas, (30, 10, 200));
+                    assert_eq!(center(&mut canvas), [30, 10, 200, 255]);
+                });
+                let _ = sender.send(result.is_ok());
+                loop {
+                    std::thread::park();
+                }
+            })
+            .expect("spawn");
+        assert!(receiver.recv().expect("the thread reported"), "see the panic above");
     }
 }

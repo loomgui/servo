@@ -451,6 +451,9 @@ pub struct Constellation<STF, SWF> {
     /// Phantom data that keeps the Rust type system happy.
     phantom: PhantomData<(STF, SWF)>,
 
+    /// What the canvas thread needs to rasterize 2D canvases on the GPU.
+    gpu_canvas_shared: paint_api::GpuCanvasShared,
+
     /// Entry point to create and get channels to a WebGLThread.
     #[cfg(feature = "webgl")]
     pub(crate) webgl_threads: Option<servo_canvas_traits::webgl::WebGLThreads>,
@@ -559,6 +562,9 @@ pub struct InitialConstellationState {
 
     /// A [`WebRenderExternalImageIdManager`] used to lazily start up the WebGPU threads.
     pub webrender_external_image_id_manager: WebRenderExternalImageIdManager,
+
+    /// What the canvas thread needs to rasterize 2D canvases on the GPU.
+    pub gpu_canvas_shared: paint_api::GpuCanvasShared,
 
     /// Entry point to create and get channels to a WebGLThread.
     #[cfg(feature = "webgl")]
@@ -704,6 +710,7 @@ where
                     next_pipeline_namespace_id: Cell::new(FIRST_CONTENT_PIPELINE_NAMESPACE_ID),
                     time_profiler_chan: state.time_profiler_chan,
                     mem_profiler_chan: state.mem_profiler_chan.clone(),
+                    gpu_canvas_shared: state.gpu_canvas_shared,
                     phantom: PhantomData,
                     webdriver_load_status_sender: None,
                     #[cfg(feature = "webgpu")]
@@ -6360,6 +6367,7 @@ where
         CanvasPaintThread::start(
             self.paint_proxy.cross_process_paint_api.clone(),
             self.mem_profiler_chan.clone(),
+            Some(self.gpu_canvas_shared.clone()),
         )
     }
 

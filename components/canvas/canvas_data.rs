@@ -424,6 +424,7 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
         );
     }
 
+    #[allow(dead_code, reason = "only upstream's unused shadow path called it")]
     fn create_draw_target_for_shadow(&self, source_rect: &Rect<f32>) -> DrawTarget {
         self.draw_target.create_similar_draw_target(&Size2D::new(
             source_rect.size.width as i32,
@@ -447,21 +448,11 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
             self.draw_target.pop_shadow();
             return;
         }
-        let shadow_src_rect = transform.outer_transformed_rect(&rect.cast());
-        // Because this comes from the rect on f32 precision, casting it down should be ok.
-        let mut new_draw_target = self.create_draw_target_for_shadow(&shadow_src_rect.cast());
-        let shadow_transform = transform
-            .then(&Transform2D::identity().pre_translate(-shadow_src_rect.origin.to_vector()));
-        draw_shadow_source(&mut new_draw_target, shadow_transform);
-        self.draw_target.draw_surface_with_shadow(
-            new_draw_target.surface(),
-            &Point2D::new(
-                shadow_src_rect.origin.x as f32,
-                shadow_src_rect.origin.y as f32,
-            ),
-            shadow_options,
-            composition_options,
-        );
+        // Loom: a backend that cannot cast this shadow still draws the shape. The path that
+        // was here rendered the shape into a second target for `draw_surface_with_shadow`,
+        // which no backend implements, so a shadowed image drew nothing at all.
+        let _ = (rect, composition_options);
+        draw_shadow_source(&mut self.draw_target, transform);
     }
 
     /// Push a clip to the draw target to respect the non-repeating bound (either x, y, or both)
@@ -531,6 +522,61 @@ impl<D: GenericDrawTarget> Drop for CanvasData<D> {
     fn drop(&mut self) {
         if let Some(image_key) = self.image_key {
             self.paint_api.delete_image(image_key);
+        }
+    }
+}
+
+impl CanvasData<crate::vello_gpu_backend::VelloGpuDrawTarget> {
+    /// The canvas's current content, for another GPU canvas to draw without a readback.
+    pub(crate) fn gpu_frame(&mut self) -> std::rc::Rc<crate::vello_gpu_backend::GpuFrame> {
+        self.draw_target.frame()
+    }
+
+    /// `drawImage` with a GPU canvas as the source: [`Self::draw_image`] for a source that
+    /// is a frame on the GPU instead of pixels.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn draw_gpu_frame(
+        &mut self,
+        frame: std::rc::Rc<crate::vello_gpu_backend::GpuFrame>,
+        dest_rect: Rect<f64>,
+        source_rect: Rect<f64>,
+        smoothing_enabled: bool,
+        shadow_options: ShadowOptions,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        // The pixels `draw_image` is given for a canvas source: `read_pixels` of this rect.
+        let source = source_rect.to_u32();
+        let filter = if smoothing_enabled {
+            Filter::Bilinear
+        } else {
+            Filter::Nearest
+        };
+        let writer = |draw_target: &mut crate::vello_gpu_backend::VelloGpuDrawTarget,
+                      transform| {
+            draw_target.draw_frame(
+                &frame,
+                source,
+                dest_rect,
+                filter,
+                composition_options,
+                transform,
+            );
+        };
+        if shadow_options.need_to_draw_shadow() {
+            let rect = Rect::new(
+                Point2D::new(dest_rect.origin.x as f32, dest_rect.origin.y as f32),
+                Size2D::new(dest_rect.size.width as f32, dest_rect.size.height as f32),
+            );
+            self.draw_with_shadow(
+                &rect,
+                shadow_options,
+                composition_options,
+                transform,
+                writer,
+            );
+        } else {
+            writer(&mut self.draw_target, transform);
         }
     }
 }
