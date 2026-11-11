@@ -1211,6 +1211,100 @@ fn shadow(offset_x: f64, offset_y: f64, blur: f64, r: u8, g: u8, b: u8, a: f32) 
     }
 }
 
+// The GPU backend collects consecutive path draws and prepares them on several threads. The
+// batches here are large enough for that, and everything that ends a batch sits between them:
+// a rect, a clip, a shadow and a change of blending. Order and paint must come out as drawn.
+parity!(path_batches_between_other_draws, 400, 300, |t| {
+    let wave = |i: u32, y: f64| {
+        let x = 10.0 + f64::from(i % 20) * 19.0;
+        let mut path = Path::new();
+        path.move_to(x, y);
+        path.bezier_curve_to(x + 12.0, y - 26.0, x + 24.0, y + 26.0, x + 36.0, y);
+        path.line_to(x + 30.0, y + 18.0);
+        path.quadratic_curve_to(x + 16.0, y + 30.0, x + 4.0, y + 14.0);
+        path.close_path();
+        path
+    };
+    t.fill_rect(
+        &rect(0.0, 0.0, 400.0, 300.0),
+        color(246, 244, 240, 1.0),
+        normal(),
+        identity(),
+    );
+    for i in 0..40_u32 {
+        let path = wave(i, 40.0 + f64::from(i / 20) * 26.0);
+        t.fill(
+            &path,
+            FillRule::Nonzero,
+            color((i * 6) as u8, 120, (240 - i * 5) as u8, 0.6),
+            normal(),
+            identity(),
+        );
+        t.stroke(
+            &path,
+            color(20, (i * 5) as u8, 90, 1.0),
+            line(
+                1.0 + f64::from(i % 4),
+                LineCapStyle::Butt,
+                LineJoinStyle::Round,
+                if i % 3 == 0 { vec![6.0, 3.0] } else { vec![] },
+            ),
+            normal(),
+            identity(),
+        );
+    }
+    // A rect over half of them: drawn after the batch above and before the next one.
+    t.fill_rect(
+        &rect(180.0, 20.0, 60.0, 90.0),
+        color(255, 255, 255, 0.85),
+        normal(),
+        identity(),
+    );
+    t.push_clip(&circle(200.0, 170.0, 70.0), FillRule::Nonzero, identity());
+    let gradient = || {
+        FillOrStrokeStyle::LinearGradient(LinearGradientStyle::new(
+            0.0,
+            120.0,
+            400.0,
+            220.0,
+            vec![stop(0.0, 250, 80, 40, 1.0), stop(1.0, 40, 90, 230, 1.0)],
+        ))
+    };
+    for i in 0..30_u32 {
+        t.fill(
+            &wave(i * 2, 130.0 + f64::from(i % 5) * 22.0),
+            FillRule::Evenodd,
+            gradient(),
+            normal(),
+            Transform2D::rotation(euclid::Angle::degrees(f64::from(i) - 15.0)),
+        );
+    }
+    t.pop_clip();
+    assert!(t.push_shadow(&shadow(4.0, 5.0, 5.0, 0, 0, 0, 0.6)));
+    for i in 0..18_u32 {
+        t.stroke(
+            &wave(i, 250.0),
+            color(30, 150, 110, 1.0),
+            line(3.0, LineCapStyle::Round, LineJoinStyle::Bevel, vec![]),
+            normal(),
+            identity(),
+        );
+    }
+    t.pop_shadow();
+    let lighter = with_op(CompositionOrBlending::Composition(
+        CompositionStyle::Lighter,
+    ));
+    for i in 0..20_u32 {
+        t.fill(
+            &circle(30.0 + f64::from(i) * 18.0, 275.0, 14.0),
+            FillRule::Nonzero,
+            color(120, 60, 20, 0.5),
+            if i % 2 == 0 { lighter } else { normal() },
+            identity(),
+        );
+    }
+});
+
 // A canvas this large rasterizes on worker threads in the CPU backend until it casts its first
 // shadow. What it drew before, and a clip that is open at that moment, must carry over.
 parity!(shadow_on_a_large_canvas, 640, 560, |t| {
