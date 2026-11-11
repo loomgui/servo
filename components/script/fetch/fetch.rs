@@ -757,7 +757,7 @@ impl FetchResponseListener for FetchContext {
     }
 
     fn process_response_eof(
-        self,
+        mut self,
         cx: &mut JSContext,
         request_id: RequestId,
         response: Result<(), NetworkError>,
@@ -770,6 +770,15 @@ impl FetchResponseListener for FetchContext {
             .root()
             .Signal()
             .remove_completed_fetch(request_id);
+
+        // `process_response` keeps the settled promise pinned so that an abort during body
+        // delivery can still reach it. Nothing can after this point, and a `TrustedPromise`
+        // unpins its promise only when it is rooted, not when it is dropped. Without this
+        // every `fetch()` kept its promise, and through it the response, headers and body
+        // stream, alive as a GC root until the script thread exited.
+        if let Some(promise) = self.fetch_promise.take() {
+            drop(promise.root(cx));
+        }
 
         let response_object = self.response_object.root();
         let mut realm = enter_auto_realm(cx, &*response_object);

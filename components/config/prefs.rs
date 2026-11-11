@@ -136,8 +136,15 @@ pub struct Preferences {
     ///
     /// Available values:
     /// - vello
+    /// - gpu (Loom): `vello_hybrid` on the GPU for canvases of at least
+    ///   `dom_canvas_gpu_min_pixels` pixels, `vello_cpu` for smaller ones
     /// - Everything else selects vello_cpu
     pub dom_canvas_backend: String,
+    /// With `dom_canvas_backend = "gpu"`, the smallest canvas (width × height) rasterized on the
+    /// GPU. Smaller canvases are cheaper on the CPU backend: a GPU canvas update has a fixed cost
+    /// (presenting through a swap chain) that only pays off on larger surfaces. 0 uses the GPU
+    /// for every canvas.
+    pub dom_canvas_gpu_min_pixels: i64,
     /// Maximum number of buffered canvas commands before an automatic flush is triggered.
     ///
     /// A lower value keeps the paint thread fed with work (better parallelism),
@@ -244,6 +251,10 @@ pub struct Preferences {
     /// <https://drafts.csswg.org/cssom-view/#the-visualviewport-interface>
     // feature: VisualViewport | #41341 | Web/API/VisualViewport
     pub dom_visual_viewport_enabled: bool,
+    /// Whether WebRender emits GPU debug markers (`KHR_debug` push/pop groups) around its
+    /// passes. They help GPU debuggers and profilers label work, but every marker is a GL
+    /// call on the paint thread; embedders that do not capture GPU traces can disable them.
+    pub gfx_gpu_markers_enabled: bool,
     /// True to compile all WebRender shaders when Servo initializes. This is mostly
     /// useful when modifying the shaders, to ensure they all compile after each change is
     /// made.
@@ -285,6 +296,10 @@ pub struct Preferences {
     pub js_mem_gc_incremental_slice_ms: i64,
     pub js_mem_gc_low_frequency_heap_growth: i64,
     pub js_mem_gc_malloc_threshold_base_mb: i64,
+    /// Collect garbage right after a seal-tagged rendering update once the JS heap has grown
+    /// by this many kilobytes since the last collection. Zero leaves collection entirely to
+    /// the engine's own triggers.
+    pub js_mem_gc_applied_seal_idle_threshold_kb: i64,
     pub js_mem_gc_per_zone_enabled: bool,
     pub js_mem_gc_urgent_threshold_mb: i64,
     pub js_mem_gc_zeal_frequency: i64,
@@ -350,6 +365,11 @@ pub struct Preferences {
     pub network_enforce_tls_localhost: bool,
     pub network_enforce_tls_onion: bool,
     pub network_http_cache_disabled: bool,
+    /// Whether every fetch asks the embedder if it wants to intercept the request
+    /// (`WebViewDelegate::load_web_resource`), waiting for the answer from the embedder's event
+    /// loop before the request proceeds. Embedders that never intercept can turn this off so
+    /// requests do not wait on their event loop (Loom).
+    pub network_request_interception_enabled: bool,
     /// The path to a disk cache file. Empty string disables the disk cache.
     pub network_http_disk_cache: String,
     /// Maximum size of the disk cache file in bytes.
@@ -431,6 +451,7 @@ impl Preferences {
             dom_canvas_capture_enabled: false,
             dom_canvas_text_enabled: true,
             dom_canvas_backend: String::new(),
+            dom_canvas_gpu_min_pixels: 512 * 512,
             dom_canvas_msg_buffer_size: 16,
             dom_composition_event_enabled: false,
             dom_cookiestore_enabled: false,
@@ -513,6 +534,7 @@ impl Preferences {
             fonts_monospace: String::new(),
             fonts_sans_serif: String::new(),
             fonts_serif: String::new(),
+            gfx_gpu_markers_enabled: true,
             gfx_precache_shaders: false,
             gfx_text_antialiasing_enabled: true,
             gfx_subpixel_text_antialiasing_enabled: true,
@@ -540,6 +562,7 @@ impl Preferences {
             js_mem_gc_incremental_slice_ms: 10,
             js_mem_gc_low_frequency_heap_growth: 150,
             js_mem_gc_malloc_threshold_base_mb: 38,
+            js_mem_gc_applied_seal_idle_threshold_kb: 0,
             js_mem_gc_per_zone_enabled: false,
             js_mem_gc_urgent_threshold_mb: 16,
             js_mem_gc_zeal_frequency: 100,
@@ -573,6 +596,7 @@ impl Preferences {
             network_enforce_tls_enabled: false,
             network_enforce_tls_localhost: false,
             network_enforce_tls_onion: false,
+            network_request_interception_enabled: true,
             network_http_cache_disabled: false,
             network_http_disk_cache: String::new(),
             network_http_disk_cache_size: 1024 * 1024 * 100, // Roughtly 100MB

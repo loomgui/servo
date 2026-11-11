@@ -166,14 +166,23 @@ impl RefreshDriverObserver for AnimationRefreshDriverObserver {
             return false;
         }
 
+        // Seal-driven WebViews get their rendering opportunities from their embedder's seals;
+        // ticking them here as well would update their rendering twice per embedder frame (Loom).
+        let sealed = painter.seal_driven_webviews();
+        let animating_webviews: Vec<_> = animating_webviews
+            .into_iter()
+            .filter(|webview_id| !sealed.contains(webview_id))
+            .collect();
+
         // Request new animation frames from all animating WebViews.
-        if let Err(error) =
-            self.constellation_sender
-                .send(EmbedderToConstellationMessage::TickAnimation(
-                    animating_webviews,
-                    None,
-                    None,
-                ))
+        if !animating_webviews.is_empty() &&
+            let Err(error) =
+                self.constellation_sender
+                    .send(EmbedderToConstellationMessage::TickAnimation(
+                        animating_webviews,
+                        None,
+                        None,
+                    ))
         {
             warn!("Sending tick to constellation failed ({error:?}).");
             return false;

@@ -205,6 +205,14 @@ impl Paint {
 
         let webrender_external_image_id_manager = WebRenderExternalImageIdManager::default();
         let painter_surfman_details_map = PainterSurfmanDetailsMap::default();
+        // Loom prototype: share surfman details and a swap-chain table with the canvas thread so
+        // 2D canvases can be rasterized on the GPU and sampled by WebRender without CPU copies.
+        paint_api::set_gpu_canvas_shared(paint_api::GpuCanvasShared {
+            surfman_details: painter_surfman_details_map.clone(),
+            swap_chains: surfman::chains::SwapChains::new(),
+            external_image_id_manager: webrender_external_image_id_manager.clone(),
+            canvas_image_ids: Default::default(),
+        });
         #[cfg(feature = "webgl")]
         let WebGLComm {
             webgl_threads,
@@ -550,6 +558,14 @@ impl Paint {
                 };
                 let _ = response.send(accepted);
             },
+            PaintMessage::RegisterAppliedSeal(seal) => {
+                if let Some(mut painter) = self.maybe_painter_mut(seal.webview_id.into()) {
+                    let frame_id = seal.frame_id;
+                    if !painter.register_applied_seal(seal) {
+                        warn!("Rejected stale or invalid applied seal for frame {frame_id}");
+                    }
+                }
+            },
             PaintMessage::AppliedSealRenderingComplete(opportunity, changed) => {
                 if let Some(mut painter) =
                     self.maybe_painter_mut(opportunity.seal.webview_id.into())
@@ -837,6 +853,11 @@ impl Paint {
     }
 
     /// Register one already-applied seal before its specific Script opportunity.
+    /// The proxy that queues messages for this [`Paint`] from any thread.
+    pub fn paint_proxy(&self) -> PaintProxy {
+        self.paint_proxy.clone()
+    }
+
     pub fn register_applied_seal(&self, seal: paint_api::AppliedSeal) -> bool {
         self.painter_mut(seal.webview_id.into())
             .register_applied_seal(seal)

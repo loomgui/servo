@@ -41,6 +41,39 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
         }
     }
 
+    /// Loom: a canvas around an already created draw target (GPU targets can fail to create).
+    pub(crate) fn with_draw_target(
+        draw_target: DrawTarget,
+        paint_api: CrossProcessPaintApi,
+    ) -> CanvasData<DrawTarget> {
+        CanvasData {
+            draw_target,
+            paint_api,
+            image_key: None,
+        }
+    }
+
+    /// Hand this canvas's WebRender image to another backend (Loom: GPU/CPU switch on resize).
+    pub(crate) fn take_image_key(&mut self) -> Option<ImageKey> {
+        self.image_key.take()
+    }
+
+    pub(crate) fn paint_api(&self) -> CrossProcessPaintApi {
+        self.paint_api.clone()
+    }
+
+    pub(crate) fn size(&self) -> Size2D<u64> {
+        self.draw_target.get_size().cast()
+    }
+
+    /// Take over an image key that WebRender already knows, replacing its contents with this
+    /// canvas on the next `update_image_rendering`.
+    pub(crate) fn adopt_image_key(&mut self, image_key: ImageKey) {
+        if let Some(old_image_key) = self.image_key.replace(image_key) {
+            self.paint_api.delete_image(old_image_key);
+        }
+    }
+
     pub(crate) fn set_image_key(&mut self, image_key: ImageKey) {
         let (descriptor, data) = self.draw_target.image_descriptor_and_serializable_data();
         self.paint_api.add_image(image_key, descriptor, data, false);
@@ -129,10 +162,13 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
         text_bounds: Rect<f64>,
         text_runs: Vec<TextRun>,
         fill_or_stroke_style: FillOrStrokeStyle,
-        _shadow_options: ShadowOptions,
+        shadow_options: ShadowOptions,
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     ) {
+        // Loom: cast the shadow when the backend has shadow layers.
+        let shadowed =
+            shadow_options.need_to_draw_shadow() && self.draw_target.push_shadow(&shadow_options);
         self.maybe_bound_shape_with_pattern(
             fill_or_stroke_style,
             composition_options,
@@ -144,6 +180,9 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
                     .fill_text(text_runs, style, composition_options, transform);
             },
         );
+        if shadowed {
+            self.draw_target.pop_shadow();
+        }
     }
 
     pub(crate) fn stroke_text(
@@ -152,10 +191,13 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
         text_runs: Vec<TextRun>,
         fill_or_stroke_style: FillOrStrokeStyle,
         line_options: LineOptions,
-        _shadow_options: ShadowOptions,
+        shadow_options: ShadowOptions,
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     ) {
+        // Loom: cast the shadow when the backend has shadow layers.
+        let shadowed =
+            shadow_options.need_to_draw_shadow() && self.draw_target.push_shadow(&shadow_options);
         self.maybe_bound_shape_with_pattern(
             fill_or_stroke_style,
             composition_options,
@@ -171,6 +213,9 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
                 );
             },
         );
+        if shadowed {
+            self.draw_target.pop_shadow();
+        }
     }
 
     pub(crate) fn fill_rect(
@@ -267,10 +312,13 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
         path: &Path,
         fill_rule: FillRule,
         style: FillOrStrokeStyle,
-        _shadow_options: ShadowOptions,
+        shadow_options: ShadowOptions,
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     ) {
+        // Loom: cast the shadow when the backend has shadow layers.
+        let shadowed =
+            shadow_options.need_to_draw_shadow() && self.draw_target.push_shadow(&shadow_options);
         if style.is_zero_size_gradient() {
             return; // Paint nothing if gradient size is zero.
         }
@@ -285,7 +333,10 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
                     .draw_target
                     .fill(path, fill_rule, style, composition_options, transform)
             },
-        )
+        );
+        if shadowed {
+            self.draw_target.pop_shadow();
+        }
     }
 
     pub(crate) fn stroke_path(
@@ -293,10 +344,13 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
         path: &Path,
         style: FillOrStrokeStyle,
         line_options: LineOptions,
-        _shadow_options: ShadowOptions,
+        shadow_options: ShadowOptions,
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     ) {
+        // Loom: cast the shadow when the backend has shadow layers.
+        let shadowed =
+            shadow_options.need_to_draw_shadow() && self.draw_target.push_shadow(&shadow_options);
         if style.is_zero_size_gradient() {
             return; // Paint nothing if gradient size is zero.
         }
@@ -311,7 +365,10 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
                     .draw_target
                     .stroke(path, style, line_options, composition_options, transform);
             },
-        )
+        );
+        if shadowed {
+            self.draw_target.pop_shadow();
+        }
     }
 
     pub(crate) fn clip_path(
@@ -375,7 +432,7 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
     }
 
     fn draw_with_shadow<F>(
-        &self,
+        &mut self,
         rect: &Rect<f32>,
         shadow_options: ShadowOptions,
         composition_options: CompositionOptions,
@@ -384,6 +441,12 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
     ) where
         F: FnOnce(&mut DrawTarget, Transform2D<f64>),
     {
+        // Loom: backends with shadow layers draw the shape and its shadow in one go.
+        if self.draw_target.push_shadow(&shadow_options) {
+            draw_shadow_source(&mut self.draw_target, transform);
+            self.draw_target.pop_shadow();
+            return;
+        }
         let shadow_src_rect = transform.outer_transformed_rect(&rect.cast());
         // Because this comes from the rect on f32 precision, casting it down should be ok.
         let mut new_draw_target = self.create_draw_target_for_shadow(&shadow_src_rect.cast());

@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crossbeam_channel::Sender;
 use dpi::PhysicalSize;
@@ -210,10 +211,17 @@ pub(crate) struct Painter {
     /// safely hold one prepared scene at a time.
     prepared_frame_tag: Option<u64>,
 
+    /// The GPU canvas front buffers held for the prepared frame (Loom prototype).
+    gpu_canvas_latch: Option<Rc<crate::gpu_canvas_external_images::GpuCanvasLatch>>,
+
     /// Registered applied seal and exact distinct-loop completion join.
     applied_seal_join: Option<AppliedSealJoin>,
     /// A completed request delayed by the existing canvas-image gate.
     pending_applied_scene: Option<AppliedSeal>,
+    /// When each WebView last registered an applied seal. A WebView whose embedder is applying
+    /// seals gets its rendering opportunities from those seals (see
+    /// [`Self::seal_driven_webviews`]).
+    last_applied_seal: FxHashMap<WebViewId, Instant>,
 
     /// Completed non-zero scene tags not yet consumed by the embedder.
     ready_scene_frame_tags: RefCell<VecDeque<u64>>,
@@ -305,6 +313,22 @@ impl Painter {
             WebRenderImageHandlerType::WebGpu,
         );
 
+        let gpu_canvas_latch = paint_api::gpu_canvas_shared().map(|gpu_canvas| {
+            Rc::new(crate::gpu_canvas_external_images::GpuCanvasLatch::new(
+                gpu_canvas.swap_chains.clone(),
+                gpu_canvas.canvas_image_ids.clone(),
+            ))
+        });
+        if let Some(latch) = &gpu_canvas_latch {
+            external_image_handlers.set_handler(
+                Box::new(crate::gpu_canvas_external_images::GpuCanvasExternalImages::new(
+                    rendering_context.clone(),
+                    latch.clone(),
+                )),
+                WebRenderImageHandlerType::Canvas2d,
+            );
+        }
+
         WindowGLContext::initialize_image_handler(&mut external_image_handlers);
 
         if let Some(handler) = paint.embedder_external_image_handler.borrow_mut().take() {
@@ -386,6 +410,7 @@ impl Painter {
                 enable_subpixel_aa: pref!(gfx_subpixel_text_antialiasing_enabled),
                 allow_texture_swizzling: pref!(gfx_texture_swizzling_enabled),
                 enable_dithering: true,
+                enable_gpu_markers: pref!(gfx_gpu_markers_enabled),
                 clear_color,
                 cached_programs,
                 upload_method,
@@ -425,8 +450,10 @@ impl Painter {
             webrender_renderer: Some(webrender_renderer),
             shader_program_cache,
             prepared_frame_tag: None,
+            gpu_canvas_latch,
             applied_seal_join: None,
             pending_applied_scene: None,
+            last_applied_seal: Default::default(),
             ready_scene_frame_tags: RefCell::new(VecDeque::new()),
             ready_unchanged_frame_tags: RefCell::new(VecDeque::new()),
             scene_frame_notification_sender: paint.paint_proxy.sender.clone(),
@@ -576,8 +603,21 @@ impl Painter {
         // Process-monotonic frame IDs retire abandoned prior-session requests.
         // Late old completions cannot match the new full frame/sequence token.
         self.pending_applied_scene = None;
+        self.last_applied_seal
+            .insert(seal.webview_id, Instant::now());
         self.applied_seal_join = Some(AppliedSealJoin::new(seal));
         true
+    }
+
+    /// WebViews whose embedder applied a frame seal within [`paint_api::SEAL_DRIVEN_WINDOW`].
+    /// Each applied seal is that WebView's rendering opportunity for the embedder's frame, so
+    /// nothing else should tick it: an extra tick runs animations, `requestAnimationFrame`
+    /// callbacks, canvas drawing and layout a second time, and its canvas work can still be
+    /// rasterizing when the next seal arrives. Once seals stop, ordinary ticks resume.
+    pub(crate) fn seal_driven_webviews(&mut self) -> FxHashSet<WebViewId> {
+        self.last_applied_seal
+            .retain(|_, at| at.elapsed() < paint_api::SEAL_DRIVEN_WINDOW);
+        self.last_applied_seal.keys().copied().collect()
     }
 
     pub(crate) fn mark_scene_frame_ready(&self, frame_tag: u64) {
@@ -733,6 +773,13 @@ impl Painter {
             }
         );
 
+        // The canvases have presented this frame's content by now: the frame's scene waited for
+        // their image updates. Hold those buffers until the frame is drawn, so a canvas that
+        // presents again before then cannot change what this frame shows.
+        if let Some(latch) = &self.gpu_canvas_latch {
+            latch.latch();
+        }
+
         probe.checkpoint();
         self.prepared_frame_tag = Some(frame_tag);
         probe.finish(true);
@@ -781,6 +828,10 @@ impl Painter {
         // the scene no longer needs to be repainted.
         self.needs_repaint.set(RepaintReason::empty());
 
+        if let Some(latch) = &self.gpu_canvas_latch {
+            latch.release();
+        }
+
         self.screenshot_taker.maybe_take_screenshots(self);
         self.send_pending_paint_metrics_messages_after_composite();
         self.prepared_frame_tag = None;
@@ -791,6 +842,9 @@ impl Painter {
     pub(crate) fn discard_prepared_render(&mut self, frame_tag: u64) -> bool {
         if self.prepared_frame_tag != Some(frame_tag) {
             return false;
+        }
+        if let Some(latch) = &self.gpu_canvas_latch {
+            latch.release();
         }
         self.prepared_frame_tag = None;
         true
@@ -1638,7 +1692,10 @@ impl Painter {
             }
         }
 
-        if self.frame_delayer.needs_new_frame() {
+        // When an applied seal's scene was waiting for these images, `try_generate_applied_scene`
+        // below generates its tagged frame. Generating an untagged frame here as well would
+        // make WebRender build a frame nobody presents, ahead of the one the embedder waits for.
+        if self.frame_delayer.needs_new_frame() && self.pending_applied_scene.is_none() {
             self.frame_delayer.set_pending_frame(false);
             self.generate_frame(&mut txn, RenderReasons::SCENE);
             let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();

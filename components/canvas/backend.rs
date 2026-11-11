@@ -48,6 +48,14 @@ pub(crate) trait GenericDrawTarget {
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     );
+    /// Loom: start a canvas shadow (<https://html.spec.whatwg.org/multipage/#shadows>): until
+    /// `pop_shadow`, draws also cast `shadow`. Returns `false` when the backend cannot draw
+    /// shadows, in which case nothing was pushed.
+    fn push_shadow(&mut self, _shadow: &ShadowOptions) -> bool {
+        false
+    }
+    /// Loom: end the shadow started by a successful `push_shadow`.
+    fn pop_shadow(&mut self) {}
     fn draw_surface_with_shadow(
         &self,
         surface: Self::SourceSurface,

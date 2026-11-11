@@ -55,10 +55,10 @@ use http::header::REFRESH;
 use hyper_serde::Serde;
 use js::context::{JSContext, NoGC};
 use js::glue::GetWindowProxyClass;
-use js::jsapi::{GCReason, JSContext as UnsafeJSContext};
+use js::jsapi::{GCReason, JSContext as UnsafeJSContext, JSGCParamKey, NotifyAnimationActivity};
 use js::jsval::UndefinedValue;
 use js::rust::ParentRuntime;
-use js::rust::wrappers2::{JS_AddInterruptCallback, JS_GC, SetWindowProxyClass};
+use js::rust::wrappers2::{JS_AddInterruptCallback, JS_GC, JS_GetGCParameter, SetWindowProxyClass};
 use layout_api::{LayoutConfig, LayoutFactory, RestyleReason, ScriptThreadFactory};
 use media::WindowGLContext;
 use metrics::MAX_TASK_NS;
@@ -77,6 +77,7 @@ use profile_traits::time::ProfilerCategory;
 use profile_traits::time_profile;
 use rustc_hash::{FxHashMap, FxHashSet};
 use script_bindings::cell::DomRefCell;
+use script_bindings::reflector::DomObject;
 use script_traits::{
     ConstellationInputEvent, DiscardBrowsingContext, DocumentActivity, InitialScriptState,
     NewPipelineInfo, Painter, ScriptThreadMessage, UpdatePipelineIdReason, WebViewState,
@@ -165,6 +166,11 @@ use crate::runtime::script_runtime::{
 use crate::tasks::task_queue::TaskQueue;
 
 thread_local!(static SCRIPT_THREAD_ROOT: Cell<Option<*const ScriptThread>> = const { Cell::new(None) });
+
+/// A collection in the idle gap after a seal-tagged rendering update starts no sooner than
+/// this many times the previous one's pause after it, so that these collections take at
+/// most about 3% of the script thread's time.
+const IDLE_COLLECTION_INTERVAL_IN_PAUSES: u32 = 32;
 
 fn with_optional_script_thread<R>(f: impl FnOnce(Option<&ScriptThread>) -> R) -> R {
     SCRIPT_THREAD_ROOT.with(|root| {
@@ -411,6 +417,13 @@ pub struct ScriptThread {
     pending_rendering_update_callbacks: RefCell<Vec<GenericCallback<bool>>>,
     #[no_trace]
     pending_applied_seal_updates: RefCell<Vec<paint_api::AppliedSealOpportunity>>,
+    /// When this thread last received a seal-tagged rendering opportunity from the embedder.
+    last_applied_seal_opportunity: Cell<Option<Instant>>,
+    /// The JS heap size right after the last collection started from
+    /// [`Self::maybe_collect_garbage_after_applied_seal`].
+    js_heap_bytes_after_idle_collection: Cell<u32>,
+    /// When the last such collection finished and how long it paused this thread.
+    last_idle_collection: Cell<Option<(Instant, Duration)>>,
 
     /// Whether an animation tick or ScriptThread-triggered rendering update is pending. This might
     /// either be because the Servo renderer is managing animations and the [`ScriptThread`] has
@@ -990,6 +1003,9 @@ impl ScriptThread {
                     scheduled_update_the_rendering: Default::default(),
                     pending_rendering_update_callbacks: Default::default(),
                     pending_applied_seal_updates: Default::default(),
+                    last_applied_seal_opportunity: Default::default(),
+                    js_heap_bytes_after_idle_collection: Default::default(),
+                    last_idle_collection: Default::default(),
                     needs_rendering_update: Arc::new(AtomicBool::new(false)),
                     debugger_global: debugger_global.as_traced(),
                     debugger_paused: Cell::new(false),
@@ -1130,7 +1146,17 @@ impl ScriptThread {
                 continue;
             }
 
-            if document.waiting_on_canvas_image_updates() {
+            // An embedder's applied seal promises a scene of the DOM state it acknowledged, so
+            // its rendering opportunity always updates the document. Skipping it because an
+            // earlier update's canvas image is still rasterizing would build that scene from a
+            // display list laid out before the acknowledged state. The renderer keeps the frame
+            // delayed until the newest canvas epoch arrives.
+            let has_applied_seal = self
+                .pending_applied_seal_updates
+                .borrow()
+                .iter()
+                .any(|opportunity| opportunity.seal.webview_id == document.webview_id());
+            if document.waiting_on_canvas_image_updates() && !has_applied_seal {
                 continue;
             }
 
@@ -1210,6 +1236,11 @@ impl ScriptThread {
                 // > relevant global object as the timestamp.
                 document.run_the_animation_frame_callbacks(cx);
             }
+
+            // Canvases are normally drawn in the callbacks above. Start rasterizing them now so
+            // that work overlaps the layout the following steps need, instead of starting after
+            // it.
+            document.flush_dirty_canvases_before_layout();
 
             // Run the resize observer steps.
             let mut depth = Default::default();
@@ -1293,6 +1324,71 @@ impl ScriptThread {
         Some(painters_generating_frames)
     }
 
+    /// Tell the JS engine that every document of this thread is animating.
+    ///
+    /// A major collection discards a realm's JIT code unless the realm animated within the
+    /// last second, which Gecko reports from its refresh driver and Servo never did. A
+    /// seal-driven embedder runs the page's script once per frame, so the discarded code is
+    /// needed again at once: the frame after a collection ran its script about 2 ms slower
+    /// while the code was recompiled, and was presented late.
+    fn note_animation_activity(&self) {
+        for (_, document) in self.documents.borrow().iter() {
+            let global = document.window().reflector().get_jsobject();
+            unsafe { NotifyAnimationActivity(global.get()) };
+        }
+    }
+
+    /// Collect JS garbage while this thread is idle between two embedder frames.
+    ///
+    /// Collections are not incremental here, so the engine's own trigger, which waits for tens
+    /// of megabytes of garbage, pauses for as long as it takes to finalize all of it: about
+    /// 100 ms for the half a million DOM objects an animated canvas leaves behind. A
+    /// seal-driven embedder shows every frame, so that pause is a visibly dropped frame.
+    ///
+    /// The frame's display list and its completion have just been sent, and the next seal has
+    /// not arrived. Collecting here, as soon as a small amount of garbage has built up, keeps
+    /// each pause short and puts it where nothing is waiting for this thread.
+    fn maybe_collect_garbage_after_applied_seal(&self, cx: &mut JSContext) {
+        let threshold_kb = pref!(js_mem_gc_applied_seal_idle_threshold_kb);
+        if threshold_kb <= 0 {
+            return;
+        }
+        let heap_bytes = unsafe { JS_GetGCParameter(cx, JSGCParamKey::JSGC_BYTES) };
+        let after_last_collection = self.js_heap_bytes_after_idle_collection.get();
+        if heap_bytes < after_last_collection {
+            // The engine collected on its own in the meantime.
+            self.js_heap_bytes_after_idle_collection.set(heap_bytes);
+            return;
+        }
+        let threshold_bytes = u32::try_from(threshold_kb.saturating_mul(1024)).unwrap_or(u32::MAX);
+        if heap_bytes - after_last_collection < threshold_bytes {
+            return;
+        }
+        // A collection's pause grows with the live heap, which every collection has to mark,
+        // and the threshold is reached sooner the faster frames come. Without a limit a page
+        // with a large heap at several hundred frames per second spent over a tenth of its
+        // time collecting. Waiting lets more garbage build up, which costs less per kilobyte.
+        if let Some((finished, pause)) = self.last_idle_collection.get()
+            && finished.elapsed() < pause * IDLE_COLLECTION_INTERVAL_IN_PAUSES
+        {
+            return;
+        }
+        let started = Instant::now();
+        unsafe { JS_GC(cx, GCReason::API) };
+        let pause = started.elapsed();
+        self.last_idle_collection.set(Some((Instant::now(), pause)));
+        let heap_bytes_after = unsafe { JS_GetGCParameter(cx, JSGCParamKey::JSGC_BYTES) };
+        self.js_heap_bytes_after_idle_collection
+            .set(heap_bytes_after);
+        debug!(
+            target: "script::gc",
+            "Collected JS garbage after an applied seal: {} KB -> {} KB in {:?}",
+            heap_bytes / 1024,
+            heap_bytes_after / 1024,
+            pause
+        );
+    }
+
     /// Schedule a rendering update ("update the rendering"), if necessary. This
     /// can be necessary for a couple reasons. For instance, when the DOM
     /// changes a scheduled rendering update becomes necessary if one isn't
@@ -1320,6 +1416,18 @@ impl ScriptThread {
         // necessary, just exit early and schedule the next rendering update
         // when it becomes necessary.
         if !needs_rendering_update && !running_animations {
+            return;
+        }
+
+        // While the embedder is applying frame seals, each seal is the rendering opportunity
+        // for its frame. An update scheduled here would run between seals, where its result
+        // can never be shown on its own, and its canvas work could still be rasterizing when
+        // the next seal arrives.
+        if self
+            .last_applied_seal_opportunity
+            .get()
+            .is_some_and(|at| at.elapsed() < paint_api::SEAL_DRIVEN_WINDOW)
+        {
             return;
         }
 
@@ -1554,6 +1662,7 @@ impl ScriptThread {
             let _ = callback.send(built_any_display_lists);
         }
 
+        let mut completed_applied_seal = false;
         if let Some(changed_painters) = changed_painters {
             for opportunity in self.pending_applied_seal_updates.borrow_mut().drain(..) {
                 let changed = changed_painters.contains(&servo_base::id::PainterId::from(
@@ -1562,7 +1671,12 @@ impl ScriptThread {
                 // This same sender already sent this loop's DL/color updates above.
                 self.paint_api
                     .complete_applied_seal_rendering_update(opportunity, changed);
+                completed_applied_seal = true;
             }
+        }
+        if completed_applied_seal {
+            self.note_animation_activity();
+            self.maybe_collect_garbage_after_applied_seal(cx);
         }
 
         self.maybe_fulfill_font_ready_promises(cx);
@@ -1936,6 +2050,7 @@ impl ScriptThread {
             },
             ScriptThreadMessage::TickAllAnimations(_webviews, callback, opportunity) => {
                 if let Some(opportunity) = opportunity {
+                    self.last_applied_seal_opportunity.set(Some(Instant::now()));
                     self.pending_applied_seal_updates
                         .borrow_mut()
                         .push(opportunity);

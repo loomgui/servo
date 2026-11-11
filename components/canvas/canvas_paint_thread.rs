@@ -114,11 +114,21 @@ impl CanvasPaintThread {
 
     fn collect_memory_reports(&self, sender: ReportsChan) {
         perform_memory_report(|ops| {
-            let reports = self
+            let mut reports: Vec<Report> = self
                 .canvases
                 .iter()
                 .flat_map(|(canvas_id, canvas)| canvas.collect_memory_report(*canvas_id, ops))
                 .collect();
+            // Loom: GPU resources shared by all GPU canvases (image atlas, cached uploads).
+            reports.extend(
+                crate::vello_gpu_backend::shared_memory_report()
+                    .into_iter()
+                    .map(|(name, size)| Report {
+                        path: profile_traits::path!["canvas", "gpu-shared", name],
+                        kind: profile_traits::mem::ReportKind::ExplicitNonHeapSize,
+                        size,
+                    }),
+            );
             sender.send(ProcessReports::new(reports));
         });
     }
@@ -338,6 +348,8 @@ enum Canvas {
     #[cfg(feature = "vello")]
     Vello(CanvasData<crate::vello_backend::VelloDrawTarget>),
     VelloCPU(CanvasData<crate::vello_cpu_backend::VelloCPUDrawTarget>),
+    /// GPU-rasterized canvas (Loom prototype), selected with `dom_canvas_backend = "gpu"`.
+    VelloGpu(CanvasData<crate::vello_gpu_backend::VelloGpuDrawTarget>),
 }
 
 impl Canvas {
@@ -348,8 +360,78 @@ impl Canvas {
         {
             #[cfg(feature = "vello")]
             "vello" => Some(Self::Vello(CanvasData::new(size, paint_api))),
+            "gpu" if Self::wants_gpu(size) => Some(
+                Self::try_gpu(size, paint_api.clone())
+                    .unwrap_or_else(|| Self::VelloCPU(CanvasData::new(size, paint_api))),
+            ),
             _ => Some(Self::VelloCPU(CanvasData::new(size, paint_api))),
         }
+    }
+
+    /// Loom: under the `gpu` backend, whether a canvas of `size` belongs on the GPU.
+    fn wants_gpu(size: Size2D<u64>) -> bool {
+        let min_pixels = servo_config::pref!(dom_canvas_gpu_min_pixels).max(0) as u64;
+        size.area() >= min_pixels && crate::vello_gpu_backend::available()
+    }
+
+    /// Loom: a GPU canvas of `size`, or `None` when its GPU resources cannot be created.
+    fn try_gpu(size: Size2D<u64>, paint_api: CrossProcessPaintApi) -> Option<Self> {
+        let target = crate::vello_gpu_backend::VelloGpuDrawTarget::try_new(
+            size.max(Size2D::new(1, 1)).cast(),
+        )?;
+        Some(Self::VelloGpu(CanvasData::with_draw_target(
+            target, paint_api,
+        )))
+    }
+
+    /// Loom: recreate (resize or reset) under the `gpu` backend. GPU canvases are rebuilt here,
+    /// so a failed GPU allocation falls back to the CPU backend instead of panicking, and canvases
+    /// move between backends when their size crosses `dom_canvas_gpu_min_pixels`. Returns whether
+    /// the canvas was recreated.
+    fn recreate_with_backend_choice(&mut self, size: Option<Size2D<u64>>) -> bool {
+        if servo_config::pref!(dom_canvas_backend).to_lowercase() != "gpu" {
+            return false;
+        }
+        let (current_size, is_gpu) = match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(_) => return false,
+            Canvas::VelloCPU(canvas_data) => (canvas_data.size(), false),
+            Canvas::VelloGpu(canvas_data) => (canvas_data.size(), true),
+        };
+        let size = size.unwrap_or(current_size);
+        let wants_gpu = Self::wants_gpu(size);
+        if !wants_gpu && !is_gpu {
+            return false;
+        }
+        let (image_key, paint_api) = match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(_) => unreachable!(),
+            Canvas::VelloCPU(canvas_data) => {
+                (canvas_data.take_image_key(), canvas_data.paint_api())
+            },
+            Canvas::VelloGpu(canvas_data) => {
+                (canvas_data.take_image_key(), canvas_data.paint_api())
+            },
+        };
+        *self = wants_gpu
+            .then(|| Self::try_gpu(size, paint_api.clone()))
+            .flatten()
+            .unwrap_or_else(|| Canvas::VelloCPU(CanvasData::new(size, paint_api)));
+        if let Some(image_key) = image_key {
+            match self {
+                #[cfg(feature = "vello")]
+                Canvas::Vello(_) => unreachable!(),
+                Canvas::VelloCPU(canvas_data) => {
+                    canvas_data.adopt_image_key(image_key);
+                    canvas_data.update_image_rendering(None);
+                },
+                Canvas::VelloGpu(canvas_data) => {
+                    canvas_data.adopt_image_key(image_key);
+                    canvas_data.update_image_rendering(None);
+                },
+            }
+        }
+        true
     }
 
     fn collect_memory_report(
@@ -361,6 +443,7 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.collect_memory_report(canvas_id, ops),
             Canvas::VelloCPU(canvas_data) => canvas_data.collect_memory_report(canvas_id, ops),
+            Canvas::VelloGpu(canvas_data) => canvas_data.collect_memory_report(canvas_id, ops),
         }
     }
 
@@ -369,6 +452,7 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.set_image_key(image_key),
             Canvas::VelloCPU(canvas_data) => canvas_data.set_image_key(image_key),
+            Canvas::VelloGpu(canvas_data) => canvas_data.set_image_key(image_key),
         }
     }
 
@@ -377,6 +461,7 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.pop_clips(clips),
             Canvas::VelloCPU(canvas_data) => canvas_data.pop_clips(clips),
+            Canvas::VelloGpu(canvas_data) => canvas_data.pop_clips(clips),
         }
     }
 
@@ -402,6 +487,15 @@ impl Canvas {
                 transform,
             ),
             Canvas::VelloCPU(canvas_data) => canvas_data.stroke_text(
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+            Canvas::VelloGpu(canvas_data) => canvas_data.stroke_text(
                 text_bounds,
                 text_runs,
                 fill_or_stroke_style,
@@ -440,6 +534,14 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            Canvas::VelloGpu(canvas_data) => canvas_data.fill_text(
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
         }
     }
 
@@ -457,6 +559,9 @@ impl Canvas {
                 canvas_data.fill_rect(rect, style, shadow_options, composition_options, transform)
             },
             Canvas::VelloCPU(canvas_data) => {
+                canvas_data.fill_rect(rect, style, shadow_options, composition_options, transform)
+            },
+            Canvas::VelloGpu(canvas_data) => {
                 canvas_data.fill_rect(rect, style, shadow_options, composition_options, transform)
             },
         }
@@ -482,6 +587,14 @@ impl Canvas {
                 transform,
             ),
             Canvas::VelloCPU(canvas_data) => canvas_data.stroke_rect(
+                rect,
+                style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+            Canvas::VelloGpu(canvas_data) => canvas_data.stroke_rect(
                 rect,
                 style,
                 line_options,
@@ -519,6 +632,14 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            Canvas::VelloGpu(canvas_data) => canvas_data.fill_path(
+                path,
+                fill_rule,
+                style,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
         }
     }
 
@@ -549,6 +670,14 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            Canvas::VelloGpu(canvas_data) => canvas_data.stroke_path(
+                path,
+                style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
         }
     }
 
@@ -557,6 +686,7 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.clear_rect(rect, transform),
             Canvas::VelloCPU(canvas_data) => canvas_data.clear_rect(rect, transform),
+            Canvas::VelloGpu(canvas_data) => canvas_data.clear_rect(rect, transform),
         }
     }
 
@@ -591,6 +721,15 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+            Canvas::VelloGpu(canvas_data) => canvas_data.draw_image(
+                snapshot,
+                dest_rect,
+                source_rect,
+                smoothing_enabled,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
         }
     }
 
@@ -599,6 +738,7 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.read_pixels(read_rect),
             Canvas::VelloCPU(canvas_data) => canvas_data.read_pixels(read_rect),
+            Canvas::VelloGpu(canvas_data) => canvas_data.read_pixels(read_rect),
         }
     }
 
@@ -607,6 +747,7 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.clip_path(path, fill_rule, transform),
             Canvas::VelloCPU(canvas_data) => canvas_data.clip_path(path, fill_rule, transform),
+            Canvas::VelloGpu(canvas_data) => canvas_data.clip_path(path, fill_rule, transform),
         }
     }
 
@@ -615,6 +756,7 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.put_image_data(snapshot, rect),
             Canvas::VelloCPU(canvas_data) => canvas_data.put_image_data(snapshot, rect),
+            Canvas::VelloGpu(canvas_data) => canvas_data.put_image_data(snapshot, rect),
         }
     }
 
@@ -623,14 +765,19 @@ impl Canvas {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.update_image_rendering(canvas_epoch),
             Canvas::VelloCPU(canvas_data) => canvas_data.update_image_rendering(canvas_epoch),
+            Canvas::VelloGpu(canvas_data) => canvas_data.update_image_rendering(canvas_epoch),
         }
     }
 
     fn recreate(&mut self, size: Option<Size2D<u64>>) {
+        if self.recreate_with_backend_choice(size) {
+            return;
+        }
         match self {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.recreate(size),
             Canvas::VelloCPU(canvas_data) => canvas_data.recreate(size),
+            Canvas::VelloGpu(canvas_data) => canvas_data.recreate(size),
         }
     }
 }

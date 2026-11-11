@@ -2708,6 +2708,11 @@ pub(super) fn parse_color(
     string: &DOMString,
 ) -> Result<AbsoluteColor, ()> {
     let string = string.str();
+    // Animated canvases set a fresh `rgba(r, g, b, a)` string for nearly every fill and
+    // gradient stop. That form never depends on the element, so it skips the CSS parser.
+    if let Some(color) = servo_canvas_traits::color::parse_legacy_rgb_color(&string) {
+        return Ok(color);
+    }
     let mut parser = Parser::new(&string);
     let context = parser_context_for_anonymous_content(
         CssRuleType::Style,

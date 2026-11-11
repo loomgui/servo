@@ -82,6 +82,11 @@ impl PaintProxy {
     }
 }
 
+/// How long after an applied seal a WebView counts as seal-driven: its embedder is supplying
+/// rendering opportunities, so Servo does not generate its own for it. Long enough to bridge
+/// slow embedder frames, short enough that a stalled embedder does not freeze the page.
+pub const SEAL_DRIVEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Correlation of one already-applied embedder seal; this is not readiness.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AppliedSeal {
@@ -176,6 +181,10 @@ pub enum PaintMessage {
     GenerateFrame(Vec<PainterId>),
     /// A per-loop barrier after every DL/color message from this rendering opportunity.
     AppliedSealRenderingComplete(AppliedSealOpportunity, bool),
+    /// Register an applied seal before its rendering opportunity is requested. Sent on this
+    /// FIFO ahead of the seal-tagged tick, so it is handled before the opportunity completes,
+    /// without the embedder thread having to be free (see `servo::FrameDriver`).
+    RegisterAppliedSeal(AppliedSeal),
     /// Create a new image key. The result will be returned via the
     /// provided channel sender.
     GenerateImageKey(WebViewId, GenericSender<ImageKey>),
@@ -624,6 +633,37 @@ impl PainterSurfmanDetailsMap {
         let mut map = self.0.lock().expect("poisoned");
         map.remove(&painter_id);
     }
+
+    /// Any registered painter's details. Embedders with a single WebView (Loom) have exactly one.
+    pub fn any(&self) -> Option<PainterSurfmanDetails> {
+        let map = self.0.lock().expect("poisoned");
+        map.values().next().cloned()
+    }
+}
+
+/// State shared between the paint thread and the canvas thread for GPU-rasterized 2D canvases
+/// (Loom prototype). The canvas thread renders into surfman surfaces published through
+/// `swap_chains`; the paint thread's external-image handler samples their front buffers.
+#[derive(Clone)]
+pub struct GpuCanvasShared {
+    pub surfman_details: PainterSurfmanDetailsMap,
+    pub swap_chains: surfman::chains::SwapChains<webrender_api::ExternalImageId, surfman::Device>,
+    pub external_image_id_manager: WebRenderExternalImageIdManager,
+    /// The external image ids of the live GPU canvases. The paint thread latches each one's
+    /// front buffer when it prepares a frame.
+    pub canvas_image_ids: Arc<Mutex<Vec<webrender_api::ExternalImageId>>>,
+}
+
+static GPU_CANVAS_SHARED: std::sync::OnceLock<GpuCanvasShared> = std::sync::OnceLock::new();
+
+/// Publish the GPU canvas state. Only the first call has an effect.
+pub fn set_gpu_canvas_shared(shared: GpuCanvasShared) {
+    let _ = GPU_CANVAS_SHARED.set(shared);
+}
+
+/// The GPU canvas state, if the paint thread has published it (single-process embedders only).
+pub fn gpu_canvas_shared() -> Option<&'static GpuCanvasShared> {
+    GPU_CANVAS_SHARED.get()
 }
 
 /// This trait is used as a bridge between the different GL clients
@@ -675,6 +715,8 @@ pub enum WebRenderImageHandlerType {
     Media,
     WebGpu,
     Embedder,
+    /// GPU-rasterized 2D canvases (Loom prototype).
+    Canvas2d,
 }
 
 /// List of WebRender external images to be shared among all external image
@@ -719,6 +761,8 @@ pub struct WebRenderExternalImageHandlers {
     webgpu_handler: Option<Box<dyn WebRenderExternalImageApi>>,
     /// Optional handler installed by an embedder for GPU-native image URLs.
     embedder_handler: Option<Box<dyn WebRenderExternalImageApi>>,
+    /// GPU-rasterized 2D canvas handler.
+    canvas2d_handler: Option<Box<dyn WebRenderExternalImageApi>>,
     /// A [`WebRenderExternalImageIdManager`] responsible for creating new [`ExternalImageId`]s.
     /// This is shared with the WebGL, WebGPU, and hardware-accelerated media threads and
     /// all other instances of [`WebRenderExternalImageHandlers`] -- one per WebRender instance.
@@ -732,6 +776,7 @@ impl WebRenderExternalImageHandlers {
             media_handler: Default::default(),
             webgpu_handler: Default::default(),
             embedder_handler: Default::default(),
+            canvas2d_handler: Default::default(),
             id_manager,
         }
     }
@@ -750,6 +795,32 @@ impl WebRenderExternalImageHandlers {
             WebRenderImageHandlerType::Media => self.media_handler = Some(handler),
             WebRenderImageHandlerType::WebGpu => self.webgpu_handler = Some(handler),
             WebRenderImageHandlerType::Embedder => self.embedder_handler = Some(handler),
+            WebRenderImageHandlerType::Canvas2d => self.canvas2d_handler = Some(handler),
+        }
+    }
+}
+
+impl WebRenderExternalImageHandlers {
+    /// The handler that serves `key`, or `None` when no handler knows the id any more.
+    ///
+    /// An id leaves the id manager as soon as its source is destroyed, while WebRender may
+    /// still draw a frame that was built earlier and refers to it. Handlers that keep such an
+    /// image alive for the frame claim it through `owns_unregistered_id`.
+    fn handler_type_for(&self, key: ExternalImageId) -> Option<WebRenderImageHandlerType> {
+        if let Some(handler_type) = self.id_manager().get(&key) {
+            return Some(handler_type);
+        }
+        let owns = |handler: &Option<Box<dyn WebRenderExternalImageApi>>| {
+            handler
+                .as_ref()
+                .is_some_and(|handler| handler.owns_unregistered_id(key.0))
+        };
+        if owns(&self.embedder_handler) {
+            Some(WebRenderImageHandlerType::Embedder)
+        } else if owns(&self.canvas2d_handler) {
+            Some(WebRenderImageHandlerType::Canvas2d)
+        } else {
+            None
         }
     }
 }
@@ -765,17 +836,16 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
         _channel_index: u8,
         _is_composited: bool,
     ) -> ExternalImage<'_> {
-        let handler_type = self.id_manager().get(&key).unwrap_or_else(|| {
-            if self
-                .embedder_handler
-                .as_ref()
-                .is_some_and(|handler| handler.owns_unregistered_id(key.0))
-            {
-                WebRenderImageHandlerType::Embedder
-            } else {
-                panic!("Tried to get unknown external image")
-            }
-        });
+        let Some(handler_type) = self.handler_type_for(key) else {
+            // The image's source was destroyed after the frame being drawn was built, for
+            // example a canvas that was resized or removed. Draw the frame without it: a
+            // panic here would end the embedder's rendering for good.
+            warn!("Skipping external image {key:?}: its source no longer exists");
+            return ExternalImage {
+                uv: TexelRect::invalid(),
+                source: ExternalImageSource::Invalid,
+            };
+        };
         match handler_type {
             WebRenderImageHandlerType::WebGl => {
                 let (source, size) = self.webgl_handler.as_mut().unwrap().lock(key.0);
@@ -813,23 +883,23 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
                     source,
                 }
             },
+            WebRenderImageHandlerType::Canvas2d => {
+                let (source, size) = self.canvas2d_handler.as_mut().unwrap().lock(key.0);
+                ExternalImage {
+                    uv: TexelRect::new(0.0, size.height as f32, size.width as f32, 0.0),
+                    source,
+                }
+            },
         }
     }
 
     /// Unlock the external image. The WR should not read the image
     /// content after this call.
     fn unlock(&mut self, key: ExternalImageId, _channel_index: u8) {
-        let handler_type = self.id_manager().get(&key).unwrap_or_else(|| {
-            if self
-                .embedder_handler
-                .as_ref()
-                .is_some_and(|handler| handler.owns_unregistered_id(key.0))
-            {
-                WebRenderImageHandlerType::Embedder
-            } else {
-                panic!("Tried to get unknown external image")
-            }
-        });
+        // An id no handler knows was skipped by `lock`; there is nothing to release.
+        let Some(handler_type) = self.handler_type_for(key) else {
+            return;
+        };
         match handler_type {
             WebRenderImageHandlerType::WebGl => self.webgl_handler.as_mut().unwrap().unlock(key.0),
             WebRenderImageHandlerType::Media => self.media_handler.as_mut().unwrap().unlock(key.0),
@@ -838,6 +908,9 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
             },
             WebRenderImageHandlerType::Embedder => {
                 self.embedder_handler.as_mut().unwrap().unlock(key.0)
+            },
+            WebRenderImageHandlerType::Canvas2d => {
+                self.canvas2d_handler.as_mut().unwrap().unlock(key.0)
             },
         };
     }

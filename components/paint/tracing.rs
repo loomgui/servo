@@ -44,6 +44,7 @@ mod from_constellation {
                 Self::UpdateBackgroundColors { .. } => target!("UpdateBackgroundColors"),
                 Self::GenerateFrame { .. } => target!("GenerateFrame"),
                 Self::AppliedSealRenderingComplete(..) => target!("AppliedSealRenderingComplete"),
+                Self::RegisterAppliedSeal(..) => target!("RegisterAppliedSeal"),
                 Self::GenerateImageKey(..) => target!("GenerateImageKey"),
                 Self::UpdateImages(..) => target!("UpdateImages"),
                 Self::GenerateFontKeys(..) => target!("GenerateFontKeys"),
