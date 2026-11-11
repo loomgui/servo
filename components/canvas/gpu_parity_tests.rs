@@ -1211,6 +1211,56 @@ fn shadow(offset_x: f64, offset_y: f64, blur: f64, r: u8, g: u8, b: u8, a: f32) 
     }
 }
 
+// A canvas this large rasterizes on worker threads in the CPU backend until it casts its first
+// shadow. What it drew before, and a clip that is open at that moment, must carry over.
+parity!(shadow_on_a_large_canvas, 640, 560, |t| {
+    t.fill_rect(
+        &rect(0.0, 0.0, 640.0, 560.0),
+        color(236, 238, 240, 1.0),
+        normal(),
+        identity(),
+    );
+    t.fill(
+        &circle(120.0, 110.0, 70.0),
+        FillRule::Nonzero,
+        color(30, 110, 200, 0.8),
+        normal(),
+        identity(),
+    );
+    t.push_clip(&circle(380.0, 300.0, 210.0), FillRule::Nonzero, identity());
+    t.fill_rect(
+        &rect(200.0, 120.0, 360.0, 60.0),
+        color(250, 190, 30, 1.0),
+        normal(),
+        identity(),
+    );
+    assert!(t.push_shadow(&shadow(14.0, 18.0, 16.0, 10, 20, 60, 0.7)));
+    t.fill_rect(
+        &rect(260.0, 220.0, 220.0, 140.0),
+        color(220, 60, 50, 1.0),
+        normal(),
+        identity(),
+    );
+    t.pop_shadow();
+    t.fill(
+        &circle(520.0, 420.0, 90.0),
+        FillRule::Nonzero,
+        color(40, 170, 110, 1.0),
+        normal(),
+        identity(),
+    );
+    t.pop_clip();
+    assert!(t.push_shadow(&shadow(-6.0, 6.0, 4.0, 0, 0, 0, 0.5)));
+    t.fill(
+        &circle(90.0, 460.0, 50.0),
+        FillRule::Nonzero,
+        color(120, 60, 200, 1.0),
+        normal(),
+        identity(),
+    );
+    t.pop_shadow();
+});
+
 parity!(shadow_blurred_rect, 160, 120, |t| {
     assert!(t.push_shadow(&shadow(8.0, 10.0, 12.0, 0, 0, 0, 0.6)));
     t.fill_rect(

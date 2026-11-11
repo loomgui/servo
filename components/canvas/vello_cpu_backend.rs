@@ -53,7 +53,8 @@ pub(crate) struct VelloCPUDrawTarget {
     resources: vello_cpu::Resources,
     pixmap: vello_cpu::Pixmap,
     clips: Vec<(Path, kurbo::Affine)>,
-    /// `ctx` rasterizes on worker threads, which large canvases do.
+    /// `ctx` rasterizes on worker threads. Large canvases start out that way and stop when
+    /// they first cast a shadow; see [`Self::become_single_threaded`].
     multi_threaded: bool,
     state: State,
 }
@@ -111,6 +112,34 @@ impl VelloCPUDrawTarget {
                 self.state = State::Drawing;
             },
         }
+    }
+
+    /// Move this canvas to `vello_cpu`'s single-threaded renderer, keeping its content.
+    ///
+    /// Shadows are filter layers, which only that renderer has: the multi-threaded one panics
+    /// on them. A canvas that casts a shadow therefore gives up multi-threaded rasterization
+    /// for the rest of its life. That is slower for a large canvas, and correct.
+    fn become_single_threaded(&mut self) {
+        if !self.multi_threaded {
+            return;
+        }
+        // Rasterize what was recorded so far; the new context starts from that image.
+        let _ = self.pixmap();
+        let size = self.size();
+        self.ctx = vello_cpu::RenderContext::new_with(
+            size.width as u16,
+            size.height as u16,
+            RenderSettings {
+                num_threads: 0,
+                ..Default::default()
+            },
+        );
+        // `pixmap` left the clips pushed on the old context.
+        for (path, affine) in &self.clips {
+            self.ctx.set_transform(*affine);
+            self.ctx.push_clip_layer(&path.0);
+        }
+        self.multi_threaded = false;
     }
 
     fn pixmap(&mut self) -> &[u8] {
@@ -296,13 +325,7 @@ impl GenericDrawTarget for VelloCPUDrawTarget {
     }
 
     fn push_shadow(&mut self, shadow: &ShadowOptions) -> bool {
-        // `vello_cpu` has filter layers only in its single-threaded renderer; the
-        // multi-threaded one panics on them, which would take the canvas thread and with it
-        // the page down. Canvases of 512x512 and up render multi-threaded, so they draw
-        // their shapes without shadows.
-        if self.multi_threaded {
-            return false;
-        }
+        self.become_single_threaded();
         self.ensure_drawing();
         self.ctx.set_transform(kurbo::Affine::IDENTITY);
         self.ctx.push_filter_layer(shadow_filter(shadow));

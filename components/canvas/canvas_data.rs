@@ -448,9 +448,9 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
             self.draw_target.pop_shadow();
             return;
         }
-        // Loom: a backend that cannot cast this shadow still draws the shape. The path that
-        // was here rendered the shape into a second target for `draw_surface_with_shadow`,
-        // which no backend implements, so a shadowed image drew nothing at all.
+        // Loom: a backend that cannot cast shadows still draws the shape. The path that was
+        // here rendered the shape into a second target for `draw_surface_with_shadow`, which
+        // no backend implements, so a shadowed image drew nothing at all.
         let _ = (rect, composition_options);
         draw_shadow_source(&mut self.draw_target, transform);
     }
