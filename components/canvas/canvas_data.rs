@@ -535,6 +535,61 @@ impl<D: GenericDrawTarget> Drop for CanvasData<D> {
     }
 }
 
+impl CanvasData<crate::vello_gpu_backend::VelloGpuDrawTarget> {
+    /// The canvas's current content, for another GPU canvas to draw without a readback.
+    pub(crate) fn gpu_frame(&mut self) -> std::rc::Rc<crate::vello_gpu_backend::GpuFrame> {
+        self.draw_target.frame()
+    }
+
+    /// `drawImage` with a GPU canvas as the source: [`Self::draw_image`] for a source that
+    /// is a frame on the GPU instead of pixels.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn draw_gpu_frame(
+        &mut self,
+        frame: std::rc::Rc<crate::vello_gpu_backend::GpuFrame>,
+        dest_rect: Rect<f64>,
+        source_rect: Rect<f64>,
+        smoothing_enabled: bool,
+        shadow_options: ShadowOptions,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        // The pixels `draw_image` is given for a canvas source: `read_pixels` of this rect.
+        let source = source_rect.to_u32();
+        let filter = if smoothing_enabled {
+            Filter::Bilinear
+        } else {
+            Filter::Nearest
+        };
+        let writer = |draw_target: &mut crate::vello_gpu_backend::VelloGpuDrawTarget,
+                      transform| {
+            draw_target.draw_frame(
+                &frame,
+                source,
+                dest_rect,
+                filter,
+                composition_options,
+                transform,
+            );
+        };
+        if shadow_options.need_to_draw_shadow() {
+            let rect = Rect::new(
+                Point2D::new(dest_rect.origin.x as f32, dest_rect.origin.y as f32),
+                Size2D::new(dest_rect.size.width as f32, dest_rect.size.height as f32),
+            );
+            self.draw_with_shadow(
+                &rect,
+                shadow_options,
+                composition_options,
+                transform,
+                writer,
+            );
+        } else {
+            writer(&mut self.draw_target, transform);
+        }
+    }
+}
+
 /// It writes an image to the destination target
 /// draw_target: the destination target where the image_data will be copied
 /// image_data: Pixel information of the image to be written. It takes RGBA8

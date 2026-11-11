@@ -1567,6 +1567,228 @@ fn gpu_memory_report() {
     });
 }
 
+// ---- canvas to canvas ----------------------------------------------------------------------
+
+/// `drawImage(canvas, ...)` between two canvases of one backend. CPU canvases hand over the
+/// source's pixels; GPU canvases sample the source's frame on the GPU.
+trait DrawCanvas: GenericDrawTarget + Sized {
+    fn draw_canvas(
+        &mut self,
+        source: &mut Self,
+        source_rect: Rect<u32>,
+        dest: Rect<f64>,
+        filter: Filter,
+        composition: CompositionOptions,
+        transform: Transform2D<f64>,
+    );
+}
+
+impl DrawCanvas for VelloCPUDrawTarget {
+    fn draw_canvas(
+        &mut self,
+        source: &mut Self,
+        source_rect: Rect<u32>,
+        dest: Rect<f64>,
+        filter: Filter,
+        composition: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        let pixels = source.snapshot().get_rect(source_rect);
+        draw_image(self, pixels, dest, filter, composition, transform);
+    }
+}
+
+impl DrawCanvas for VelloGpuDrawTarget {
+    fn draw_canvas(
+        &mut self,
+        source: &mut Self,
+        source_rect: Rect<u32>,
+        dest: Rect<f64>,
+        filter: Filter,
+        composition: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        let frame = source.frame();
+        self.draw_frame(&frame, source_rect, dest, filter, composition, transform);
+    }
+}
+
+fn urect(x: u32, y: u32, w: u32, h: u32) -> Rect<u32> {
+    Rect::new(Point2D::new(x, y), Size2D::new(w, h))
+}
+
+/// A source canvas with opaque, translucent and empty regions, and no symmetry that would
+/// hide a flipped or shifted copy.
+fn canvas_source<T: GenericDrawTarget>(t: &mut T) {
+    t.fill_rect(
+        &rect(0.0, 0.0, 96.0, 20.0),
+        color(30, 60, 200, 1.0),
+        normal(),
+        identity(),
+    );
+    t.fill_rect(
+        &rect(8.0, 26.0, 40.0, 30.0),
+        color(220, 40, 40, 0.6),
+        normal(),
+        identity(),
+    );
+    t.fill(
+        &circle(70.0, 40.0, 18.0),
+        FillRule::Nonzero,
+        FillOrStrokeStyle::LinearGradient(LinearGradientStyle::new(
+            52.0,
+            22.0,
+            88.0,
+            58.0,
+            vec![stop(0.0, 255, 230, 60, 1.0), stop(1.0, 20, 160, 90, 1.0)],
+        )),
+        normal(),
+        identity(),
+    );
+    t.fill_rect(
+        &rect(2.0, 2.0, 6.0, 6.0),
+        color(255, 255, 255, 1.0),
+        normal(),
+        identity(),
+    );
+}
+
+fn canvas_to_canvas_scene<T: DrawCanvas>(t: &mut T) {
+    let mut source = T::new(Size2D::new(96, 64));
+    canvas_source(&mut source);
+
+    t.fill_rect(
+        &rect(0.0, 0.0, 320.0, 240.0),
+        color(40, 44, 52, 1.0),
+        normal(),
+        identity(),
+    );
+    // The whole canvas, unscaled.
+    t.draw_canvas(
+        &mut source,
+        urect(0, 0, 96, 64),
+        frect(8.0, 8.0, 96.0, 64.0),
+        Filter::Nearest,
+        normal(),
+        identity(),
+    );
+    // Part of it, scaled up with smoothing, at half alpha.
+    let mut faded = normal();
+    faded.alpha = 0.5;
+    t.draw_canvas(
+        &mut source,
+        urect(40, 16, 48, 40),
+        frect(120.0, 8.0, 144.0, 120.0),
+        Filter::Bilinear,
+        faded,
+        identity(),
+    );
+    // Scaled down, rotated, added to what is there.
+    t.draw_canvas(
+        &mut source,
+        urect(0, 0, 96, 64),
+        frect(0.0, 0.0, 60.0, 40.0),
+        Filter::Bilinear,
+        with_op(CompositionOrBlending::Composition(
+            CompositionStyle::Lighter,
+        )),
+        Transform2D::rotation(euclid::Angle::degrees(20.0)).then_translate((30.0, 110.0).into()),
+    );
+    // Inside a clip.
+    t.push_clip(&circle(230.0, 180.0, 40.0), FillRule::Nonzero, identity());
+    t.draw_canvas(
+        &mut source,
+        urect(0, 0, 96, 64),
+        frect(170.0, 140.0, 120.0, 80.0),
+        Filter::Bilinear,
+        normal(),
+        identity(),
+    );
+    t.pop_clip();
+
+    // A draw shows the source as it was when it was drawn. Change the source and draw it
+    // again next to the first copy, then drop it before this canvas is rasterized.
+    t.draw_canvas(
+        &mut source,
+        urect(40, 20, 48, 32),
+        frect(8.0, 170.0, 48.0, 32.0),
+        Filter::Bilinear,
+        normal(),
+        identity(),
+    );
+    source.fill_rect(
+        &rect(0.0, 0.0, 96.0, 64.0),
+        color(250, 20, 220, 1.0),
+        normal(),
+        identity(),
+    );
+    t.draw_canvas(
+        &mut source,
+        urect(40, 20, 48, 32),
+        frect(64.0, 170.0, 48.0, 32.0),
+        Filter::Bilinear,
+        normal(),
+        identity(),
+    );
+    drop(source);
+}
+
+#[test]
+fn canvas_to_canvas() {
+    run_parity(
+        "canvas_to_canvas",
+        Size2D::new(320, 240),
+        canvas_to_canvas_scene::<VelloCPUDrawTarget>,
+        canvas_to_canvas_scene::<VelloGpuDrawTarget>,
+    );
+}
+
+/// A canvas keeps drawing while another canvas still has to draw its previous frame: the
+/// frame must stay intact, and every texture involved must be released afterwards.
+#[test]
+fn canvas_frames_survive_their_source() {
+    if gpu_canvas_unsupported_platform() {
+        eprintln!("canvas_frames_survive_their_source: skipped; needs OpenGL ES");
+        return;
+    }
+    let pixels = on_gpu_thread(|| {
+        let mut dest = VelloGpuDrawTarget::new(Size2D::new(64, 64));
+        dest.clear_rect(&rect(0.0, 0.0, 64.0, 64.0), identity());
+        // Sixteen frames of one source, each a different color, drawn side by side.
+        let mut source = VelloGpuDrawTarget::new(Size2D::new(64, 64));
+        for step in 0..16_u32 {
+            source.fill_rect(
+                &rect(0.0, 0.0, 64.0, 64.0),
+                color((step * 16) as u8, 255 - (step * 16) as u8, 90, 1.0),
+                normal(),
+                identity(),
+            );
+            let frame = source.frame();
+            dest.draw_frame(
+                &frame,
+                urect(0, 0, 64, 64),
+                frect(f64::from(step * 4), 0.0, 4.0, 64.0),
+                Filter::Nearest,
+                normal(),
+                identity(),
+            );
+        }
+        drop(source);
+        dest.snapshot().as_raw_bytes().to_vec()
+    });
+    for step in 0..16_usize {
+        let pixel = &pixels[(32 * 64 + step * 4 + 2) * 4..][..4];
+        let expected = [(step * 16) as u8, 255 - (step * 16) as u8, 90, 255];
+        assert!(
+            pixel
+                .iter()
+                .zip(&expected)
+                .all(|(seen, wanted)| seen.abs_diff(*wanted) <= CHANNEL_TOLERANCE),
+            "column {step}: {pixel:?}, expected {expected:?}"
+        );
+    }
+}
+
 // ---- realistic workloads -------------------------------------------------------------------
 
 // The hands-on main menu's ember particles: a radial-gradient glow plus a solid core per

@@ -15,6 +15,11 @@
 //! updates: every rendered frame is copied on the GPU into the retained texture, which is drawn
 //! back as the background when later draws are not preceded by a full-canvas clear.
 //!
+//! The retained texture is also how one GPU canvas is drawn into another (`drawImage` with a
+//! canvas source): the destination's scene samples the source's frame directly, so no pixels
+//! are read back or uploaded. A frame that another canvas still has to draw is never
+//! overwritten; the source keeps its next frame in a new texture instead.
+//!
 //! Images (`drawImage`, `putImageData`, patterns) are uploaded into `vello_hybrid`'s image atlas
 //! once per distinct content: uploads are cached per thread by a content hash, pinned while a
 //! pending scene samples them, and evicted when idle or over budget.
@@ -63,6 +68,8 @@ use crate::vello_cpu_backend::{paint, shadow_filter, snapshot_as_pixmap};
 
 /// Texture binding id used to draw retained content back into a scene.
 const RETAINED_TEXTURE: TextureId = TextureId(1);
+/// Texture binding ids from here on are the other canvases' frames a scene draws.
+const FIRST_SOURCE_TEXTURE: u64 = 2;
 /// Largest image side the renderer's atlas pages hold (`AtlasConfig::default().atlas_size`).
 const MAX_ATLAS_IMAGE_SIDE: u16 = 4096;
 /// Atlas bytes cached uploads may hold before unpinned ones are evicted, oldest first.
@@ -452,12 +459,64 @@ enum State {
     Rendered,
 }
 
+/// A canvas frame kept as a GL texture, with bottom-up rows.
+///
+/// The canvas that rendered it holds it as its retained content. Other canvases of the thread
+/// hold it while a scene of theirs that draws it is pending.
+pub(crate) struct GpuFrame {
+    thread: Rc<GpuThread>,
+    texture: glow::NativeTexture,
+    size: Size2D<u32>,
+}
+
+impl GpuFrame {
+    /// An uninitialized frame texture of `size`. The thread's context must be current.
+    fn new(thread: &Rc<GpuThread>, size: Size2D<u32>) -> Result<Self, String> {
+        let glow = thread.gl.glow();
+        let texture = unsafe {
+            let texture = glow.create_texture()?;
+            glow.bind_texture(glow::TEXTURE_2D, Some(texture));
+            glow.tex_storage_2d(
+                glow::TEXTURE_2D,
+                1,
+                glow::RGBA8,
+                size.width as i32,
+                size.height as i32,
+            );
+            glow.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            glow.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
+            glow.bind_texture(glow::TEXTURE_2D, None);
+            texture
+        };
+        Ok(Self {
+            thread: thread.clone(),
+            texture,
+            size,
+        })
+    }
+}
+
+impl Drop for GpuFrame {
+    fn drop(&mut self) {
+        self.thread.make_current();
+        unsafe { self.thread.gl.glow().delete_texture(self.texture) };
+    }
+}
+
 /// Per-canvas GL resources: a swap chain on the thread's context and the retained frame.
 struct Gpu {
     thread: Rc<GpuThread>,
     image_id: ExternalImageId,
     /// Copy of the last rendered frame, drawn back when content must be retained.
-    retained: glow::NativeTexture,
+    retained: Rc<GpuFrame>,
 }
 
 impl Gpu {
@@ -489,29 +548,12 @@ impl Gpu {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .push(image_id);
-        let glow = thread.gl.glow();
-        let retained = unsafe {
-            let texture = glow.create_texture()?;
-            glow.bind_texture(glow::TEXTURE_2D, Some(texture));
-            glow.tex_storage_2d(
-                glow::TEXTURE_2D,
-                1,
-                glow::RGBA8,
-                size.width as i32,
-                size.height as i32,
-            );
-            glow.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MIN_FILTER,
-                glow::NEAREST as i32,
-            );
-            glow.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MAG_FILTER,
-                glow::NEAREST as i32,
-            );
-            glow.bind_texture(glow::TEXTURE_2D, None);
-            texture
+        let retained = match GpuFrame::new(&thread, size) {
+            Ok(frame) => Rc::new(frame),
+            Err(error) => {
+                Self::release(&thread, image_id);
+                return Err(error);
+            },
         };
         Ok(Self {
             thread,
@@ -520,10 +562,39 @@ impl Gpu {
         })
     }
 
+    /// Give back the swap chain and image id of a canvas.
+    fn release(thread: &Rc<GpuThread>, image_id: ExternalImageId) {
+        thread
+            .shared
+            .canvas_image_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|id| *id != image_id);
+        let _ = thread.shared.swap_chains.destroy(
+            image_id,
+            &thread.device,
+            &mut thread.context.borrow_mut(),
+        );
+        thread
+            .shared
+            .external_image_id_manager
+            .clone()
+            .remove(&image_id);
+    }
+
     /// Rasterize `scene` into this canvas's back buffer, keep a GPU copy of the result, and
-    /// publish the buffer to WebRender.
-    fn render(&mut self, scene: &Scene, size: Size2D<u32>, clear: bool, draw_retained: bool) {
-        let thread = &self.thread;
+    /// publish the buffer to WebRender. `sources` are the other canvases' frames the scene
+    /// draws, in the order of their texture ids.
+    fn render(
+        &mut self,
+        scene: &Scene,
+        size: Size2D<u32>,
+        clear: bool,
+        draw_retained: bool,
+        sources: &[Rc<GpuFrame>],
+    ) {
+        let thread = self.thread.clone();
+        let thread = &thread;
         thread.make_current();
         let Some(swap_chain) = thread.shared.swap_chains.get(self.image_id) else {
             return;
@@ -544,7 +615,13 @@ impl Gpu {
                 .set_drawing_buffer_size(size.width as i32, size.height as i32);
             let mut bindings = WebGlTextureBindings::new();
             if draw_retained {
-                bindings.insert(RETAINED_TEXTURE, self.retained);
+                bindings.insert(RETAINED_TEXTURE, self.retained.texture);
+            }
+            for (index, source) in sources.iter().enumerate() {
+                bindings.insert(
+                    TextureId(FIRST_SOURCE_TEXTURE + index as u64),
+                    source.texture,
+                );
             }
             let render_size = RenderSize {
                 width: size.width,
@@ -561,6 +638,14 @@ impl Gpu {
             ) {
                 warn!("GPU canvas: render failed: {error:?}");
             }
+            // Another canvas may still have to draw the frame this one replaces. Leave that
+            // texture to it and retain the new frame in a fresh one.
+            if Rc::strong_count(&self.retained) > 1 {
+                match GpuFrame::new(thread, size) {
+                    Ok(frame) => self.retained = Rc::new(frame),
+                    Err(error) => warn!("GPU canvas: could not allocate a frame: {error}"),
+                }
+            }
             let glow = thread.gl.glow();
             unsafe {
                 // Retain this frame on the GPU before the buffer moves to WebRender.
@@ -572,7 +657,7 @@ impl Gpu {
                     Some(texture),
                     0,
                 );
-                glow.bind_texture(glow::TEXTURE_2D, Some(self.retained));
+                glow.bind_texture(glow::TEXTURE_2D, Some(self.retained.texture));
                 glow.copy_tex_sub_image_2d(
                     glow::TEXTURE_2D,
                     0,
@@ -629,7 +714,7 @@ impl Gpu {
                 glow::READ_FRAMEBUFFER,
                 glow::COLOR_ATTACHMENT0,
                 glow::TEXTURE_2D,
-                Some(self.retained),
+                Some(self.retained.texture),
                 0,
             );
             glow.read_pixels(
@@ -659,25 +744,8 @@ impl Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
-        let thread = &self.thread;
-        thread.make_current();
-        unsafe { thread.gl.glow().delete_texture(self.retained) };
-        thread
-            .shared
-            .canvas_image_ids
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .retain(|id| *id != self.image_id);
-        let _ = thread.shared.swap_chains.destroy(
-            self.image_id,
-            &thread.device,
-            &mut thread.context.borrow_mut(),
-        );
-        thread
-            .shared
-            .external_image_id_manager
-            .clone()
-            .remove(&self.image_id);
+        self.thread.make_current();
+        Self::release(&self.thread, self.image_id);
     }
 }
 
@@ -693,6 +761,9 @@ pub(crate) struct VelloGpuDrawTarget {
     draws_retained: bool,
     /// Cached uploads the pending scene samples; unpinned after the next rasterization.
     pinned_uploads: Vec<UploadKey>,
+    /// Other canvases' frames the pending scene draws; released after the next rasterization.
+    /// The frame at index `i` is bound as texture `FIRST_SOURCE_TEXTURE + i`.
+    source_frames: Vec<Rc<GpuFrame>>,
     /// Open shadow (filter) layers: draws inside them do not target the canvas directly.
     shadow_depth: u32,
 }
@@ -772,9 +843,16 @@ impl VelloGpuDrawTarget {
         let size = self.size;
         let (clear, draw_retained) = (self.clear_next, self.draws_retained);
         self.ignore_clips(|self_| {
-            self_.gpu.render(&self_.scene, size, clear, draw_retained);
+            self_.gpu.render(
+                &self_.scene,
+                size,
+                clear,
+                draw_retained,
+                &self_.source_frames,
+            );
             self_.scene.reset();
         });
+        self.source_frames.clear();
         self.unpin_uploads();
         self.gpu.thread.end_rasterization();
         self.state = State::Rendered;
@@ -818,6 +896,7 @@ impl VelloGpuDrawTarget {
             clear_next: true,
             draws_retained: false,
             pinned_uploads: Vec::new(),
+            source_frames: Vec::new(),
             shadow_depth: 0,
         };
         // Publish a transparent first frame so WebRender always has a surface to sample.
@@ -858,6 +937,84 @@ impl VelloGpuDrawTarget {
             },
             other => Some(other),
         }
+    }
+
+    /// This canvas's current content as a frame another canvas of the thread can draw with
+    /// [`Self::draw_frame`]. Rasterizes pending commands; copies nothing.
+    pub(crate) fn frame(&mut self) -> Rc<GpuFrame> {
+        self.flush();
+        self.gpu.retained.clone()
+    }
+
+    /// Draw the `source` region of another canvas's `frame`, in canvas pixels from its top
+    /// left, into `dest`. The frame is sampled on the GPU: nothing is read back or uploaded.
+    /// What is drawn is the frame as it was when [`Self::frame`] returned it, whatever its
+    /// canvas draws afterwards.
+    pub(crate) fn draw_frame(
+        &mut self,
+        frame: &Rc<GpuFrame>,
+        source: Rect<u32>,
+        dest: Rect<f64>,
+        filter: Filter,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        let Some(source) = source.intersection(&Rect::from_size(frame.size)) else {
+            return;
+        };
+        if source.is_empty() {
+            return;
+        }
+        self.ensure_drawing();
+        let index = match self
+            .source_frames
+            .iter()
+            .position(|held| Rc::ptr_eq(held, frame))
+        {
+            Some(index) => index,
+            None => {
+                self.source_frames.push(frame.clone());
+                self.source_frames.len() - 1
+            },
+        };
+        let texture = TextureId(FIRST_SOURCE_TEXTURE + index as u64);
+        let (width, height) = (f64::from(source.size.width), f64::from(source.size.height));
+        let scale_up = dest.size.width > width || dest.size.height > height;
+        // Global alpha as a multiply tint, quantized to 8 bits like `draw_surface`.
+        let alpha = (composition_options.alpha * 255.0) as u8;
+        let tint = (alpha != u8::MAX).then(|| vello_hybrid::Tint {
+            color: peniko::Color::new([1.0, 1.0, 1.0, f32::from(alpha) / 255.0]),
+            mode: vello_hybrid::TintMode::Multiply,
+        });
+        // Frame rows are bottom-up: take the region from the bottom and flip it into place.
+        let bottom = frame.size.height - source.max_y();
+        let source_region = vello_hybrid::RectU16::new(
+            source.min_x() as u16,
+            bottom as u16,
+            source.max_x() as u16,
+            (bottom + source.size.height) as u16,
+        );
+        let placement = kurbo::Affine::translate((dest.origin.x, dest.origin.y))
+            .pre_scale_non_uniform(dest.size.width / width, dest.size.height / height) *
+            kurbo::Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, height]);
+        self.with_composition(composition_options.composition_operation, move |self_| {
+            self_.scene.set_tint(tint);
+            self_.scene.set_transform(transform.cast().into());
+            self_.scene.draw_texture_rects(
+                texture,
+                // Bilinear only when scaling up, as for image sources.
+                if scale_up {
+                    filter.convert()
+                } else {
+                    peniko::ImageQuality::Low
+                },
+                [SampleRect {
+                    source_region,
+                    transform: placement,
+                }],
+            );
+            self_.scene.reset_tint();
+        })
     }
 
     /// Block until the GPU has executed every submitted command (benchmarks).
@@ -920,6 +1077,7 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
     fn clear_rect(&mut self, rect: &Rect<f32>, transform: Transform2D<f64>) {
         if self.is_viewport_cleared(rect, transform) {
             self.scene.reset();
+            self.source_frames.clear();
             self.unpin_uploads();
             self.clips.clear();
             self.state = State::Drawing;

@@ -304,18 +304,37 @@ impl CanvasPaintThread {
                 composition_options,
                 transform,
             ) => {
-                let snapshot = self
-                    .canvas(canvas_id)
-                    .read_pixels(Some(source_rect.to_u32()));
-                self.canvas(other_canvas_id).draw_image(
-                    snapshot,
-                    dest_rect,
-                    source_rect,
-                    smoothing,
-                    shadow_options,
-                    composition_options,
-                    transform,
-                );
+                // Between two GPU canvases the destination samples the source's frame on the
+                // GPU. Any other pair goes through the source's pixels.
+                let frame = if self.canvas(other_canvas_id).is_gpu() {
+                    self.canvas(canvas_id).gpu_frame()
+                } else {
+                    None
+                };
+                if let Some(frame) = frame {
+                    self.canvas(other_canvas_id).draw_gpu_frame(
+                        frame,
+                        dest_rect,
+                        source_rect,
+                        smoothing,
+                        shadow_options,
+                        composition_options,
+                        transform,
+                    );
+                } else {
+                    let snapshot = self
+                        .canvas(canvas_id)
+                        .read_pixels(Some(source_rect.to_u32()));
+                    self.canvas(other_canvas_id).draw_image(
+                        snapshot,
+                        dest_rect,
+                        source_rect,
+                        smoothing,
+                        shadow_options,
+                        composition_options,
+                        transform,
+                    );
+                }
             },
             CanvasCommand::GetImageData(dest_rect, sender) => {
                 let snapshot = self.canvas(canvas_id).read_pixels(dest_rect);
@@ -737,6 +756,43 @@ impl Canvas {
                 composition_options,
                 transform,
             ),
+        }
+    }
+
+    fn is_gpu(&self) -> bool {
+        matches!(self, Canvas::VelloGpu(_))
+    }
+
+    /// This canvas's current content as a GPU frame, if it is a GPU canvas.
+    fn gpu_frame(&mut self) -> Option<std::rc::Rc<crate::vello_gpu_backend::GpuFrame>> {
+        match self {
+            Canvas::VelloGpu(canvas_data) => Some(canvas_data.gpu_frame()),
+            _ => None,
+        }
+    }
+
+    /// Draw another GPU canvas's frame. Only called on GPU canvases.
+    #[expect(clippy::too_many_arguments)]
+    fn draw_gpu_frame(
+        &mut self,
+        frame: std::rc::Rc<crate::vello_gpu_backend::GpuFrame>,
+        dest_rect: Rect<f64>,
+        source_rect: Rect<f64>,
+        smoothing_enabled: bool,
+        shadow_options: ShadowOptions,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        if let Canvas::VelloGpu(canvas_data) = self {
+            canvas_data.draw_gpu_frame(
+                frame,
+                dest_rect,
+                source_rect,
+                smoothing_enabled,
+                shadow_options,
+                composition_options,
+                transform,
+            );
         }
     }
 

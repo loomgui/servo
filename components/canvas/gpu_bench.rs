@@ -282,6 +282,97 @@ fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
+/// One frame of a page that composes an offscreen canvas into a visible one: redraw the
+/// 1920×1080 source, then draw all of it into the 1920×1080 destination and present that.
+fn layer_frame<T: GenericDrawTarget>(
+    source: &mut T,
+    dest: &mut T,
+    frame: u32,
+    draw_source: impl FnOnce(&mut T, &mut T),
+) {
+    source.clear_rect(&rect(0.0, 0.0, 1920.0, 1080.0), identity());
+    for i in 0..40_u32 {
+        let x = ((i * 131 + frame * 7) % 1800) as f32;
+        let y = ((i * 71 + frame * 3) % 1000) as f32;
+        source.fill_rect(
+            &rect(x, y, 120.0, 80.0),
+            color((i * 6) as u8, 200, (255 - i * 5) as u8, 0.8),
+            normal(),
+            identity(),
+        );
+    }
+    dest.clear_rect(&rect(0.0, 0.0, 1920.0, 1080.0), identity());
+    draw_source(dest, source);
+    let _ = dest.image_descriptor_and_serializable_data();
+}
+
+/// What drawing one full-screen canvas into another costs per frame on the canvas thread.
+#[test]
+#[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+fn gpu_bench_canvas_to_canvas() {
+    let size = Size2D::new(1920, 1080);
+    let whole = urect(0, 0, 1920, 1080);
+    let place = frect(0.0, 0.0, 1920.0, 1080.0);
+    let frames = frames();
+
+    let mut source = VelloCPUDrawTarget::new(size);
+    let mut dest = VelloCPUDrawTarget::new(size);
+    let mut run = |frame| {
+        layer_frame(&mut source, &mut dest, frame, |dest, source| {
+            dest.draw_canvas(source, whole, place, Filter::Nearest, normal(), identity());
+        })
+    };
+    (0..WARMUP_FRAMES).for_each(&mut run);
+    let start = Instant::now();
+    (WARMUP_FRAMES..WARMUP_FRAMES + frames).for_each(&mut run);
+    let cpu = start.elapsed() / frames;
+
+    let gpu = on_gpu_thread(move || {
+        let mut timings = Vec::new();
+        for through_pixels in [true, false] {
+            let mut source = VelloGpuDrawTarget::new(size);
+            let mut dest = VelloGpuDrawTarget::new(size);
+            let mut run = |frame| {
+                layer_frame(&mut source, &mut dest, frame, |dest, source| {
+                    if through_pixels {
+                        // What a canvas source cost before: read back, hash and upload.
+                        let pixels = source.snapshot();
+                        draw_image(dest, pixels, place, Filter::Nearest, normal(), identity());
+                    } else {
+                        dest.draw_canvas(
+                            source,
+                            whole,
+                            place,
+                            Filter::Nearest,
+                            normal(),
+                            identity(),
+                        );
+                    }
+                });
+                dest.finish_gpu();
+            };
+            (0..WARMUP_FRAMES).for_each(&mut run);
+            let start = Instant::now();
+            (WARMUP_FRAMES..WARMUP_FRAMES + frames).for_each(&mut run);
+            timings.extend_from_slice(&(start.elapsed() / frames).as_nanos().to_le_bytes());
+        }
+        timings
+    });
+    let nanos = |index: usize| {
+        let bytes: [u8; 16] = gpu[index * 16..][..16].try_into().unwrap();
+        Duration::from_nanos(u128::from_le_bytes(bytes) as u64)
+    };
+    println!(
+        "\n1920x1080 canvas drawn into a 1920x1080 canvas, per frame, GPU times include glFinish\n\
+         cpu backend                      {:>7.2} ms\n\
+         gpu backend, through pixels      {:>7.2} ms\n\
+         gpu backend, through the frame   {:>7.2} ms\n",
+        ms(cpu),
+        ms(nanos(0)),
+        ms(nanos(1)),
+    );
+}
+
 /// One canvas of `side`×`side` showing a HUD panel scaled to fill it: finds the size where the
 /// GPU backend's fixed per-update cost stops dominating.
 #[test]
