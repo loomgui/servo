@@ -32,7 +32,7 @@ use servo_canvas_traits::canvas::{
     TextRun,
 };
 use style::color::AbsoluteColor;
-use surfman::chains::SwapChainsAPI;
+use surfman::chains::{SwapChainAPI, SwapChainsAPI};
 
 use crate::backend::GenericDrawTarget;
 use crate::canvas_data::Filter;
@@ -193,8 +193,9 @@ fn run_parity(
 
     // A scene that drew nothing would match trivially; `clear` legitimately wipes the canvas.
     assert!(
-        name == "composite_clear" ||
-            cpu.as_raw_bytes()
+        name == "composite_clear"
+            || cpu
+                .as_raw_bytes()
                 .chunks_exact(4)
                 .any(|pixel| pixel[3] != 0),
         "{name}: the CPU reference is blank"
@@ -1355,6 +1356,184 @@ fn gpu_lifetime_stress() {
         }
         vec![1]
     });
+}
+
+/// Reads a published canvas surface the way WebRender does: on its own surfman device, on
+/// another thread. Returns the surface and the color of its center pixel.
+#[allow(unsafe_code, reason = "GL calls on the reader thread's own context")]
+fn read_center_on_another_device(surface: surfman::Surface) -> (surfman::Surface, [u8; 4]) {
+    use glow::HasContext;
+    type Reply = std::sync::mpsc::Sender<(surfman::Surface, [u8; 4])>;
+    static READER: std::sync::OnceLock<
+        std::sync::Mutex<std::sync::mpsc::Sender<(surfman::Surface, Reply)>>,
+    > = std::sync::OnceLock::new();
+    let reader = READER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<(surfman::Surface, Reply)>();
+        let details = gpu_shared().surfman_details.any().expect("surfman details");
+        std::thread::Builder::new()
+            .name("gpu-parity-reader".into())
+            .spawn(move || {
+                let device = details
+                    .connection
+                    .create_device(&details.adapter)
+                    .expect("reader device");
+                let descriptor = device
+                    .create_context_descriptor(&surfman::ContextAttributes {
+                        version: surfman::GLVersion::new(3, 0),
+                        flags: surfman::ContextAttributeFlags::ALPHA,
+                    })
+                    .expect("reader context descriptor");
+                let mut context = device
+                    .create_context(&descriptor, None)
+                    .expect("reader context");
+                let own_surface = device
+                    .create_surface(
+                        &context,
+                        surfman::SurfaceAccess::GPUOnly,
+                        surfman::SurfaceType::Generic {
+                            size: Size2D::new(1, 1),
+                        },
+                    )
+                    .expect("reader surface");
+                device
+                    .bind_surface_to_context(&mut context, own_surface)
+                    .map_err(|(error, _)| error)
+                    .expect("bind reader surface");
+                device.make_context_current(&context).expect("make current");
+                let gl = unsafe {
+                    glow::Context::from_loader_function(|symbol| {
+                        device.get_proc_address(&context, symbol)
+                    })
+                };
+                let framebuffer = unsafe { gl.create_framebuffer() }.expect("framebuffer");
+                for (surface, reply) in receiver {
+                    let size = device.surface_info(&surface).size;
+                    let surface_texture = device
+                        .create_surface_texture(&mut context, surface)
+                        .map_err(|(error, _)| error)
+                        .expect("surface texture");
+                    let mut pixel = [0_u8; 4];
+                    unsafe {
+                        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer));
+                        gl.framebuffer_texture_2d(
+                            glow::READ_FRAMEBUFFER,
+                            glow::COLOR_ATTACHMENT0,
+                            device.surface_gl_texture_target(),
+                            device.surface_texture_object(&surface_texture),
+                            0,
+                        );
+                        gl.read_pixels(
+                            size.width / 2,
+                            size.height / 2,
+                            1,
+                            1,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelPackData::Slice(Some(&mut pixel)),
+                        );
+                        gl.framebuffer_texture_2d(
+                            glow::READ_FRAMEBUFFER,
+                            glow::COLOR_ATTACHMENT0,
+                            device.surface_gl_texture_target(),
+                            None,
+                            0,
+                        );
+                    }
+                    let surface = device
+                        .destroy_surface_texture(&mut context, surface_texture)
+                        .map_err(|(error, _)| error)
+                        .expect("destroy surface texture");
+                    let _ = reply.send((surface, pixel));
+                }
+            })
+            .expect("spawn reader thread");
+        std::sync::Mutex::new(sender)
+    });
+    let (reply, result) = std::sync::mpsc::channel();
+    reader
+        .lock()
+        .unwrap()
+        .send((surface, reply))
+        .expect("reader alive");
+    result.recv().expect("reader finished")
+}
+
+/// A canvas frame must be complete the moment it is published: the painter samples the front
+/// buffer on its own device without waiting for this one.
+///
+/// Surfaces are shared between the two Direct3D devices by share handle, without a keyed mutex
+/// under stock ANGLE, and GL sync objects cannot cross EGL displays. The contract for such a
+/// shared texture is that the producing device flushes before another device uses it, which
+/// the backend does before it swaps. Each frame here ends with an opaque full-canvas fill on
+/// top of several hundred blended gradients, so a reader that ran ahead of the rasterization
+/// would see the previous frame or the gradients instead of that fill.
+#[test]
+fn published_frame_is_complete_on_another_device() {
+    if gpu_canvas_unsupported_platform() {
+        eprintln!("published_frame_is_complete_on_another_device: skipped; needs OpenGL ES");
+        return;
+    }
+    let stale = on_gpu_thread(|| {
+        let shared = gpu_shared();
+        let size = Size2D::new(2048_u32, 2048_u32);
+        let mut target = VelloGpuDrawTarget::new(size);
+        let id = target.external_image_id();
+        let lighter = with_op(CompositionOrBlending::Composition(
+            CompositionStyle::Lighter,
+        ));
+        // `on_gpu_thread` treats an empty result as a panic.
+        let mut stale = vec![0xff];
+        for frame in 0..120_u32 {
+            target.clear_rect(&rect(0.0, 0.0, 2048.0, 2048.0), identity());
+            for i in 0..400_u32 {
+                let (x, y) = (
+                    f64::from((i * 97 + frame * 13) % 2048),
+                    f64::from((i * 211 + frame * 29) % 2048),
+                );
+                let glow = FillOrStrokeStyle::RadialGradient(RadialGradientStyle::new(
+                    x,
+                    y,
+                    0.0,
+                    x,
+                    y,
+                    220.0,
+                    vec![stop(0.0, 255, 220, 150, 0.6), stop(1.0, 150, 50, 20, 0.0)],
+                ));
+                target.fill(
+                    &circle(x, y, 220.0),
+                    FillRule::Nonzero,
+                    glow,
+                    lighter,
+                    identity(),
+                );
+            }
+            let expected = [(frame * 2 + 10) as u8, 255 - (frame * 2) as u8, 77, 255];
+            target.fill_rect(
+                &rect(0.0, 0.0, 2048.0, 2048.0),
+                color(expected[0], expected[1], expected[2], 1.0),
+                normal(),
+                identity(),
+            );
+            let _ = target.image_descriptor_and_serializable_data();
+            let swap_chain = shared.swap_chains.get(id).expect("swap chain");
+            let surface = swap_chain.take_surface().expect("published front buffer");
+            let (surface, pixel) = read_center_on_another_device(surface);
+            swap_chain.recycle_surface(surface);
+            let off = pixel
+                .iter()
+                .zip(&expected)
+                .any(|(seen, wanted)| seen.abs_diff(*wanted) > CHANNEL_TOLERANCE);
+            if off {
+                stale.push(frame as u8);
+            }
+        }
+        stale
+    });
+    assert_eq!(
+        stale,
+        vec![0xff],
+        "frames that were incomplete when read on the other device"
+    );
 }
 
 /// GPU memory shared by a thread's canvases shows up in memory reports once images are cached.

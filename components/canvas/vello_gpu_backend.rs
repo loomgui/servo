@@ -592,6 +592,12 @@ impl Gpu {
                     0,
                 );
                 glow.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+                // This is the synchronization with WebRender, not a hint. The painter samples
+                // the buffer on its own device. Surfaces are shared between devices by share
+                // handle (Direct3D) or IOSurface (macOS), where the producer has to flush
+                // before another device reads; GL sync objects cannot cross devices. Without
+                // this flush the other device reads every frame incomplete, which
+                // `published_frame_is_complete_on_another_device` checks.
                 glow.flush();
             }
         }
