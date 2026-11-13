@@ -561,6 +561,18 @@ impl GenericDrawTarget for VelloCPUDrawTarget {
         )
     }
 
+    fn snapshot_rect(&mut self, rect: Rect<u32>) -> pixels::Snapshot {
+        let size = self.size();
+        Snapshot::from_vec(
+            rect.size,
+            SnapshotPixelFormat::RGBA,
+            SnapshotAlphaMode::Transparent {
+                premultiplied: true,
+            },
+            pixels::rgba8_get_rect(self.pixmap(), size, rect).into_owned(),
+        )
+    }
+
     fn surface(&mut self) -> Self::SourceSurface {
         self.pixmap(); // sync pixmap
         Arc::new(vello_cpu::Pixmap::from_parts(

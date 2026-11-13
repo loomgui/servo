@@ -437,6 +437,83 @@ fn gpu_bench_canvas_to_canvas() {
     );
 }
 
+/// One frame of a page that reads its canvas back: a cheap scene, the presentation, and
+/// `getImageData` of `read`.
+fn readback_frame<T: GenericDrawTarget>(target: &mut T, frame: u32, read: Rect<u32>) -> usize {
+    target.fill_rect(
+        &rect(0.0, 0.0, 1920.0, 1080.0),
+        color(16, 24, 32, 1.0),
+        normal(),
+        identity(),
+    );
+    for i in 0..40_u32 {
+        let x = ((i * 131 + frame * 7) % 1800) as f32;
+        let y = ((i * 71 + frame * 3) % 1000) as f32;
+        target.fill_rect(
+            &rect(x, y, 90.0, 60.0),
+            color((i * 6) as u8, 200, (255 - i * 5) as u8, 1.0),
+            normal(),
+            identity(),
+        );
+    }
+    let _ = target.image_descriptor_and_serializable_data();
+    if read.is_empty() {
+        return 0;
+    }
+    target.snapshot_rect(read).as_raw_bytes().len()
+}
+
+/// What `getImageData` costs per frame on the canvas thread: a 1920×1080 canvas read back
+/// as a 64×64 region and whole, against the same frame without a read.
+#[test]
+#[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+fn gpu_bench_readback() {
+    let size = Size2D::new(1920, 1080);
+    let reads = [
+        urect(0, 0, 0, 0),
+        urect(928, 508, 64, 64),
+        urect(0, 0, 1920, 1080),
+    ];
+    let frames = frames();
+    fn measure<T: GenericDrawTarget>(target: &mut T, read: Rect<u32>, frames: u32) -> Duration {
+        for frame in 0..WARMUP_FRAMES {
+            readback_frame(target, frame, read);
+        }
+        let start = Instant::now();
+        for frame in WARMUP_FRAMES..WARMUP_FRAMES + frames {
+            readback_frame(target, frame, read);
+        }
+        start.elapsed() / frames
+    }
+    let cpu: Vec<Duration> = reads
+        .iter()
+        .map(|read| measure(&mut VelloCPUDrawTarget::new(size), *read, frames))
+        .collect();
+    let gpu = on_gpu_thread(move || {
+        let mut timings = Vec::new();
+        for read in reads {
+            let elapsed = measure(&mut VelloGpuDrawTarget::new(size), read, frames);
+            timings.extend_from_slice(&elapsed.as_nanos().to_le_bytes());
+        }
+        timings
+    });
+    let nanos = |index: usize| {
+        let bytes: [u8; 16] = gpu[index * 16..][..16].try_into().unwrap();
+        Duration::from_nanos(u128::from_le_bytes(bytes) as u64)
+    };
+    let mut report = String::from("\n1920x1080 canvas, per frame      cpu ms    gpu ms\n");
+    let names = ["no read", "read 64x64", "read 1920x1080"];
+    for (index, name) in names.iter().enumerate() {
+        report += &format!(
+            "{:<28} {:>9.2} {:>9.2}\n",
+            name,
+            ms(cpu[index]),
+            ms(nanos(index))
+        );
+    }
+    eprintln!("{report}");
+}
+
 /// One canvas of `side`×`side` showing a HUD panel scaled to fill it: finds the size where the
 /// GPU backend's fixed per-update cost stops dominating.
 #[test]

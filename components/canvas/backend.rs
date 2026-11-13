@@ -123,6 +123,11 @@ pub(crate) trait GenericDrawTarget {
         &mut self,
     ) -> (ImageDescriptor, SerializableImageData);
     fn snapshot(&mut self) -> Snapshot;
+    /// The pixels of `rect`, which lies within the target. `getImageData` of a small region
+    /// should not cost a copy of the whole canvas.
+    fn snapshot_rect(&mut self, rect: Rect<u32>) -> Snapshot {
+        self.snapshot().get_rect(rect)
+    }
 }
 
 /// A version of the `Into<T>` trait from the standard library that can be used
