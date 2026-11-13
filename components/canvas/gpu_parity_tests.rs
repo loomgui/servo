@@ -12,7 +12,8 @@
 //! `<name>-cpu.png`, `<name>-gpu.png` and `<name>-diff.png` to `target/gpu-parity/`; set
 //! `GPU_PARITY_SAVE=1` to write the CPU and GPU images of every scene.
 //!
-//! The GPU half needs a real GPU. On Windows run with ANGLE, as Loom ships it:
+//! The GPU half needs a real GPU. On macOS it runs on CGL with no extra features. On Windows run
+//! with ANGLE, as Loom ships it:
 //! `cargo test -p servo-canvas --features surfman/sm-angle-default gpu_parity`
 //! with `libEGL.dll` / `libGLESv2.dll` on `PATH`.
 
@@ -141,12 +142,14 @@ pub(crate) fn compare_pixels(cpu: &[u8], gpu: &[u8]) -> Comparison {
     }
 }
 
-/// The GPU canvas backend runs only on OpenGL ES (ANGLE on Windows). On desktop GL, such as CGL
-/// on macOS, it must report itself unavailable so canvases use the CPU backend.
+/// The GPU canvas backend runs on OpenGL ES 3.0 (ANGLE on Windows) and on a desktop OpenGL 3.3+
+/// core profile (CGL on macOS). Elsewhere desktop GL may be older; there the backend must report
+/// itself unavailable so canvases use the CPU backend.
 fn gpu_canvas_unsupported_platform() -> bool {
-    surfman::Connection::new()
-        .map(|connection| connection.gl_api() != surfman::GLApi::GLES)
-        .unwrap_or(false)
+    !cfg!(any(target_os = "windows", target_os = "macos")) &&
+        surfman::Connection::new()
+            .map(|connection| connection.gl_api() != surfman::GLApi::GLES)
+            .unwrap_or(false)
 }
 
 #[test]
@@ -171,7 +174,7 @@ fn run_parity(
     gpu_scene: fn(&mut VelloGpuDrawTarget),
 ) {
     if gpu_canvas_unsupported_platform() {
-        eprintln!("{name}: skipped; the GPU canvas backend needs OpenGL ES");
+        eprintln!("{name}: skipped; unsupported GL");
         return;
     }
     let mut cpu = VelloCPUDrawTarget::new(size);
@@ -1447,7 +1450,7 @@ parity!(recreate_and_resize, 100, 80, |t| {
 #[test]
 fn gpu_lifetime_stress() {
     if gpu_canvas_unsupported_platform() {
-        eprintln!("gpu_lifetime_stress: skipped; the GPU canvas backend needs OpenGL ES");
+        eprintln!("gpu_lifetime_stress: skipped; unsupported GL");
         return;
     }
     on_gpu_thread(|| {
@@ -1614,7 +1617,7 @@ fn read_center_on_another_device(surface: surfman::Surface) -> (surfman::Surface
 #[test]
 fn published_frame_is_complete_on_another_device() {
     if gpu_canvas_unsupported_platform() {
-        eprintln!("published_frame_is_complete_on_another_device: skipped; needs OpenGL ES");
+        eprintln!("published_frame_is_complete_on_another_device: skipped; unsupported GL");
         return;
     }
     let stale = on_gpu_thread(|| {
@@ -1684,7 +1687,7 @@ fn published_frame_is_complete_on_another_device() {
 #[test]
 fn gpu_memory_report() {
     if gpu_canvas_unsupported_platform() {
-        eprintln!("gpu_memory_report: skipped; the GPU canvas backend needs OpenGL ES");
+        eprintln!("gpu_memory_report: skipped; unsupported GL");
         return;
     }
     on_gpu_thread(|| {
@@ -1892,7 +1895,7 @@ fn canvas_to_canvas() {
 #[test]
 fn canvas_frames_survive_their_source() {
     if gpu_canvas_unsupported_platform() {
-        eprintln!("canvas_frames_survive_their_source: skipped; needs OpenGL ES");
+        eprintln!("canvas_frames_survive_their_source: skipped; unsupported GL");
         return;
     }
     let pixels = on_gpu_thread(|| {
@@ -1981,7 +1984,7 @@ fn reading_a_region_matches_the_whole_canvas() {
         "CPU backend: region with this index differs"
     );
     if gpu_canvas_unsupported_platform() {
-        eprintln!("reading_a_region_matches_the_whole_canvas: GPU half skipped; needs OpenGL ES");
+        eprintln!("reading_a_region_matches_the_whole_canvas: GPU half skipped; unsupported GL");
         return;
     }
     assert_eq!(

@@ -345,21 +345,21 @@ impl GpuThread {
             .surfman_details
             .any()
             .ok_or("no painter surfman details")?;
-        // vello_hybrid's WebGL renderer needs an OpenGL ES 3.0 context: its shaders are GLSL ES
-        // 3.00 and it asserts on GLES-only queries. Desktop GL (CGL on macOS) is not supported,
-        // so report it as unavailable instead of letting the renderer panic this thread.
-        let gl_api = details.connection.gl_api();
-        if gl_api != GLApi::GLES {
-            return Err(format!(
-                "the GPU canvas needs an OpenGL ES context; this surfman connection is {gl_api:?}"
-            ));
-        }
+        // vello_hybrid's WebGL renderer runs on OpenGL ES 3.0 (ANGLE on Windows) or on a desktop
+        // OpenGL 3.3+ core profile (CGL on macOS), translating its shaders to GLSL 3.30 there.
+        // Older desktop GL is reported unavailable below, so canvases use the CPU backend.
+        let version = match details.connection.gl_api() {
+            GLApi::GLES => GLVersion::new(3, 0),
+            // Surfman creates a core profile for 3.2 and up. CGL then returns the newest core
+            // version the GPU supports (4.1).
+            GLApi::GL => GLVersion::new(3, 2),
+        };
         let device = details
             .connection
             .create_device(&details.adapter)
             .map_err(|e| format!("device: {e:?}"))?;
         let attributes = ContextAttributes {
-            version: GLVersion::new(3, 0),
+            version,
             flags: ContextAttributeFlags::ALPHA |
                 ContextAttributeFlags::DEPTH |
                 ContextAttributeFlags::STENCIL,
@@ -416,6 +416,18 @@ impl GpuThread {
                 return Err(error);
             },
         };
+        let gl_version = glow.version();
+        if !gl_version.is_embedded && (gl_version.major, gl_version.minor) < (3, 3) {
+            let version = format!("{}.{}", gl_version.major, gl_version.minor);
+            unsafe {
+                glow.delete_texture(canary);
+                glow.delete_framebuffer(copy_framebuffer);
+            }
+            let _ = device.destroy_context(&mut context);
+            return Err(format!(
+                "the GPU canvas needs OpenGL ES 3.0 or OpenGL 3.3; this context is OpenGL {version}"
+            ));
+        }
         let gl = WebGl2RenderingContext::from_glow(glow, 1, 1);
         // The renderer panics rather than returning errors (shader compilation, link and
         // capability checks). Contain that here so a driver that cannot run it falls back to the
@@ -1394,7 +1406,13 @@ impl VelloGpuDrawTarget {
         SerializableImageData::External(ExternalImageData {
             id: self.gpu.image_id,
             channel_index: 0,
-            image_type: ExternalImageType::TextureHandle(ImageBufferKind::Texture2D),
+            // The swap chain's surfaces are rectangle textures (IOSurfaces) on macOS.
+            image_type: ExternalImageType::TextureHandle(
+                match self.gpu.thread.device.surface_gl_texture_target() {
+                    glow::TEXTURE_RECTANGLE => ImageBufferKind::TextureRect,
+                    _ => ImageBufferKind::Texture2D,
+                },
+            ),
             normalized_uvs: false,
         })
     }
