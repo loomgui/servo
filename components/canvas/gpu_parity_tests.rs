@@ -1933,6 +1933,75 @@ fn canvas_frames_survive_their_source() {
     }
 }
 
+/// `getImageData` of a region reads that region alone. It has to return what a crop of the
+/// whole canvas returns, row for row, on both backends.
+#[test]
+fn reading_a_region_matches_the_whole_canvas() {
+    // An odd height and no symmetry, so a wrong row order or offset cannot go unnoticed.
+    const WIDTH: u32 = 97;
+    const HEIGHT: u32 = 61;
+    /// The index of the first region that differs, or `ALL_MATCH`.
+    const ALL_MATCH: u8 = u8::MAX;
+    fn first_mismatch<T: GenericDrawTarget>(mut target: T) -> Vec<u8> {
+        for index in 0..WIDTH * HEIGHT / 12 {
+            let (x, y) = (index * 7 % WIDTH, index * 13 % HEIGHT);
+            target.fill_rect(
+                &rect(x as f32, y as f32, 5.0, 3.0),
+                color((x * 2) as u8, (y * 4) as u8, (index * 31) as u8, 1.0),
+                normal(),
+                identity(),
+            );
+        }
+        let whole = target.snapshot();
+        let regions = [
+            urect(0, 0, WIDTH, HEIGHT),
+            urect(0, 0, 1, 1),
+            urect(WIDTH - 1, HEIGHT - 1, 1, 1),
+            urect(11, 7, 33, 20),
+            urect(0, 40, WIDTH, 21),
+            urect(60, 0, 37, HEIGHT),
+            urect(5, 30, 80, 1),
+        ];
+        let mismatch = regions.iter().position(|region| {
+            target.snapshot_rect(*region).as_raw_bytes() != whole.get_rect(*region).as_raw_bytes()
+        });
+        assert!(
+            whole
+                .as_raw_bytes()
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] != 0),
+            "the scene drew nothing"
+        );
+        vec![mismatch.map_or(ALL_MATCH, |index| index as u8)]
+    }
+    let size = Size2D::new(WIDTH, HEIGHT);
+    assert_eq!(
+        first_mismatch(VelloCPUDrawTarget::new(size)),
+        [ALL_MATCH],
+        "CPU backend: region with this index differs"
+    );
+    if gpu_canvas_unsupported_platform() {
+        eprintln!("reading_a_region_matches_the_whole_canvas: GPU half skipped; needs OpenGL ES");
+        return;
+    }
+    assert_eq!(
+        on_gpu_thread(move || first_mismatch(VelloGpuDrawTarget::new(size))),
+        [ALL_MATCH],
+        "GPU backend: region with this index differs"
+    );
+}
+
+/// Where the driver cannot return rows top-down, the backend turns them around itself.
+#[test]
+fn flip_rows_reverses_the_row_order() {
+    for rows in [1_usize, 2, 5, 6] {
+        let mut pixels: Vec<u8> = (0..rows).flat_map(|row| [row as u8; 3]).collect();
+        crate::vello_gpu_backend::flip_rows(&mut pixels, 3);
+        let expected: Vec<u8> = (0..rows).rev().flat_map(|row| [row as u8; 3]).collect();
+        assert_eq!(pixels, expected, "{rows} rows");
+    }
+}
+
 // ---- realistic workloads -------------------------------------------------------------------
 
 // The hands-on main menu's ember particles: a radial-gradient glow plus a solid core per

@@ -951,17 +951,26 @@ impl Gpu {
         }
     }
 
-    /// Read the retained copy back as top-down premultiplied RGBA.
-    fn read_retained(&self, size: Size2D<u32>) -> Vec<u8> {
+    /// Read `rect` of the retained copy back as top-down premultiplied RGBA. `rect` lies
+    /// within the canvas, whose size is `size`.
+    fn read_retained(&self, size: Size2D<u32>, rect: Rect<u32>) -> Vec<u8> {
         self.thread.make_current();
         let glow = self.thread.gl.glow();
-        let (width, height) = (size.width as usize, size.height as usize);
+        let (width, height) = (rect.size.width as usize, rect.size.height as usize);
         let mut pixels = vec![0_u8; width * height * 4];
-        if self.thread.lost.get() {
+        if self.thread.lost.get() || pixels.is_empty() {
             // The content is gone with the context.
             return pixels;
         }
+        // GL rows are bottom-up. ANGLE can hand them over top-down; elsewhere they are
+        // turned around afterwards.
+        let top_down = glow
+            .supported_extensions()
+            .contains("GL_ANGLE_pack_reverse_row_order");
         unsafe {
+            if top_down {
+                glow.pixel_store_i32(PACK_REVERSE_ROW_ORDER_ANGLE, 1);
+            }
             let framebuffer = glow.create_framebuffer().ok();
             glow.bind_framebuffer(glow::READ_FRAMEBUFFER, framebuffer);
             glow.framebuffer_texture_2d(
@@ -972,8 +981,8 @@ impl Gpu {
                 0,
             );
             glow.read_pixels(
-                0,
-                0,
+                rect.origin.x as i32,
+                (size.height - rect.origin.y - rect.size.height) as i32,
                 width as i32,
                 height as i32,
                 glow::RGBA,
@@ -984,15 +993,30 @@ impl Gpu {
             if let Some(framebuffer) = framebuffer {
                 glow.delete_framebuffer(framebuffer);
             }
+            if top_down {
+                glow.pixel_store_i32(PACK_REVERSE_ROW_ORDER_ANGLE, 0);
+            }
         }
-        // GL rows are bottom-up.
-        let stride = width * 4;
-        let mut flipped = vec![0_u8; pixels.len()];
-        for (row, chunk) in pixels.chunks_exact(stride).enumerate() {
-            let dest = (height - 1 - row) * stride;
-            flipped[dest..dest + stride].copy_from_slice(chunk);
+        if !top_down {
+            flip_rows(&mut pixels, width * 4);
         }
-        flipped
+        pixels
+    }
+}
+
+/// `GL_PACK_REVERSE_ROW_ORDER_ANGLE` of `ANGLE_pack_reverse_row_order`: `glReadPixels`
+/// returns the top row first.
+const PACK_REVERSE_ROW_ORDER_ANGLE: u32 = 0x93A4;
+
+/// Reverse the order of the `stride`-byte rows of `pixels` in place.
+pub(crate) fn flip_rows(pixels: &mut [u8], stride: usize) {
+    let rows = pixels.len() / stride;
+    let (top, bottom) = pixels.split_at_mut(rows / 2 * stride);
+    for (upper, lower) in top
+        .chunks_exact_mut(stride)
+        .zip(bottom.chunks_exact_mut(stride).rev())
+    {
+        upper.swap_with_slice(lower);
     }
 }
 
@@ -1723,14 +1747,18 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
     }
 
     fn snapshot(&mut self) -> Snapshot {
+        self.snapshot_rect(Rect::from_size(self.size))
+    }
+
+    fn snapshot_rect(&mut self, rect: Rect<u32>) -> Snapshot {
         self.flush();
         Snapshot::from_vec(
-            self.size.cast(),
+            rect.size,
             SnapshotPixelFormat::RGBA,
             SnapshotAlphaMode::Transparent {
                 premultiplied: true,
             },
-            self.gpu.read_retained(self.size),
+            self.gpu.read_retained(self.size, rect),
         )
     }
 

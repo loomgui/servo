@@ -652,7 +652,8 @@ pub fn generic_transform_inplace<
             2 => {
                 let a = rgba[3] as u32;
 
-                if a > 0 {
+                // Opaque pixels, which most are, come out of the divisions unchanged.
+                if a > 0 && a < 255 {
                     rgba[0] = (rgba[0] as u32 * 255 / a) as u8;
                     rgba[1] = (rgba[1] as u32 * 255 / a) as u8;
                     rgba[2] = (rgba[2] as u32 * 255 / a) as u8;
@@ -706,7 +707,49 @@ fn is_webp(buffer: &[u8]) -> bool {
 
 #[cfg(test)]
 mod test {
-    use super::detect_image_format;
+    use super::{Multiply, detect_image_format, transform_inplace};
+
+    /// Unpremultiplying skips the divisions for opaque pixels. Every color and alpha value
+    /// has to come out as the divisions would leave it.
+    #[test]
+    fn unmultiply_matches_the_division_for_every_alpha() {
+        for alpha in 0..=255_u8 {
+            let expected = |channel: u8| match alpha {
+                0 => channel,
+                _ => (u32::from(channel) * 255 / u32::from(alpha)) as u8,
+            };
+            for channel in 0..=255_u8 {
+                let (green, blue) = (channel.wrapping_add(85), channel.wrapping_add(170));
+                let mut straight = [channel, green, blue, alpha];
+                transform_inplace(&mut straight, Multiply::UnMultiply, false, false);
+                assert_eq!(
+                    straight,
+                    [expected(channel), expected(green), expected(blue), alpha]
+                );
+                let mut swapped = [channel, green, blue, alpha];
+                transform_inplace(&mut swapped, Multiply::UnMultiply, true, false);
+                assert_eq!(
+                    swapped,
+                    [expected(blue), expected(green), expected(channel), alpha]
+                );
+            }
+        }
+    }
+
+    /// How long `getImageData` of a 1920x1080 canvas spends unpremultiplying.
+    #[test]
+    #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+    fn unmultiply_bench() {
+        for (name, alpha) in [("opaque", 255_u8), ("translucent", 128)] {
+            let mut pixels = [90, 60, 30, alpha].repeat(1920 * 1080);
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                transform_inplace(&mut pixels, Multiply::UnMultiply, false, false);
+                std::hint::black_box(&mut pixels);
+            }
+            eprintln!("{name}: {:.2} ms", start.elapsed().as_secs_f64() * 50.0);
+        }
+    }
 
     #[test]
     fn test_supported_images() {

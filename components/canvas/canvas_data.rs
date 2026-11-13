@@ -504,7 +504,7 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
             {
                 Snapshot::empty()
             } else {
-                self.draw_target.snapshot().get_rect(read_rect)
+                self.draw_target.snapshot_rect(read_rect)
             }
         } else {
             self.draw_target.snapshot()
