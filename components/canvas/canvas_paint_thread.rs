@@ -977,11 +977,13 @@ mod canvas_tests {
     }
 
     fn lose_context_and_recover(thread_name: &'static str, in_driver: bool) {
-        let supported = surfman::Connection::new()
-            .map(|connection| connection.gl_api() == surfman::GLApi::GLES)
-            .unwrap_or(false);
+        // The GPU backend runs on OpenGL ES (ANGLE) and on CGL's core profile on macOS.
+        let supported = cfg!(target_os = "macos") ||
+            surfman::Connection::new()
+                .map(|connection| connection.gl_api() == surfman::GLApi::GLES)
+                .unwrap_or(false);
         if !supported {
-            eprintln!("{thread_name}: skipped; the GPU canvas backend needs OpenGL ES");
+            eprintln!("{thread_name}: skipped; no GL context the GPU canvas backend runs on");
             return;
         }
         let (sender, receiver) = std::sync::mpsc::channel();

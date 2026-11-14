@@ -1,14 +1,18 @@
 // Copyright 2026 the Loom Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Native OpenGL ES 3.0 stand-in for the subset of `web_sys::WebGl2RenderingContext` that the
-//! WebGL2 backend uses.
+//! Native OpenGL stand-in for the subset of `web_sys::WebGl2RenderingContext` that the WebGL2
+//! backend uses.
 //!
 //! The renderer was written against the browser API. This module mirrors the method names,
 //! argument shapes and handle semantics it relies on and forwards every call to `glow`, so the
-//! backend can run on a native GLES context (for example ANGLE through surfman) with only its
-//! imports changed. The caller owns the context and must keep it current on the thread that uses
-//! the renderer.
+//! backend can run on a native GL context with only its imports changed. The caller owns the
+//! context and must keep it current on the thread that uses the renderer.
+//!
+//! Two kinds of context are supported: OpenGL ES 3.0 (for example ANGLE through surfman), and a
+//! desktop OpenGL 3.3+ core profile (for example CGL on macOS, which stops at 4.1). For the
+//! latter, this module rewrites the GLSL ES 3.00 shaders as GLSL 3.30 core, which has the same
+//! language features, and stands in for the few ES calls core profiles lack.
 
 #![allow(
     unsafe_code,
@@ -43,6 +47,11 @@ pub type WebGlUniformLocation = glow::NativeUniformLocation;
 pub struct WebGl2RenderingContext {
     gl: Rc<glow::Context>,
     drawing_buffer: Rc<Cell<(i32, i32)>>,
+    /// The context is desktop OpenGL (a core profile) rather than OpenGL ES.
+    desktop: bool,
+    /// `glInvalidateFramebuffer` exists: OpenGL ES 3.0, desktop OpenGL 4.3, or
+    /// `ARB_invalidate_subdata`. It is only a hint, so it is skipped where it is missing.
+    invalidate_framebuffer: bool,
 }
 
 impl fmt::Debug for WebGl2RenderingContext {
@@ -175,6 +184,19 @@ pub mod js_sys {
     }
 }
 
+/// `source`, a GLSL ES 3.00 shader, as GLSL 3.30 core for a desktop OpenGL core profile.
+///
+/// The two languages have the same features for these shaders; only the version line differs.
+/// GLSL 3.30 accepts and ignores precision qualifiers. macOS core profiles lack
+/// `GL_ARB_ES3_compatibility`, so `#version 300 es` itself does not compile there.
+fn desktop_glsl(source: &str) -> alloc::borrow::Cow<'_, str> {
+    const ES: &str = "#version 300 es";
+    match source.trim_start().strip_prefix(ES) {
+        Some(rest) => alloc::borrow::Cow::Owned(alloc::format!("#version 330 core{rest}")),
+        None => alloc::borrow::Cow::Borrowed(source),
+    }
+}
+
 fn unpack(pixels: Option<&[u8]>) -> glow::PixelUnpackData<'_> {
     glow::PixelUnpackData::Slice(pixels)
 }
@@ -203,12 +225,22 @@ fn zeroed(width: i32, height: i32, depth: i32, format: u32, ty: u32) -> Vec<u8> 
 }
 
 impl WebGl2RenderingContext {
-    /// Wrap a native GLES 3.0 context. `width`/`height` are the size of the default framebuffer
-    /// the renderer draws into (see [`Self::set_drawing_buffer_size`]).
+    /// Wrap a native OpenGL ES 3.0 or desktop OpenGL 3.3+ core context. `width`/`height` are the
+    /// size of the default framebuffer the renderer draws into (see
+    /// [`Self::set_drawing_buffer_size`]).
     pub fn from_glow(gl: glow::Context, width: i32, height: i32) -> Self {
+        let version = gl.version();
+        let desktop = !version.is_embedded;
+        let invalidate_framebuffer = !desktop
+            || (version.major, version.minor) >= (4, 3)
+            || gl
+                .supported_extensions()
+                .contains("GL_ARB_invalidate_subdata");
         Self {
             gl: Rc::new(gl),
             drawing_buffer: Rc::new(Cell::new((width, height))),
+            desktop,
+            invalidate_framebuffer,
         }
     }
 
@@ -243,6 +275,33 @@ impl WebGl2RenderingContext {
                 }
                 glow::PIXEL_PACK_BUFFER_BINDING => JsValue::Buffer(gl.get_parameter_buffer(pname)),
                 glow::DEPTH_WRITEMASK => JsValue::Bool(gl.get_parameter_bool(pname)),
+                // Core profiles removed `DEPTH_BITS`. Ask the bound draw framebuffer instead,
+                // which names its depth buffer `DEPTH` (the default one) or `DEPTH_ATTACHMENT`.
+                glow::DEPTH_BITS if self.desktop => {
+                    let attachment = if gl
+                        .get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING)
+                        .is_some()
+                    {
+                        glow::DEPTH_ATTACHMENT
+                    } else {
+                        glow::DEPTH
+                    };
+                    let kind = gl.get_framebuffer_attachment_parameter_i32(
+                        glow::DRAW_FRAMEBUFFER,
+                        attachment,
+                        glow::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+                    );
+                    let bits = if kind as u32 == glow::NONE {
+                        0
+                    } else {
+                        gl.get_framebuffer_attachment_parameter_i32(
+                            glow::DRAW_FRAMEBUFFER,
+                            attachment,
+                            glow::FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE,
+                        )
+                    };
+                    JsValue::Number(f64::from(bits))
+                }
                 glow::VIEWPORT => {
                     let mut out = [0_i32; 4];
                     gl.get_parameter_i32_slice(pname, &mut out);
@@ -571,8 +630,10 @@ impl WebGl2RenderingContext {
         target: u32,
         attachments: &js_sys::Array,
     ) -> Result<(), JsValue> {
-        // SAFETY: module contract.
-        unsafe { self.gl.invalidate_framebuffer(target, &attachments.0) }
+        if self.invalidate_framebuffer {
+            // SAFETY: module contract.
+            unsafe { self.gl.invalidate_framebuffer(target, &attachments.0) }
+        }
         Ok(())
     }
 
@@ -636,8 +697,13 @@ impl WebGl2RenderingContext {
     }
 
     pub fn shader_source(&self, shader: &WebGlShader, source: &str) {
+        let source = if self.desktop {
+            desktop_glsl(source)
+        } else {
+            alloc::borrow::Cow::Borrowed(source)
+        };
         // SAFETY: module contract.
-        unsafe { self.gl.shader_source(*shader, source) }
+        unsafe { self.gl.shader_source(*shader, &source) }
     }
 
     pub fn compile_shader(&self, shader: &WebGlShader) {
