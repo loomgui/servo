@@ -103,11 +103,13 @@ pub use render::{WebGlPendingProbe, WebGlProbeError, WebGlProbeStatus};
 pub use resources::Resources;
 pub use sampling::SampleRect;
 pub use scene::{
-    LayersConfig, MemorySettings, PathStripGenerator, PathStripSettings, PathStrips,
+    DirectBlend, LayersConfig, MemorySettings, PathStripGenerator, PathStripSettings, PathStrips,
     RenderSettings, Scene,
 };
 #[cfg(feature = "text")]
-pub use text::{GlyphRunBuilder, HybridGlyphRunBackend};
+pub use text::{
+    GlyphRunBuilder, GlyphRunCaches, GlyphRunJob, GlyphRunStrips, HybridGlyphRunBackend,
+};
 pub use util::DimensionConstraints;
 pub use vello_common::TextureId;
 pub use vello_common::geometry::SizeU16;
