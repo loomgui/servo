@@ -121,12 +121,17 @@ struct PathJob {
 enum StripJob {
     Path(PathJob),
     Text(GlyphRunJob),
+    /// A job that panics (tests).
+    #[cfg(test)]
+    Panic,
 }
 
 impl StripJob {
     fn run(&self) -> JobStrips {
         match self {
             Self::Path(job) => JobStrips::Path(path_strips(job)),
+            #[cfg(test)]
+            Self::Panic => panic!("a strip job panicked (test)"),
             Self::Text(job) => JobStrips::Text(Box::new(
                 GLYPH_RUN_CACHES.with(|caches| job.strips(&mut caches.borrow_mut())),
             )),
@@ -181,8 +186,8 @@ impl PendingPaths {
     fn push(&mut self, thread: &GpuThread, job: StripJob, draw: PendingDraw) {
         self.jobs.push(job);
         self.draws.push(draw);
-        if self.jobs.len() >= DISPATCH_PATHS &&
-            let Some(workers) = thread.path_workers()
+        if self.jobs.len() >= DISPATCH_PATHS
+            && let Some(workers) = thread.path_workers()
         {
             let jobs = std::mem::replace(&mut self.jobs, Vec::with_capacity(DISPATCH_PATHS));
             let batch = StripBatch::new(jobs);
@@ -225,8 +230,8 @@ impl PendingPaths {
         let mut batches = std::mem::take(&mut self.dispatched);
         if !self.jobs.is_empty() {
             let rest = StripBatch::new(std::mem::take(&mut self.jobs));
-            if rest.jobs.len() >= MIN_PARALLEL_PATHS &&
-                let Some(workers) = thread.path_workers()
+            if rest.jobs.len() >= MIN_PARALLEL_PATHS
+                && let Some(workers) = thread.path_workers()
             {
                 rest.start(workers);
             }
@@ -236,8 +241,13 @@ impl PendingPaths {
         for batch in &batches {
             batch.work();
         }
-        let strips: Vec<JobStrips> = batches.iter().flat_map(|batch| batch.finish()).collect();
+        let strips: Vec<Option<JobStrips>> =
+            batches.iter().flat_map(|batch| batch.finish()).collect();
         for (draw, strips) in self.draws.drain(..).zip(&strips) {
+            // A job that panicked has no strips; its draw is dropped (see `StripBatch::run`).
+            let Some(strips) = strips else {
+                continue;
+            };
             match (draw, strips) {
                 (
                     PendingDraw::Canvas {
@@ -263,10 +273,16 @@ impl PendingPaths {
 
 /// Paths whose strips any number of threads generate together. Each claims a few paths at a
 /// time until none are left, which keeps them balanced whatever the paths cost.
+///
+/// A job that panics (glyph preparation reads fonts the page supplied) must neither take the
+/// process down, which a panic on a pool thread does, nor leave [`Self::finish`] waiting: it
+/// counts as done, without strips, and its draw is dropped with a warning.
 struct StripBatch {
     jobs: Vec<StripJob>,
     next: AtomicUsize,
-    strips: Vec<Mutex<Option<JobStrips>>>,
+    /// Each job's result: `None` until it is done, then its strips, or `None` inside if it
+    /// panicked.
+    strips: Vec<Mutex<Option<Option<JobStrips>>>>,
     /// Paths done, and a wake-up for [`Self::finish`] when that reaches all of them.
     done: Mutex<usize>,
     all_done: std::sync::Condvar,
@@ -291,19 +307,36 @@ impl StripBatch {
         }
     }
 
+    /// Run job `index` and keep its result, `None` if it panicked.
+    fn run(&self, index: usize) {
+        let strips =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.jobs[index].run()));
+        if strips.is_err() {
+            warn_once(
+                &WARNED_JOB_PANIC,
+                "generating the strips of a draw panicked; the draw is skipped",
+            );
+        }
+        *lock(&self.strips[index]) = Some(strips.ok());
+    }
+
+    /// Count `count` more jobs as done.
+    fn complete(&self, count: usize) {
+        let mut done = lock(&self.done);
+        *done += count;
+        if *done == self.jobs.len() {
+            self.all_done.notify_all();
+        }
+    }
+
     /// Generate the strips of one path if one is left to claim; returns whether one was.
     fn work_one(&self) -> bool {
         let index = self.next.fetch_add(1, Ordering::Relaxed);
         if index >= self.jobs.len() {
             return false;
         }
-        let strips = self.jobs[index].run();
-        *lock(&self.strips[index]) = Some(strips);
-        let mut done = lock(&self.done);
-        *done += 1;
-        if *done == self.jobs.len() {
-            self.all_done.notify_all();
-        }
+        self.run(index);
+        self.complete(1);
         true
     }
 
@@ -316,19 +349,15 @@ impl StripBatch {
             }
             let end = (start + PATHS_PER_CLAIM).min(self.jobs.len());
             for index in start..end {
-                let strips = self.jobs[index].run();
-                *lock(&self.strips[index]) = Some(strips);
+                self.run(index);
             }
-            let mut done = lock(&self.done);
-            *done += end - start;
-            if *done == self.jobs.len() {
-                self.all_done.notify_all();
-            }
+            self.complete(end - start);
         }
     }
 
-    /// The strips of every path, in order, once the threads on them are done.
-    fn finish(&self) -> Vec<JobStrips> {
+    /// The strips of every path, in order, once the threads on them are done: `None` for a
+    /// job that panicked.
+    fn finish(&self) -> Vec<Option<JobStrips>> {
         let mut done = lock(&self.done);
         while *done < self.jobs.len() {
             done = self
@@ -460,6 +489,7 @@ fn warn_once(flag: &'static std::thread::LocalKey<Cell<bool>>, message: &str) {
 
 thread_local! {
     static WARNED_IMAGE: Cell<bool> = const { Cell::new(false) };
+    static WARNED_JOB_PANIC: Cell<bool> = const { Cell::new(false) };
     /// Font data shared by all GPU canvases on this thread, as in the CPU backend.
     static FONT_CACHE: RefCell<HashMap<FontIdentifier, peniko::FontData>> = RefCell::default();
 }
@@ -802,6 +832,9 @@ impl GpuThread {
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(threads)
                     .thread_name(|index| format!("CanvasPaths#{index}"))
+                    // Jobs catch their own panics (see `StripBatch`); anything else that
+                    // panics on a pool thread must not abort the process either.
+                    .panic_handler(|_| warn!("GPU canvas: a path worker panicked"))
                     .build()
                     .inspect_err(|error| warn!("GPU canvas: no path workers: {error}"))
                     .ok()
@@ -1351,8 +1384,13 @@ impl Gpu {
                 glow::UNSIGNED_BYTE,
                 glow::PixelPackData::BufferOffset(0),
             );
-            let mapped =
-                glow.map_buffer_range(glow::PIXEL_PACK_BUFFER, 0, len as i32, glow::MAP_READ_BIT);
+            // The buffer's contents are undefined until the read succeeds.
+            let read_failed = glow.get_error() != glow::NO_ERROR;
+            let mapped = if read_failed {
+                std::ptr::null_mut()
+            } else {
+                glow.map_buffer_range(glow::PIXEL_PACK_BUFFER, 0, len as i32, glow::MAP_READ_BIT)
+            };
             if mapped.is_null() {
                 pixels.resize(len, 0);
             } else {
@@ -1500,6 +1538,8 @@ impl VelloGpuDrawTarget {
         let Some(settings) = self.scene.path_strip_settings() else {
             // The scene has to generate these strips itself.
             self.draw_pending_paths();
+            // Recording the pending draws set their own transforms.
+            self.scene.set_transform(transform);
             self.with_composition(composition_options.composition_operation, |self_| {
                 self_.scene.set_paint(paint);
                 match stroke {
@@ -1557,11 +1597,13 @@ impl VelloGpuDrawTarget {
             return;
         };
         self.scene.set_paint(paint.clone());
-        let stroked = line_options.is_some();
-        if let Some(line_options) = line_options {
-            self.scene.set_stroke(line_options.convert());
+        let stroke: Option<kurbo::Stroke> = line_options.map(|line_options| line_options.convert());
+        let stroked = stroke.is_some();
+        if let Some(stroke) = &stroke {
+            self.scene.set_stroke(stroke.clone());
         }
-        self.scene.set_transform(transform.cast().into());
+        let transform: kurbo::Affine = transform.cast().into();
+        self.scene.set_transform(transform);
         let thread = self.gpu.thread.clone();
         if deferred {
             let visible =
@@ -1594,7 +1636,13 @@ impl VelloGpuDrawTarget {
                         },
                         None => {
                             self.pending_paths.record(&mut self.scene, &thread);
+                            // Recording the pending draws set their own paints, transforms
+                            // and strokes.
                             self.scene.set_paint(paint.clone());
+                            self.scene.set_transform(transform);
+                            if let Some(stroke) = &stroke {
+                                self.scene.set_stroke(stroke.clone());
+                            }
                             let mut resources = thread.resources.borrow_mut();
                             let run = self
                                 .scene
@@ -2223,5 +2271,54 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
 
     fn create_source_surface_from_data(&self, data: Snapshot) -> Option<Self::SourceSurface> {
         Some(snapshot_as_pixmap(data))
+    }
+}
+
+#[cfg(test)]
+mod strip_batch_tests {
+    use super::*;
+
+    fn path_job() -> StripJob {
+        let settings = Scene::new(64, 64)
+            .path_strip_settings()
+            .expect("no clip path is set");
+        StripJob::Path(PathJob {
+            path: kurbo::Rect::new(4.0, 4.0, 40.0, 30.0).to_path(0.1),
+            stroke: None,
+            fill_rule: peniko::Fill::NonZero,
+            settings,
+        })
+    }
+
+    /// A job that panics on a worker thread neither aborts the process (as an uncaught panic
+    /// on a rayon pool thread does) nor leaves `finish` waiting; the other jobs keep their
+    /// strips.
+    #[test]
+    fn a_panicking_strip_job_is_dropped() {
+        let workers = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .panic_handler(|_| panic!("a panic escaped a strip job"))
+            .build()
+            .unwrap();
+        let mut jobs: Vec<StripJob> = (0..40).map(|_| path_job()).collect();
+        for index in [0, 17, 39] {
+            jobs[index] = StripJob::Panic;
+        }
+        let batch = StripBatch::new(jobs);
+        batch.start(&workers);
+        batch.work();
+        let strips = batch.finish();
+        assert_eq!(strips.len(), 40);
+        for (index, strips) in strips.iter().enumerate() {
+            assert_eq!(
+                strips.is_none(),
+                [0, 17, 39].contains(&index),
+                "job {index}"
+            );
+        }
+        // Only panicking jobs, all on the workers.
+        let batch = StripBatch::new((0..8).map(|_| StripJob::Panic).collect());
+        batch.start(&workers);
+        assert!(batch.finish().iter().all(Option::is_none));
     }
 }
