@@ -71,6 +71,9 @@ impl CanvasPaintThread {
                                 Ok(Ok((canvas_id, command))) => {
                                     canvas_paint_thread.process_command(command, canvas_id);
                                     canvas_paint_thread.recover_from_gpu_context_loss();
+                                    // Loom: until the next command, help prepare the pending
+                                    // paths of GPU canvases.
+                                    canvas_paint_thread.work_while(&|| msg_receiver.is_empty());
                                 },
                                 Ok(Err(e)) => {
                                     warn!("CanvasPaintThread message deserialization error: {e:?}");
@@ -152,6 +155,20 @@ impl CanvasPaintThread {
             );
             sender.send(ProcessReports::new(reports));
         });
+    }
+
+    /// Loom: generate strips of pending GPU canvas draws while `idle` holds, alongside the
+    /// worker threads. A page sends its drawing commands in small batches; between them this
+    /// thread would otherwise wait while the workers have work queued.
+    fn work_while(&mut self, idle: &dyn Fn() -> bool) {
+        for canvas in self.canvases.values_mut() {
+            if !idle() {
+                return;
+            }
+            if let Canvas::VelloGpu(canvas_data) = canvas {
+                canvas_data.draw_target_mut().work_while(idle);
+            }
+        }
     }
 
     #[servo_tracing::instrument(

@@ -53,6 +53,11 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
         }
     }
 
+    /// Loom: the canvas's draw target.
+    pub(crate) fn draw_target_mut(&mut self) -> &mut DrawTarget {
+        &mut self.draw_target
+    }
+
     /// Hand this canvas's WebRender image to another backend (Loom: GPU/CPU switch on resize).
     pub(crate) fn take_image_key(&mut self) -> Option<ImageKey> {
         self.image_key.take()

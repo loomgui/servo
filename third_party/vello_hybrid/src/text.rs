@@ -12,7 +12,9 @@
 
 use core::ops::RangeInclusive;
 
-use crate::{AtlasId, Resources, Scene};
+use crate::{AtlasId, PathStripGenerator, PathStripSettings, PathStrips, Resources, Scene};
+use alloc::vec::Vec;
+use glifo::GlyphPrepCache;
 use glifo::atlas::{PendingBitmapUpload, PendingClearRect};
 use glifo::renderer::replay_atlas_commands;
 use glifo::{
@@ -22,10 +24,12 @@ use glifo::{
 use peniko::BlendMode;
 use peniko::color::palette::css::BLACK;
 use peniko::color::{AlphaColor, Srgb};
-use vello_common::kurbo::{Affine, BezPath, Rect};
+use vello_common::kurbo::{Affine, BezPath, Rect, Stroke};
 use vello_common::multi_atlas::AtlasConfig;
 use vello_common::paint::{Image, ImageSource, PaintType};
 use vello_common::peniko;
+use vello_common::peniko::{Fill, FontData};
+use vello_common::transforms::Transforms;
 
 /// Glyph atlas cache for the hybrid (GPU) renderer.
 #[derive(Debug)]
@@ -335,6 +339,341 @@ impl glifo::GlyphRenderer for Scene {
     }
 
     #[inline]
+    fn atlas_paint_transform(&self, _atlas_slot: &AtlasSlot) -> Affine {
+        let padding = GLYPH_PADDING as f64;
+        Affine::translate((-padding, -padding))
+    }
+}
+
+/// Loom: a glyph run whose outlines are turned into strips away from the scene, on any thread;
+/// see [`Scene::glyph_run_job`]. Preparing the glyphs and generating their strips is nearly all
+/// the work of drawing text.
+#[derive(Clone, Debug)]
+pub struct GlyphRunJob {
+    font: FontData,
+    font_size: f32,
+    glyphs: Vec<Glyph>,
+    /// The stroke of stroked text, as set on the scene; filled text has none.
+    stroke: Option<Stroke>,
+    fill_rule: Fill,
+    transform: Affine,
+    paint_transform: Affine,
+    root_transform: Affine,
+    width: u16,
+    height: u16,
+    level: vello_common::fearless_simd::Level,
+    aliasing_threshold: Option<u8>,
+}
+
+/// Loom: what [`GlyphRunJob::strips`] made of a glyph run.
+#[derive(Debug)]
+pub struct GlyphRunStrips(GlyphRunResult);
+
+#[derive(Debug)]
+enum GlyphRunResult {
+    /// The transforms and strips of each glyph outline, in order.
+    Outlines(Vec<(Transforms, PathStrips)>),
+    /// The run has glyphs that are not plain outlines (bitmaps, color layers); it is drawn
+    /// into the scene as usual.
+    Scene(GlyphRunJob),
+}
+
+/// Loom: what running glyph run jobs keeps between them: glyph preparation caches and a strip
+/// generator. Use one per thread, for as long as possible.
+#[derive(Debug, Default)]
+pub struct GlyphRunCaches {
+    prep: GlyphPrepCache,
+    generator: PathStripGenerator,
+    jobs: u32,
+}
+
+/// Glyph run jobs a thread runs between two maintenances of its glyph caches.
+const JOBS_PER_CACHE_MAINTENANCE: u32 = 32;
+
+impl GlyphRunJob {
+    /// The strips of every glyph outline of the run, as [`Scene::glyph_run`] would generate
+    /// them. Runs on any thread, with that thread's glyph caches.
+    pub fn strips(&self, caches: &mut GlyphRunCaches) -> GlyphRunStrips {
+        let GlyphRunCaches {
+            prep,
+            generator,
+            jobs,
+        } = caches;
+        let mut collector = OutlineCollector {
+            job: self,
+            transforms: Transforms::new(),
+            stroke: self.stroke.clone(),
+            generator,
+            outlines: Vec::new(),
+            other: false,
+            paint: PaintType::Solid(BLACK),
+        };
+        collector.transforms.set_transform(self.transform);
+        collector
+            .transforms
+            .set_paint_transform(self.paint_transform);
+        let builder = glifo::GlyphRunBuilder::new(
+            self.font.clone(),
+            self.transform,
+            self.paint_transform,
+            OutlineBackend {
+                cache: prep,
+                collector: &mut collector,
+            },
+        )
+        .font_size(self.font_size);
+        if self.stroke.is_some() {
+            builder.stroke_glyphs(self.glyphs.iter().copied());
+        } else {
+            builder.fill_glyphs(self.glyphs.iter().copied());
+        }
+        *jobs += 1;
+        if *jobs % JOBS_PER_CACHE_MAINTENANCE == 0 {
+            prep.maintain();
+        }
+        GlyphRunStrips(if collector.other {
+            GlyphRunResult::Scene(self.clone())
+        } else {
+            GlyphRunResult::Outlines(collector.outlines)
+        })
+    }
+}
+
+impl Scene {
+    /// Loom: a job that generates the strips of a glyph run with the current state, or
+    /// `None` when they have to be generated in the scene: a clip path, filter effect or
+    /// non-isolated blend mode is set. The scene draws the strips with
+    /// [`Self::draw_glyph_run_strips`].
+    pub fn glyph_run_job(
+        &self,
+        font: &FontData,
+        font_size: f32,
+        glyphs: impl Iterator<Item = Glyph>,
+        stroked: bool,
+    ) -> Option<GlyphRunJob> {
+        if !self.can_defer_paths() {
+            return None;
+        }
+        let settings = self.path_strip_settings()?;
+        let state = self.render_state();
+        Some(GlyphRunJob {
+            font: font.clone(),
+            font_size,
+            glyphs: glyphs.collect(),
+            stroke: stroked.then(|| state.stroke.clone()),
+            fill_rule: state.fill_rule,
+            transform: *state.transforms.transform(),
+            paint_transform: *state.transforms.paint_transform(),
+            root_transform: self.root_transform(),
+            width: settings.width,
+            height: settings.height,
+            level: settings.level,
+            aliasing_threshold: settings.aliasing_threshold,
+        })
+    }
+
+    /// Loom: draw a glyph run from its [`GlyphRunJob::strips`] with the current paint, as
+    /// [`Self::glyph_run`] would have drawn it when the job was made. The scene state must be
+    /// what it was then, except for the transforms, which the job holds.
+    pub fn draw_glyph_run_strips(&mut self, resources: &mut Resources, strips: &GlyphRunStrips) {
+        let saved = self.render_state().transforms.clone();
+        match &strips.0 {
+            GlyphRunResult::Outlines(outlines) => {
+                for (transforms, strips) in outlines {
+                    self.render_state_mut().transforms = transforms.clone();
+                    self.draw_path_strips(strips);
+                }
+            },
+            GlyphRunResult::Scene(job) => {
+                self.set_transform(job.transform);
+                self.set_paint_transform(job.paint_transform);
+                if let Some(stroke) = &job.stroke {
+                    self.set_stroke(stroke.clone());
+                }
+                let run = self
+                    .glyph_run(resources, &job.font)
+                    .font_size(job.font_size);
+                if job.stroke.is_some() {
+                    run.stroke_glyphs(job.glyphs.iter().copied());
+                } else {
+                    run.fill_glyphs(job.glyphs.iter().copied());
+                }
+            },
+        }
+        self.render_state_mut().transforms = saved;
+    }
+}
+
+/// The glifo backend of a glyph run job.
+struct OutlineBackend<'a, 'j> {
+    cache: &'a mut GlyphPrepCache,
+    collector: &'a mut OutlineCollector<'j>,
+}
+
+impl<'a> GlyphRunBackend<'a> for OutlineBackend<'a, '_> {
+    fn atlas_cache(self, _enabled: bool) -> Self {
+        self
+    }
+
+    fn fill_glyphs<Glyphs>(self, run: glifo::GlyphRun<'a>, glyphs: Glyphs)
+    where
+        Glyphs: Iterator<Item = Glyph> + Clone,
+    {
+        let mut glyph_run = run.build(glyphs, self.cache.as_mut(), AtlasCacher::Disabled);
+        glyph_run.fill_glyphs(self.collector);
+    }
+
+    fn stroke_glyphs<Glyphs>(self, run: glifo::GlyphRun<'a>, glyphs: Glyphs)
+    where
+        Glyphs: Iterator<Item = Glyph> + Clone,
+    {
+        let mut glyph_run = run.build(glyphs, self.cache.as_mut(), AtlasCacher::Disabled);
+        // As `HybridGlyphRunBackend` does.
+        if let Some(stroke) = &mut self.collector.stroke {
+            stroke.width *= glyph_run.stroke_adjustment();
+        }
+        glyph_run.stroke_glyphs(self.collector);
+    }
+
+    fn render_decoration<Glyphs>(
+        self,
+        _run: glifo::GlyphRun<'a>,
+        _glyphs: Glyphs,
+        _x_range: RangeInclusive<f32>,
+        _baseline_y: f32,
+        _offset: f32,
+        _size: f32,
+        _buffer: f32,
+    ) where
+        Glyphs: Iterator<Item = Glyph> + Clone,
+    {
+        self.collector.other = true;
+    }
+}
+
+/// Collects the strips of glyph outlines. Anything else a glyph draws marks the run for the
+/// scene.
+struct OutlineCollector<'j> {
+    job: &'j GlyphRunJob,
+    transforms: Transforms,
+    stroke: Option<Stroke>,
+    generator: &'j mut PathStripGenerator,
+    outlines: Vec<(Transforms, PathStrips)>,
+    other: bool,
+    paint: PaintType,
+}
+
+impl OutlineCollector<'_> {
+    fn settings(&self) -> PathStripSettings {
+        PathStripSettings {
+            width: self.job.width,
+            height: self.job.height,
+            level: self.job.level,
+            transform: self.job.root_transform * *self.transforms.transform(),
+            aliasing_threshold: self.job.aliasing_threshold,
+        }
+    }
+}
+
+impl DrawSink for OutlineCollector<'_> {
+    fn set_transform(&mut self, t: Affine) {
+        self.transforms.set_transform(t);
+    }
+
+    fn set_paint(&mut self, _paint: glifo::AtlasPaint) {
+        self.other = true;
+    }
+
+    fn set_paint_transform(&mut self, t: Affine) {
+        self.transforms.set_paint_transform(t);
+    }
+
+    fn fill_path(&mut self, path: &BezPath) {
+        if self.other {
+            return;
+        }
+        let settings = self.settings();
+        let strips = self.generator.fill(path, self.job.fill_rule, &settings);
+        self.outlines.push((self.transforms.clone(), strips));
+    }
+
+    fn fill_rect(&mut self, _rect: &Rect) {
+        self.other = true;
+    }
+
+    fn push_clip_layer(&mut self, _clip: &BezPath) {
+        self.other = true;
+    }
+
+    fn push_clip_path(&mut self, _clip: &BezPath) {
+        self.other = true;
+    }
+
+    fn push_blend_layer(&mut self, _blend_mode: BlendMode) {
+        self.other = true;
+    }
+
+    fn pop_layer(&mut self) {
+        self.other = true;
+    }
+
+    fn pop_clip_path(&mut self) {
+        self.other = true;
+    }
+
+    fn width(&self) -> u16 {
+        self.job.width
+    }
+
+    fn height(&self) -> u16 {
+        self.job.height
+    }
+}
+
+impl glifo::GlyphRenderer for OutlineCollector<'_> {
+    type SavedState = Transforms;
+
+    fn save_state(&mut self) -> Self::SavedState {
+        self.transforms.clone()
+    }
+
+    fn restore_state(&mut self, state: Self::SavedState) {
+        self.transforms = state;
+    }
+
+    fn stroke_path(&mut self, path: &BezPath) {
+        if self.other {
+            return;
+        }
+        let Some(stroke) = &self.stroke else {
+            self.other = true;
+            return;
+        };
+        let settings = self.settings();
+        let strips = self.generator.stroke(path, stroke, &settings);
+        self.outlines.push((self.transforms.clone(), strips));
+    }
+
+    fn set_paint_image(&mut self, _image: Image) {
+        self.other = true;
+    }
+
+    fn set_tint(&mut self, _tint: Option<vello_common::paint::Tint>) {
+        self.other = true;
+    }
+
+    fn get_context_color(&self) -> AlphaColor<Srgb> {
+        BLACK
+    }
+
+    fn current_paint(&self) -> &PaintType {
+        &self.paint
+    }
+
+    fn atlas_image_source(&self, atlas_slot: &AtlasSlot) -> ImageSource {
+        ImageSource::opaque_id(atlas_slot.image_id)
+    }
+
     fn atlas_paint_transform(&self, _atlas_slot: &AtlasSlot) -> Affine {
         let padding = GLYPH_PADDING as f64;
         Affine::translate((-padding, -padding))

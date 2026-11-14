@@ -227,6 +227,134 @@ fn sprites<T: GenericDrawTarget>(t: &mut T, frame: u32, images: &[pixels::Snapsh
     }
 }
 
+/// Loom canvas benchmark `compositing`: a background, 90 rectangles in six blend and composite
+/// modes inside a circular clip, and 12 rectangles with shadows.
+fn compositing<T: GenericDrawTarget>(t: &mut T, frame: u32) {
+    let (w, h) = (1920.0_f64, 1080.0_f64);
+    let time = f64::from(frame) / 60.0;
+    t.clear_rect(&rect(0.0, 0.0, w as f32, h as f32), identity());
+    t.fill_rect(
+        &rect(0.0, 0.0, w as f32, h as f32),
+        color(0x24, 0x34, 0x47, 1.0),
+        normal(),
+        identity(),
+    );
+    t.push_clip(
+        &circle(w / 2.0, h / 2.0, 500.0),
+        FillRule::Nonzero,
+        identity(),
+    );
+    let modes = [
+        CompositionOrBlending::Blending(BlendingStyle::Multiply),
+        CompositionOrBlending::Blending(BlendingStyle::Screen),
+        CompositionOrBlending::Blending(BlendingStyle::Overlay),
+        CompositionOrBlending::Composition(CompositionStyle::Lighter),
+        CompositionOrBlending::Composition(CompositionStyle::DestinationOut),
+        CompositionOrBlending::Composition(CompositionStyle::Xor),
+    ];
+    for i in 0..90_u32 {
+        let x = w / 2.0 + (time * 0.7 + f64::from(i) * 0.5).cos() * 380.0;
+        let y = h / 2.0 + (time * 0.9 + f64::from(i) * 0.8).sin() * 300.0;
+        let hue = (i * 47 + frame) % 360;
+        t.fill_rect(
+            &rect((x - 120.0) as f32, (y - 90.0) as f32, 240.0, 180.0),
+            color((hue % 256) as u8, (255 - hue % 200) as u8, 120, 0.7),
+            with_op(modes[i as usize % modes.len()]),
+            identity(),
+        );
+    }
+    t.pop_clip();
+    let shadow_options = ShadowOptions {
+        offset_x: 0.0,
+        offset_y: 8.0,
+        blur: 16.0,
+        color: match color(0, 0, 0, 0.6) {
+            FillOrStrokeStyle::Color(color) => color,
+            _ => unreachable!(),
+        },
+    };
+    for i in 0..12_u32 {
+        let y = 60.0 + (time + f64::from(i)).sin() * 20.0;
+        let shadowed = t.push_shadow(&shadow_options);
+        t.fill_rect(
+            &rect((80 + i * 150) as f32, y as f32, 110.0, 70.0),
+            color(0xff, 0xd6, 0x78, 1.0),
+            normal(),
+            identity(),
+        );
+        if shadowed {
+            t.pop_shadow();
+        }
+    }
+}
+
+/// Loom canvas benchmark `text`: 216 short strings in three sizes that change every frame, and
+/// one stroked line.
+fn text<T: GenericDrawTarget>(t: &mut T, frame: u32) {
+    t.clear_rect(&rect(0.0, 0.0, 1920.0, 1080.0), identity());
+    for row in 0..36_u32 {
+        for column in 0..6_u32 {
+            let size = 14.0 + (column % 3) as f32 * 6.0;
+            let label = format!("Score {}", (frame * (row + 1) + column * 977) % 100_000);
+            t.fill_text(
+                vec![text_run(
+                    &label,
+                    20.0 + column as f32 * 316.0,
+                    28.0 + row as f32 * 29.0,
+                    size,
+                )],
+                color(0xe8, 0xea, 0xed, 1.0),
+                normal(),
+                identity(),
+            );
+        }
+    }
+    t.stroke_text(
+        vec![text_run(&format!("Frame {frame}"), 640.0, 560.0, 64.0)],
+        color(0xff, 0xd6, 0x78, 1.0),
+        line(1.5, LineCapStyle::Butt, LineJoinStyle::Miter, vec![]),
+        normal(),
+        identity(),
+    );
+}
+
+/// Loom canvas benchmark `particles` content on a `width`×`height` canvas: `count` radial
+/// glows added together.
+fn glows<T: GenericDrawTarget>(t: &mut T, time: f64, count: u32, width: f64, height: f64) {
+    t.clear_rect(&rect(0.0, 0.0, width as f32, height as f32), identity());
+    let lighter = with_op(CompositionOrBlending::Composition(
+        CompositionStyle::Lighter,
+    ));
+    for i in 0..count {
+        let fi = f64::from(i);
+        let phase = (time * (0.05 + f64::from(i % 7) * 0.01) + fi * 0.137) % 1.0;
+        let x = ((i * 97) as f64 % width) + (time + fi).sin() * 24.0;
+        let y = height - phase * height;
+        let radius = 18.0 + f64::from(i % 5) * 9.0;
+        let alpha = ((phase * std::f64::consts::PI).sin() * 0.9) as f32;
+        let glow = FillOrStrokeStyle::RadialGradient(RadialGradientStyle::new(
+            x,
+            y,
+            0.0,
+            x,
+            y,
+            radius,
+            vec![
+                stop(0.0, 255, 220, 150, alpha),
+                stop(0.4, 244, 150, 60, alpha * 0.4),
+                stop(1.0, 150, 50, 20, 0.0),
+            ],
+        ));
+        t.fill(
+            &circle(x, y, radius),
+            FillRule::Nonzero,
+            glow,
+            lighter,
+            identity(),
+        );
+    }
+}
+
 struct Timing {
     per_frame: Duration,
 }
@@ -276,6 +404,9 @@ enum Workload {
     Paths,
     Hud,
     Sprites,
+    Compositing,
+    Text,
+    Many,
 }
 
 impl Workload {
@@ -285,6 +416,9 @@ impl Workload {
             Self::Paths => "paths",
             Self::Hud => "hud",
             Self::Sprites => "sprites",
+            Self::Compositing => "compositing",
+            Self::Text => "text",
+            Self::Many => "many",
         }
     }
 
@@ -294,12 +428,18 @@ impl Workload {
             Self::Paths => "paths 1920x1080 (260 curves, filled and stroked)",
             Self::Hud => "hud 4x 400x140 (bars, text, 6 icons each)",
             Self::Sprites => "sprites 1920x1080 (500 drawImage)",
+            Self::Compositing => "compositing 1920x1080 (90 blends in a clip, 12 shadows)",
+            Self::Text => "text 1920x1080 (216 strings, 1 stroked)",
+            Self::Many => "many 6x 640x540 (20 glows each)",
         }
     }
 
     fn targets<T: GenericDrawTarget>(self) -> Vec<T> {
         match self {
-            Self::Embers | Self::Paths | Self::Sprites => vec![T::new(Size2D::new(1920, 1080))],
+            Self::Embers | Self::Paths | Self::Sprites | Self::Compositing | Self::Text => {
+                vec![T::new(Size2D::new(1920, 1080))]
+            },
+            Self::Many => (0..6).map(|_| T::new(Size2D::new(640, 540))).collect(),
             Self::Hud => (0..4).map(|_| T::new(Size2D::new(400, 140))).collect(),
         }
     }
@@ -319,6 +459,13 @@ impl Workload {
                 }
             },
             Self::Sprites => sprites(&mut targets[0], frame, images),
+            Self::Compositing => compositing(&mut targets[0], frame),
+            Self::Text => text(&mut targets[0], frame),
+            Self::Many => {
+                for (i, target) in targets.iter_mut().enumerate() {
+                    glows(target, f64::from(frame) / 60.0 + i as f64, 20, 640.0, 540.0);
+                }
+            },
         }
     }
 }
@@ -623,6 +770,9 @@ fn gpu_bench() {
         Workload::Paths,
         Workload::Hud,
         Workload::Sprites,
+        Workload::Compositing,
+        Workload::Text,
+        Workload::Many,
     ]
         .into_iter()
         .filter(|workload| only.as_deref().is_none_or(|only| only == workload.key()));
