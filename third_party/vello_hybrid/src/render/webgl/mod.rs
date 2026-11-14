@@ -29,7 +29,7 @@ use crate::draw::ExternalTextureRun;
 use crate::render::common::IMAGE_PADDING;
 use crate::util::RangedSlice;
 use crate::{
-    GpuStrip, LayersConfig, RenderError, RenderSettings, RenderSize, Resources,
+    DirectBlend, GpuStrip, LayersConfig, RenderError, RenderSettings, RenderSize, Resources,
     blend::{BlendStrip, GpuBlendInstance},
     copy::GpuCopyInstance,
     filter::{FilterContext, FilterInstanceData, FilterPassPlan},
@@ -992,6 +992,8 @@ pub(crate) struct WebGlPrograms {
     encoded_paints_data: Vec<u8>,
     /// Scratch buffer for staging filter data texture data.
     filter_data: Vec<u8>,
+    /// Loom: scratch buffer for staging strip uploads on desktop OpenGL.
+    strip_upload: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -1217,6 +1219,7 @@ impl WebGlPrograms {
             },
             negate_ndc: false,
             encoded_paints_data,
+            strip_upload: Vec::new(),
             filter_data: Vec::new(),
         }
     }
@@ -1732,6 +1735,29 @@ impl WebGlPrograms {
         let opaque_len = size_of_val(opaque_strips);
         let alpha_len = alpha_strips.len() * size_of::<GpuStrip>();
         let total_len = opaque_len + alpha_len;
+
+        if gl.is_desktop() {
+            // Loom: on desktop OpenGL, specify the buffer with its data in one call. macOS's
+            // OpenGL turns `bufferSubData` into a buffer that the commands recorded so far
+            // already use into a flush of those commands and a new command buffer, and then
+            // waits for a free one: with one strip upload per pass, the canvas thread waited on
+            // the GPU throughout a frame with many passes. Replacing the whole data store never
+            // waits.
+            let mut bytes = core::mem::take(&mut self.strip_upload);
+            bytes.clear();
+            bytes.reserve(total_len);
+            bytes.extend_from_slice(bytemuck::cast_slice(opaque_strips));
+            for strips in alpha_strips.slices() {
+                bytes.extend_from_slice(bytemuck::cast_slice(strips));
+            }
+            gl.buffer_data_with_u8_array(
+                WebGl2RenderingContext::ARRAY_BUFFER,
+                &bytes,
+                WebGl2RenderingContext::DYNAMIC_DRAW,
+            );
+            self.strip_upload = bytes;
+            return;
+        }
 
         // Allocate buffer, then write both slices via bufferSubData.
         // We don't want to pay for concatenating the two slices. It's better to
@@ -2605,6 +2631,54 @@ fn initialize_strip_vao(gl: &WebGl2RenderingContext, resources: &WebGlResources)
     gl.bind_vertex_array(None);
 }
 
+/// Loom: set the fixed-function blend for `blend` on premultiplied colors. Source-over is the
+/// renderer's default blend state.
+fn set_direct_blend(gl: &WebGl2RenderingContext, blend: DirectBlend) {
+    type Gl = WebGl2RenderingContext;
+    // (color source, color destination, alpha source, alpha destination) factors.
+    let (src, dst, src_alpha, dst_alpha) = match blend {
+        DirectBlend::SourceOver => (
+            Gl::ONE,
+            Gl::ONE_MINUS_SRC_ALPHA,
+            Gl::ONE,
+            Gl::ONE_MINUS_SRC_ALPHA,
+        ),
+        DirectBlend::Plus => (Gl::ONE, Gl::ONE, Gl::ONE, Gl::ONE),
+        DirectBlend::DestinationOut => (
+            Gl::ZERO,
+            Gl::ONE_MINUS_SRC_ALPHA,
+            Gl::ZERO,
+            Gl::ONE_MINUS_SRC_ALPHA,
+        ),
+        DirectBlend::Xor => (
+            Gl::ONE_MINUS_DST_ALPHA,
+            Gl::ONE_MINUS_SRC_ALPHA,
+            Gl::ONE_MINUS_DST_ALPHA,
+            Gl::ONE_MINUS_SRC_ALPHA,
+        ),
+        // Cs + Cd − Cs·Cd = Cs + Cd·(1 − Cs); alpha likewise with the source alpha.
+        DirectBlend::Screen => (
+            Gl::ONE,
+            Gl::ONE_MINUS_SRC_COLOR,
+            Gl::ONE,
+            Gl::ONE_MINUS_SRC_ALPHA,
+        ),
+        DirectBlend::SourceAtop => (
+            Gl::DST_ALPHA,
+            Gl::ONE_MINUS_SRC_ALPHA,
+            Gl::DST_ALPHA,
+            Gl::ONE_MINUS_SRC_ALPHA,
+        ),
+        DirectBlend::DestinationOver => (
+            Gl::ONE_MINUS_DST_ALPHA,
+            Gl::ONE,
+            Gl::ONE_MINUS_DST_ALPHA,
+            Gl::ONE,
+        ),
+    };
+    gl.blend_func_separate(src, dst, src_alpha, dst_alpha);
+}
+
 /// Context for WebGL rendering operations.
 // TODO: Improve buffer management. Currently a single buffer is used per resource, which means that
 // the GPU must finish drawing before the next `upload_strip_pair` can be executed (effectively pausing
@@ -2647,17 +2721,14 @@ impl WebGlRendererContext<'_> {
                     )
                 });
                 self.bind_external_texture(texture);
-                // Loom: additive (`plus`) runs blend straight into the target.
-                if run.additive {
-                    self.gl
-                        .blend_func(WebGl2RenderingContext::ONE, WebGl2RenderingContext::ONE);
+                // Loom: runs that are not source-over blend straight into the target.
+                let blends = run.blend != DirectBlend::SourceOver;
+                if blends {
+                    set_direct_blend(self.gl, run.blend);
                 }
                 self.draw_strip_range(first_instance + start, end - start);
-                if run.additive {
-                    self.gl.blend_func(
-                        WebGl2RenderingContext::ONE,
-                        WebGl2RenderingContext::ONE_MINUS_SRC_ALPHA,
-                    );
+                if blends {
+                    set_direct_blend(self.gl, DirectBlend::SourceOver);
                 }
             }
             self.bind_external_texture(None);
@@ -3660,16 +3731,14 @@ fn upload_texels_from(
         let mut texel = first_texel;
         let upload = |x: usize, y: usize, w: usize, h: usize, start: usize| {
             let bytes = &data[start * texel_bytes..(start + w * h) * texel_bytes];
-            glow.tex_sub_image_2d(
-                glow::TEXTURE_2D,
-                0,
+            gl.tex_sub_image_2d_streamed(
                 x as i32,
                 y as i32,
                 w as i32,
                 h as i32,
                 pixel_format,
                 ty,
-                glow::PixelUnpackData::Slice(Some(bytes)),
+                bytes,
             );
         };
         let head = texel % width_texels;

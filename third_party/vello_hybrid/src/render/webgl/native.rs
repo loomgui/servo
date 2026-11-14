@@ -52,6 +52,8 @@ pub struct WebGl2RenderingContext {
     /// `glInvalidateFramebuffer` exists: OpenGL ES 3.0, desktop OpenGL 4.3, or
     /// `ARB_invalidate_subdata`. It is only a hint, so it is skipped where it is missing.
     invalidate_framebuffer: bool,
+    /// Streams texel uploads on desktop OpenGL; see [`Self::tex_sub_image_2d_streamed`].
+    upload_buffer: Rc<Cell<Option<glow::NativeBuffer>>>,
 }
 
 impl fmt::Debug for WebGl2RenderingContext {
@@ -241,6 +243,88 @@ impl WebGl2RenderingContext {
             drawing_buffer: Rc::new(Cell::new((width, height))),
             desktop,
             invalidate_framebuffer,
+            upload_buffer: Rc::new(Cell::new(None)),
+        }
+    }
+
+    /// Loom: whether the context is desktop OpenGL (a core profile) rather than OpenGL ES.
+    pub fn is_desktop(&self) -> bool {
+        self.desktop
+    }
+
+    /// Loom: `glTexSubImage2D` of `data` into the texture bound to `TEXTURE_2D`.
+    ///
+    /// On desktop OpenGL the texels go through a pixel unpack buffer whose storage is replaced
+    /// for every upload. macOS's OpenGL writes client memory into a texture on the CPU, and
+    /// first waits for the GPU to finish every submitted command that uses the texture: the
+    /// renderer's data textures are rewritten for every render, so each render waited for the
+    /// previous one to finish on the GPU. From a buffer, the copy is a GPU command ordered after
+    /// those commands instead, and replacing the buffer's storage never waits.
+    #[allow(clippy::too_many_arguments, reason = "GL upload parameters")]
+    pub fn tex_sub_image_2d_streamed(
+        &self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        format: u32,
+        ty: u32,
+        data: &[u8],
+    ) {
+        let gl = &self.gl;
+        // SAFETY: module contract; GL copies client memory before returning.
+        unsafe {
+            if !self.desktop {
+                gl.tex_sub_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    x,
+                    y,
+                    width,
+                    height,
+                    format,
+                    ty,
+                    glow::PixelUnpackData::Slice(Some(data)),
+                );
+                return;
+            }
+            let buffer = match self.upload_buffer.get() {
+                Some(buffer) => buffer,
+                None => match gl.create_buffer() {
+                    Ok(buffer) => {
+                        self.upload_buffer.set(Some(buffer));
+                        buffer
+                    },
+                    Err(_) => {
+                        gl.tex_sub_image_2d(
+                            glow::TEXTURE_2D,
+                            0,
+                            x,
+                            y,
+                            width,
+                            height,
+                            format,
+                            ty,
+                            glow::PixelUnpackData::Slice(Some(data)),
+                        );
+                        return;
+                    },
+                },
+            };
+            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(buffer));
+            gl.buffer_data_u8_slice(glow::PIXEL_UNPACK_BUFFER, data, glow::STREAM_DRAW);
+            gl.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                x,
+                y,
+                width,
+                height,
+                format,
+                ty,
+                glow::PixelUnpackData::BufferOffset(0),
+            );
+            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
         }
     }
 
@@ -365,6 +449,14 @@ impl WebGl2RenderingContext {
     pub fn blend_func(&self, sfactor: u32, dfactor: u32) {
         // SAFETY: module contract.
         unsafe { self.gl.blend_func(sfactor, dfactor) }
+    }
+
+    pub fn blend_func_separate(&self, src_rgb: u32, dst_rgb: u32, src_alpha: u32, dst_alpha: u32) {
+        // SAFETY: module contract.
+        unsafe {
+            self.gl
+                .blend_func_separate(src_rgb, dst_rgb, src_alpha, dst_alpha)
+        }
     }
 
     pub fn flush(&self) {
@@ -820,8 +912,12 @@ impl WebGl2RenderingContext {
     pub const MAX_ARRAY_TEXTURE_LAYERS: u32 = glow::MAX_ARRAY_TEXTURE_LAYERS;
     pub const MAX_TEXTURE_SIZE: u32 = glow::MAX_TEXTURE_SIZE;
     pub const NEAREST: u32 = glow::NEAREST;
+    pub const ZERO: u32 = glow::ZERO;
     pub const ONE: u32 = glow::ONE;
     pub const ONE_MINUS_SRC_ALPHA: u32 = glow::ONE_MINUS_SRC_ALPHA;
+    pub const ONE_MINUS_SRC_COLOR: u32 = glow::ONE_MINUS_SRC_COLOR;
+    pub const DST_ALPHA: u32 = glow::DST_ALPHA;
+    pub const ONE_MINUS_DST_ALPHA: u32 = glow::ONE_MINUS_DST_ALPHA;
     pub const PIXEL_PACK_BUFFER: u32 = glow::PIXEL_PACK_BUFFER;
     pub const PIXEL_PACK_BUFFER_BINDING: u32 = glow::PIXEL_PACK_BUFFER_BINDING;
     pub const READ_FRAMEBUFFER: u32 = glow::READ_FRAMEBUFFER;

@@ -21,9 +21,20 @@
 //! overwritten; the source keeps its next frame in a new texture instead.
 //!
 //! Recording a path means turning it into strips, which is nearly all the canvas thread does
-//! for a path-heavy canvas. Path fills and strokes are therefore not recorded as they arrive:
-//! consecutive ones are collected, their strips are generated on a few worker threads, and
-//! they are recorded in order when anything else has to happen to the scene.
+//! for a path-heavy canvas; for text, preparing the glyphs comes first. Path fills and strokes
+//! and source-over text runs are therefore not recorded as they arrive: consecutive ones are
+//! collected and handed to a few worker threads in small batches, which generate their strips
+//! while the page goes on drawing (the canvas thread helps whenever it has no command to
+//! handle), and they are recorded in order when anything else has to happen to the scene.
+//!
+//! Composite operations that are fixed-function blends (`lighter`, `destination-out`, `xor`,
+//! `screen`, `source-atop`, `destination-over`) blend each draw straight into its target instead
+//! of through a blend layer. Every blend layer costs rounds of render passes, and on a tiling
+//! GPU (Apple's) each render pass loads and stores whole intermediate textures.
+//!
+//! On desktop OpenGL (CGL on macOS), data textures are uploaded and canvas pixels read back
+//! through pixel buffers: macOS's OpenGL otherwise makes the CPU wait for the GPU on every
+//! render that rewrites a texture still in use, and untiles textures on the CPU for readback.
 //!
 //! If the thread's GL context is lost, or the renderer fails in a way it reports by panicking,
 //! the thread stops using the GPU for good: GPU canvases draw nothing from then on and
@@ -65,8 +76,9 @@ use surfman::{
 };
 use vello_cpu::{kurbo, peniko};
 use vello_hybrid::{
-    ImageId, PathStripGenerator, PathStripSettings, PathStrips, RenderSize, Resources,
-    SampleRect, Scene, TextureId, WebGl2RenderingContext, WebGlRenderer, WebGlTextureBindings,
+    DirectBlend, GlyphRunCaches, GlyphRunJob, GlyphRunStrips, ImageId, PathStripGenerator,
+    PathStripSettings, PathStrips, RenderSize, Resources, SampleRect, Scene, TextureId,
+    WebGl2RenderingContext, WebGlRenderer, WebGlTextureBindings,
 };
 use webrender_api::{
     ExternalImageData, ExternalImageId, ExternalImageType, ImageBufferKind, ImageDescriptor,
@@ -92,7 +104,9 @@ const UPLOAD_CACHE_MAX_IDLE: u64 = 600;
 /// doing it on the canvas thread. A path takes around 20 µs; waking the workers, about as long.
 const MIN_PARALLEL_PATHS: usize = 16;
 /// How many paths a thread takes from a batch at a time.
-const PATHS_PER_CLAIM: usize = 4;
+const PATHS_PER_CLAIM: usize = 1;
+/// Glyphs of a text run prepared together, on one thread.
+const GLYPHS_PER_JOB: usize = 4;
 
 /// What generating the strips of a pending path draw needs. Shared with the worker threads.
 struct PathJob {
@@ -103,16 +117,290 @@ struct PathJob {
     settings: PathStripSettings,
 }
 
-/// How a pending path is drawn once its strips exist.
-struct PathDraw {
-    transform: kurbo::Affine,
-    paint: vello_cpu::PaintType,
-    composition: CompositionOrBlending,
+/// The strips of a pending draw to generate: a path's, or every glyph outline's of a text run.
+enum StripJob {
+    Path(PathJob),
+    Text(GlyphRunJob),
+}
+
+impl StripJob {
+    fn run(&self) -> JobStrips {
+        match self {
+            Self::Path(job) => JobStrips::Path(path_strips(job)),
+            Self::Text(job) => JobStrips::Text(Box::new(
+                GLYPH_RUN_CACHES.with(|caches| job.strips(&mut caches.borrow_mut())),
+            )),
+        }
+    }
+}
+
+enum JobStrips {
+    Path(PathStrips),
+    Text(Box<GlyphRunStrips>),
+}
+
+/// How a pending draw goes into the scene once its strips exist.
+enum PendingDraw {
+    /// A canvas fill or stroke.
+    Canvas {
+        transform: kurbo::Affine,
+        paint: vello_cpu::PaintType,
+        composite: Composite,
+    },
+    /// A text run of `fillText` or `strokeText`, drawn source-over with `paint`.
+    Text(vello_cpu::PaintType),
+}
+
+/// Paths and text a page drew that are not in the scene yet: canvas fills and strokes, and
+/// text runs. They go into the scene together and in order, before anything else does; see
+/// [`VelloGpuDrawTarget::draw_pending_paths`].
+///
+/// Generating their strips (and, for text, preparing the glyphs first) is nearly all the work
+/// of recording them. Every [`DISPATCH_PATHS`] of them are handed to the worker threads at once,
+/// so their strips are generated while the page goes on drawing, as the CPU backend rasterizes
+/// on its worker threads while the page draws. When they are recorded, this thread generates
+/// what is left, alongside the workers.
+#[derive(Default)]
+struct PendingPaths {
+    /// How to draw each pending path, in order.
+    draws: Vec<PendingDraw>,
+    /// The strips of the first pending paths, in order, in batches handed to the workers.
+    dispatched: Vec<Arc<StripBatch>>,
+    /// The draws after those.
+    jobs: Vec<StripJob>,
+}
+
+/// Paths the worker threads take at once while the page draws.
+const DISPATCH_PATHS: usize = 16;
+
+impl PendingPaths {
+    fn is_empty(&self) -> bool {
+        self.draws.is_empty()
+    }
+
+    fn push(&mut self, thread: &GpuThread, job: StripJob, draw: PendingDraw) {
+        self.jobs.push(job);
+        self.draws.push(draw);
+        if self.jobs.len() >= DISPATCH_PATHS &&
+            let Some(workers) = thread.path_workers()
+        {
+            let jobs = std::mem::replace(&mut self.jobs, Vec::with_capacity(DISPATCH_PATHS));
+            let batch = StripBatch::new(jobs);
+            batch.start(workers);
+            self.dispatched.push(batch);
+        }
+    }
+
+    /// Generate strips of the pending draws on this thread while `idle` holds. Draws not handed
+    /// to the workers yet go to them first.
+    fn work_while(&mut self, thread: &GpuThread, idle: &dyn Fn() -> bool) {
+        if !self.jobs.is_empty() {
+            let jobs = std::mem::replace(&mut self.jobs, Vec::with_capacity(DISPATCH_PATHS));
+            let batch = StripBatch::new(jobs);
+            if let Some(workers) = thread.path_workers() {
+                batch.start(workers);
+            }
+            self.dispatched.push(batch);
+        }
+        for batch in &self.dispatched {
+            while idle() {
+                if !batch.work_one() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Forget every pending path: the canvas was cleared. Batches the workers are on finish
+    /// and are dropped.
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Record every pending path into `scene`, in order.
+    fn record(&mut self, scene: &mut Scene, thread: &GpuThread) {
+        if self.is_empty() {
+            return;
+        }
+        let mut batches = std::mem::take(&mut self.dispatched);
+        if !self.jobs.is_empty() {
+            let rest = StripBatch::new(std::mem::take(&mut self.jobs));
+            if rest.jobs.len() >= MIN_PARALLEL_PATHS &&
+                let Some(workers) = thread.path_workers()
+            {
+                rest.start(workers);
+            }
+            batches.push(rest);
+        }
+        // This thread works on every batch alongside the workers instead of waiting for them.
+        for batch in &batches {
+            batch.work();
+        }
+        let strips: Vec<JobStrips> = batches.iter().flat_map(|batch| batch.finish()).collect();
+        for (draw, strips) in self.draws.drain(..).zip(&strips) {
+            match (draw, strips) {
+                (
+                    PendingDraw::Canvas {
+                        transform,
+                        paint,
+                        composite,
+                    },
+                    JobStrips::Path(strips),
+                ) => composite.apply(scene, |scene| {
+                    scene.set_transform(transform);
+                    scene.set_paint(paint);
+                    scene.draw_path_strips(strips);
+                }),
+                (PendingDraw::Text(paint), JobStrips::Text(strips)) => {
+                    scene.set_paint(paint);
+                    scene.draw_glyph_run_strips(&mut thread.resources.borrow_mut(), strips);
+                },
+                _ => unreachable!("every pending draw has strips of its kind"),
+            }
+        }
+    }
+}
+
+/// Paths whose strips any number of threads generate together. Each claims a few paths at a
+/// time until none are left, which keeps them balanced whatever the paths cost.
+struct StripBatch {
+    jobs: Vec<StripJob>,
+    next: AtomicUsize,
+    strips: Vec<Mutex<Option<JobStrips>>>,
+    /// Paths done, and a wake-up for [`Self::finish`] when that reaches all of them.
+    done: Mutex<usize>,
+    all_done: std::sync::Condvar,
+}
+
+impl StripBatch {
+    fn new(jobs: Vec<StripJob>) -> Arc<Self> {
+        Arc::new(Self {
+            strips: jobs.iter().map(|_| Mutex::new(None)).collect(),
+            jobs,
+            next: AtomicUsize::new(0),
+            done: Mutex::new(0),
+            all_done: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Have every worker thread help.
+    fn start(self: &Arc<Self>, workers: &rayon::ThreadPool) {
+        for _ in 0..workers.current_num_threads() {
+            let batch = self.clone();
+            workers.spawn(move || batch.work());
+        }
+    }
+
+    /// Generate the strips of one path if one is left to claim; returns whether one was.
+    fn work_one(&self) -> bool {
+        let index = self.next.fetch_add(1, Ordering::Relaxed);
+        if index >= self.jobs.len() {
+            return false;
+        }
+        let strips = self.jobs[index].run();
+        *lock(&self.strips[index]) = Some(strips);
+        let mut done = lock(&self.done);
+        *done += 1;
+        if *done == self.jobs.len() {
+            self.all_done.notify_all();
+        }
+        true
+    }
+
+    /// Generate strips until no path is left to claim.
+    fn work(&self) {
+        loop {
+            let start = self.next.fetch_add(PATHS_PER_CLAIM, Ordering::Relaxed);
+            if start >= self.jobs.len() {
+                return;
+            }
+            let end = (start + PATHS_PER_CLAIM).min(self.jobs.len());
+            for index in start..end {
+                let strips = self.jobs[index].run();
+                *lock(&self.strips[index]) = Some(strips);
+            }
+            let mut done = lock(&self.done);
+            *done += end - start;
+            if *done == self.jobs.len() {
+                self.all_done.notify_all();
+            }
+        }
+    }
+
+    /// The strips of every path, in order, once the threads on them are done.
+    fn finish(&self) -> Vec<JobStrips> {
+        let mut done = lock(&self.done);
+        while *done < self.jobs.len() {
+            done = self
+                .all_done
+                .wait(done)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        drop(done);
+        self.strips
+            .iter()
+            .map(|strips| lock(strips).take().expect("every path was claimed"))
+            .collect()
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// How one draw composites into its target.
+#[derive(Clone, Copy)]
+enum Composite {
+    SourceOver,
+    /// Straight into the target with a fixed-function blend.
+    Direct(DirectBlend),
+    /// Through a blend layer around the draw.
+    Layer(peniko::BlendMode),
+}
+
+impl Composite {
+    /// How one path, rectangle or image is drawn with `composition_operation`.
+    ///
+    /// Where the operation is a fixed-function blend ([`DirectBlend`]), the draw blends straight
+    /// into its target. That is exactly what a blend layer around the one draw gives, inside clip
+    /// and shadow layers too, since the draw then lands in that layer's texture just as the
+    /// blend layer would. Each blend layer costs its own rounds of render passes, which on a
+    /// tiling GPU (Apple's) each load and store whole intermediate textures.
+    fn of_one_draw(composition_operation: CompositionOrBlending) -> Self {
+        if composition_operation == CompositionOrBlending::Composition(CompositionStyle::SourceOver)
+        {
+            return Self::SourceOver;
+        }
+        let mode: peniko::BlendMode = composition_operation.convert();
+        match DirectBlend::for_mode(mode) {
+            Some(blend) if !forced_blend_layers() => Self::Direct(blend),
+            _ => Self::Layer(mode),
+        }
+    }
+
+    /// Run `f`, which records the draw into `scene`, composited this way.
+    fn apply(self, scene: &mut Scene, f: impl FnOnce(&mut Scene)) {
+        match self {
+            Self::SourceOver => f(scene),
+            Self::Direct(blend) => {
+                scene.set_direct_blend(blend);
+                f(scene);
+                scene.set_direct_blend(DirectBlend::SourceOver);
+            },
+            Self::Layer(mode) => {
+                scene.push_blend_layer(mode);
+                f(scene);
+                scene.pop_layer();
+            },
+        }
+    }
 }
 
 thread_local! {
     /// This thread's strip generator: the canvas thread's, or a path worker's.
     static PATH_STRIP_GENERATOR: RefCell<PathStripGenerator> = RefCell::default();
+    /// This thread's glyph caches and strip generator for text runs.
+    static GLYPH_RUN_CACHES: RefCell<GlyphRunCaches> = RefCell::default();
 }
 
 fn path_strips(job: &PathJob) -> PathStrips {
@@ -293,6 +581,9 @@ struct GpuThread {
     shared: GpuCanvasShared,
     /// Reads a canvas's back buffer into its retained texture.
     copy_framebuffer: glow::NativeFramebuffer,
+    /// Where canvas pixels are read back to on desktop OpenGL; see [`Gpu::read_retained`].
+    /// Created with the first readback.
+    readback_buffer: Cell<Option<glow::NativeBuffer>>,
     /// Threads that generate path strips, started with the first batch that is worth it.
     /// `None` inside if they could not be started; paths are then prepared on this thread.
     path_workers: std::cell::OnceCell<Option<rayon::ThreadPool>>,
@@ -303,6 +594,29 @@ struct GpuThread {
     /// The GL context is gone, or the renderer is in an unknown state after a panic. Nothing
     /// touches GL or the renderer again.
     lost: Cell<bool>,
+}
+
+/// Whether every composite operation goes through a blend layer (tests).
+#[cfg(test)]
+pub(crate) fn forced_blend_layers() -> bool {
+    FORCE_BLEND_LAYERS.with(Cell::get)
+}
+
+#[cfg(not(test))]
+fn forced_blend_layers() -> bool {
+    false
+}
+
+/// Send every composite operation through a blend layer on this thread (tests), to check that
+/// direct blending gives the same pixels.
+#[cfg(test)]
+pub(crate) fn force_blend_layers(force: bool) {
+    FORCE_BLEND_LAYERS.with(|forced| forced.set(force));
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_BLEND_LAYERS: Cell<bool> = const { Cell::new(false) };
 }
 
 thread_local! {
@@ -457,6 +771,7 @@ impl GpuThread {
             uploads: RefCell::default(),
             shared,
             copy_framebuffer,
+            readback_buffer: Cell::new(None),
             path_workers: Default::default(),
             canary,
             lost: Cell::new(false),
@@ -478,65 +793,20 @@ impl GpuThread {
         }
     }
 
-    /// The strips of `jobs`, in order, generated on the worker threads when there are enough
-    /// paths for that to pay off.
-    fn generate_path_strips(&self, jobs: &[PathJob]) -> Vec<PathStrips> {
-        let workers = (jobs.len() >= MIN_PARALLEL_PATHS)
-            .then(|| {
-                self.path_workers.get_or_init(|| {
-                    let threads = servo_config::pref!(thread_pool_canvas_workers).max(1) as usize;
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(threads)
-                        .thread_name(|index| format!("CanvasPaths#{index}"))
-                        .build()
-                        .inspect_err(|error| warn!("GPU canvas: no path workers: {error}"))
-                        .ok()
-                })
+    /// The threads that generate path strips, started the first time they are asked for.
+    /// `None` if they could not be started; paths are then prepared on this thread.
+    fn path_workers(&self) -> Option<&rayon::ThreadPool> {
+        self.path_workers
+            .get_or_init(|| {
+                let threads = servo_config::pref!(thread_pool_canvas_workers).max(1) as usize;
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .thread_name(|index| format!("CanvasPaths#{index}"))
+                    .build()
+                    .inspect_err(|error| warn!("GPU canvas: no path workers: {error}"))
+                    .ok()
             })
-            .and_then(Option::as_ref);
-        let Some(workers) = workers else {
-            return jobs.iter().map(path_strips).collect();
-        };
-        // This thread works alongside the workers instead of waiting for them. Everyone
-        // claims a few paths at a time until none are left, which keeps them balanced
-        // whatever the paths cost.
-        let next = AtomicUsize::new(0);
-        let work = || {
-            let mut done = Vec::new();
-            loop {
-                let start = next.fetch_add(PATHS_PER_CLAIM, Ordering::Relaxed);
-                if start >= jobs.len() {
-                    return done;
-                }
-                for index in start..(start + PATHS_PER_CLAIM).min(jobs.len()) {
-                    done.push((index, path_strips(&jobs[index])));
-                }
-            }
-        };
-        let parts = Mutex::new(Vec::new());
-        workers.in_place_scope(|scope| {
-            for _ in 0..workers.current_num_threads() {
-                scope.spawn(|_| {
-                    let done = work();
-                    parts.lock().unwrap_or_else(|error| error.into_inner()).push(done);
-                });
-            }
-            let done = work();
-            parts.lock().unwrap_or_else(|error| error.into_inner()).push(done);
-        });
-        let mut strips: Vec<Option<PathStrips>> = jobs.iter().map(|_| None).collect();
-        for (index, path_strips) in parts
-            .into_inner()
-            .unwrap_or_else(|error| error.into_inner())
-            .into_iter()
-            .flatten()
-        {
-            strips[index] = Some(path_strips);
-        }
-        strips
-            .into_iter()
-            .map(|strips| strips.expect("every path was claimed"))
-            .collect()
+            .as_ref()
     }
 
     /// Stop using the GPU on this thread.
@@ -969,11 +1239,45 @@ impl Gpu {
         self.thread.make_current();
         let glow = self.thread.gl.glow();
         let (width, height) = (rect.size.width as usize, rect.size.height as usize);
-        let mut pixels = vec![0_u8; width * height * 4];
-        if self.thread.lost.get() || pixels.is_empty() {
+        let len = width * height * 4;
+        if self.thread.lost.get() || len == 0 {
             // The content is gone with the context.
-            return pixels;
+            return vec![0; len];
         }
+        let framebuffer = unsafe { glow.create_framebuffer().ok() };
+        unsafe {
+            glow.bind_framebuffer(glow::READ_FRAMEBUFFER, framebuffer);
+            glow.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(self.retained.texture),
+                0,
+            );
+        }
+        let (x, y) = (
+            rect.origin.x as i32,
+            (size.height - rect.origin.y - rect.size.height) as i32,
+        );
+        let pixels = if glow.version().is_embedded {
+            self.read_pixels_gles(x, y, width, height)
+        } else {
+            self.read_pixels_desktop(x, y, width, height)
+        };
+        unsafe {
+            glow.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+            if let Some(framebuffer) = framebuffer {
+                glow.delete_framebuffer(framebuffer);
+            }
+        }
+        pixels
+    }
+
+    /// Read the bound read framebuffer's `width`×`height` pixels at `x`, `y` on OpenGL ES
+    /// (ANGLE), top row first.
+    fn read_pixels_gles(&self, x: i32, y: i32, width: usize, height: usize) -> Vec<u8> {
+        let glow = self.thread.gl.glow();
+        let mut pixels = vec![0_u8; width * height * 4];
         // GL rows are bottom-up. ANGLE can hand them over top-down; elsewhere they are
         // turned around afterwards.
         let top_down = glow
@@ -983,34 +1287,82 @@ impl Gpu {
             if top_down {
                 glow.pixel_store_i32(PACK_REVERSE_ROW_ORDER_ANGLE, 1);
             }
-            let framebuffer = glow.create_framebuffer().ok();
-            glow.bind_framebuffer(glow::READ_FRAMEBUFFER, framebuffer);
-            glow.framebuffer_texture_2d(
-                glow::READ_FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::TEXTURE_2D,
-                Some(self.retained.texture),
-                0,
-            );
             glow.read_pixels(
-                rect.origin.x as i32,
-                (size.height - rect.origin.y - rect.size.height) as i32,
+                x,
+                y,
                 width as i32,
                 height as i32,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
                 glow::PixelPackData::Slice(Some(&mut pixels)),
             );
-            glow.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
-            if let Some(framebuffer) = framebuffer {
-                glow.delete_framebuffer(framebuffer);
-            }
             if top_down {
                 glow.pixel_store_i32(PACK_REVERSE_ROW_ORDER_ANGLE, 0);
             }
         }
         if !top_down {
             flip_rows(&mut pixels, width * 4);
+        }
+        pixels
+    }
+
+    /// Read the bound read framebuffer's `width`×`height` pixels at `x`, `y` on desktop OpenGL
+    /// (CGL on macOS), top row first.
+    ///
+    /// Reading into client memory there makes the driver wait for the GPU and then untile the
+    /// texture on the CPU, into a buffer that would first have to be zeroed, with the rows
+    /// turned around afterwards. Instead the GPU copies the pixels into a pixel pack buffer, in
+    /// linear rows, and they are copied from there bottom row first: one pass over the pixels.
+    fn read_pixels_desktop(&self, x: i32, y: i32, width: usize, height: usize) -> Vec<u8> {
+        let glow = self.thread.gl.glow();
+        let stride = width * 4;
+        let len = stride * height;
+        let buffer = match self.thread.readback_buffer.get() {
+            Some(buffer) => Some(buffer),
+            None => unsafe { glow.create_buffer().ok() }
+                .inspect(|buffer| self.thread.readback_buffer.set(Some(*buffer))),
+        };
+        let Some(buffer) = buffer else {
+            let mut pixels = vec![0_u8; len];
+            unsafe {
+                glow.read_pixels(
+                    x,
+                    y,
+                    width as i32,
+                    height as i32,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(Some(&mut pixels)),
+                );
+            }
+            flip_rows(&mut pixels, stride);
+            return pixels;
+        };
+        let mut pixels = Vec::with_capacity(len);
+        unsafe {
+            glow.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(buffer));
+            glow.buffer_data_size(glow::PIXEL_PACK_BUFFER, len as i32, glow::STREAM_READ);
+            glow.read_pixels(
+                x,
+                y,
+                width as i32,
+                height as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::BufferOffset(0),
+            );
+            let mapped =
+                glow.map_buffer_range(glow::PIXEL_PACK_BUFFER, 0, len as i32, glow::MAP_READ_BIT);
+            if mapped.is_null() {
+                pixels.resize(len, 0);
+            } else {
+                let rows = std::slice::from_raw_parts(mapped, len);
+                for row in rows.chunks_exact(stride).rev() {
+                    pixels.extend_from_slice(row);
+                }
+                glow.unmap_buffer(glow::PIXEL_PACK_BUFFER);
+            }
+            glow.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
         }
         pixels
     }
@@ -1054,16 +1406,39 @@ pub(crate) struct VelloGpuDrawTarget {
     /// Other canvases' frames the pending scene draws; released after the next rasterization.
     /// The frame at index `i` is bound as texture `FIRST_SOURCE_TEXTURE + i`.
     source_frames: Vec<Rc<GpuFrame>>,
-    /// Path draws that are not in the scene yet, and how to draw each, index for index. They
-    /// go in together, before anything else does; see [`Self::draw_pending_paths`].
-    pending_path_jobs: Vec<PathJob>,
-    pending_path_draws: Vec<PathDraw>,
+    /// Path and glyph draws that are not in the scene yet.
+    pending_paths: PendingPaths,
     /// Open shadow (filter) layers: draws inside them do not target the canvas directly.
     shadow_depth: u32,
 }
 
 impl VelloGpuDrawTarget {
+    /// Run `f`, which draws one path, rectangle or image, composited with
+    /// `composition_operation`; see [`Composite::of_one_draw`].
     fn with_composition(
+        &mut self,
+        composition_operation: CompositionOrBlending,
+        f: impl FnOnce(&mut Self),
+    ) {
+        match Composite::of_one_draw(composition_operation) {
+            Composite::SourceOver => f(self),
+            Composite::Direct(blend) => {
+                self.scene.set_direct_blend(blend);
+                f(self);
+                self.scene.set_direct_blend(DirectBlend::SourceOver);
+            },
+            Composite::Layer(mode) => {
+                self.scene.push_blend_layer(mode);
+                f(self);
+                self.scene.pop_layer();
+            },
+        }
+    }
+
+    /// [`Self::with_composition`] for `f` drawing several glyphs. A blend layer composites them
+    /// together, which differs from blending each glyph where glyphs overlap, so only `lighter`
+    /// blends directly here, and only outside clip and shadow layers, as it always did.
+    fn with_text_composition(
         &mut self,
         composition_operation: CompositionOrBlending,
         f: impl FnOnce(&mut Self),
@@ -1073,15 +1448,13 @@ impl VelloGpuDrawTarget {
             f(self);
             return;
         }
-        // `lighter` is plain additive blending. Outside clip layers it can blend straight into
-        // the canvas instead of through a layer per draw (two GPU passes each).
         if composition_operation == CompositionOrBlending::Composition(CompositionStyle::Lighter) &&
             self.clips.is_empty() &&
             self.shadow_depth == 0
         {
-            self.scene.set_additive(true);
+            self.scene.set_direct_blend(DirectBlend::Plus);
             f(self);
-            self.scene.set_additive(false);
+            self.scene.set_direct_blend(DirectBlend::SourceOver);
             return;
         }
         self.scene.push_blend_layer(composition_operation.convert());
@@ -1103,19 +1476,7 @@ impl VelloGpuDrawTarget {
     /// Record the pending path draws, in the order they were made. Everything that changes
     /// the scene other than another path draw calls this first.
     fn draw_pending_paths(&mut self) {
-        if self.pending_path_jobs.is_empty() {
-            return;
-        }
-        let jobs = std::mem::take(&mut self.pending_path_jobs);
-        let strips = self.gpu.thread.generate_path_strips(&jobs);
-        let draws = std::mem::take(&mut self.pending_path_draws);
-        for (draw, strips) in draws.into_iter().zip(&strips) {
-            self.with_composition(draw.composition, |self_| {
-                self_.scene.set_transform(draw.transform);
-                self_.scene.set_paint(draw.paint);
-                self_.scene.draw_path_strips(strips);
-            });
-        }
+        self.pending_paths.record(&mut self.scene, &self.gpu.thread);
     }
 
     /// Queue a path fill (`stroke` is `None`) or stroke. Its strips are generated together
@@ -1155,17 +1516,117 @@ impl VelloGpuDrawTarget {
             });
             return;
         };
-        self.pending_path_jobs.push(PathJob {
+        let job = PathJob {
             path: path.0.clone(),
             stroke,
             fill_rule,
             settings,
-        });
-        self.pending_path_draws.push(PathDraw {
+        };
+        let draw = PendingDraw::Canvas {
             transform,
             paint,
-            composition: composition_options.composition_operation,
-        });
+            composite: Composite::of_one_draw(composition_options.composition_operation),
+        };
+        self.pending_paths
+            .push(&self.gpu.thread, StripJob::Path(job), draw);
+    }
+
+    /// Fill (`line_options` is `None`) or stroke `text_runs`.
+    ///
+    /// Generating the strips of the glyph outlines is nearly all the work. Source-over text
+    /// therefore joins the pending path draws, whose strips are generated together on the worker
+    /// threads, as the CPU backend rasterizes on its worker threads. The strips are the ones the
+    /// scene would have generated.
+    fn draw_text(
+        &mut self,
+        text_runs: Vec<TextRun>,
+        style: FillOrStrokeStyle,
+        line_options: Option<LineOptions>,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        let deferred = composition_options.composition_operation
+            == CompositionOrBlending::Composition(CompositionStyle::SourceOver);
+        if deferred {
+            // Not `ensure_drawing`: that would record the pending draws first.
+            self.start_drawing();
+        } else {
+            self.ensure_drawing();
+        }
+        let Some(paint) = self.paint(style, composition_options.alpha) else {
+            return;
+        };
+        self.scene.set_paint(paint.clone());
+        let stroked = line_options.is_some();
+        if let Some(line_options) = line_options {
+            self.scene.set_stroke(line_options.convert());
+        }
+        self.scene.set_transform(transform.cast().into());
+        let thread = self.gpu.thread.clone();
+        if deferred {
+            let visible =
+                !matches!(&paint, vello_cpu::PaintType::Solid(color) if color.components[3] == 0.0);
+            for text_run in &text_runs {
+                if !visible {
+                    break;
+                }
+                with_font(text_run, |font| {
+                    // A few glyphs per job, so that a long or costly run (strokes) spreads over
+                    // the threads too.
+                    let all_glyphs: Vec<_> = glyphs(text_run).collect();
+                    let mut jobs = all_glyphs.chunks(GLYPHS_PER_JOB).map(|chunk| {
+                        self.scene.glyph_run_job(
+                            font,
+                            text_run.pt_size,
+                            chunk.iter().copied(),
+                            stroked,
+                        )
+                    });
+                    match jobs.by_ref().collect::<Option<Vec<_>>>() {
+                        Some(jobs) => {
+                            for job in jobs {
+                                self.pending_paths.push(
+                                    &thread,
+                                    StripJob::Text(job),
+                                    PendingDraw::Text(paint.clone()),
+                                );
+                            }
+                        },
+                        None => {
+                            self.pending_paths.record(&mut self.scene, &thread);
+                            self.scene.set_paint(paint.clone());
+                            let mut resources = thread.resources.borrow_mut();
+                            let run = self
+                                .scene
+                                .glyph_run(&mut resources, font)
+                                .font_size(text_run.pt_size);
+                            if stroked {
+                                run.stroke_glyphs(glyphs(text_run));
+                            } else {
+                                run.fill_glyphs(glyphs(text_run));
+                            }
+                        },
+                    }
+                });
+            }
+            return;
+        }
+        self.with_text_composition(composition_options.composition_operation, |self_| {
+            for text_run in &text_runs {
+                with_font(text_run, |font| {
+                    let mut resources = thread.resources.borrow_mut();
+                    let run = self_
+                        .scene
+                        .glyph_run(&mut resources, font)
+                        .font_size(text_run.pt_size);
+                    if stroked {
+                        run.stroke_glyphs(glyphs(text_run));
+                    } else {
+                        run.fill_glyphs(glyphs(text_run));
+                    }
+                });
+            }
+        })
     }
 
     /// Before new commands after a rasterization, draw the retained content back as
@@ -1267,8 +1728,7 @@ impl VelloGpuDrawTarget {
             draws_retained: false,
             pinned_uploads: Vec::new(),
             source_frames: Vec::new(),
-            pending_path_jobs: Vec::new(),
-            pending_path_draws: Vec::new(),
+            pending_paths: PendingPaths::default(),
             shadow_depth: 0,
         };
         // Publish a transparent first frame so WebRender always has a surface to sample.
@@ -1316,6 +1776,13 @@ impl VelloGpuDrawTarget {
     pub(crate) fn frame(&mut self) -> Rc<GpuFrame> {
         self.flush();
         self.gpu.retained.clone()
+    }
+
+    /// Generate strips of pending draws on this thread while `idle` holds; see
+    /// [`PendingPaths`].
+    pub(crate) fn work_while(&mut self, idle: &dyn Fn() -> bool) {
+        let thread = self.gpu.thread.clone();
+        self.pending_paths.work_while(&thread, idle);
     }
 
     /// Draw the `source` region of another canvas's `frame`, in canvas pixels from its top
@@ -1455,8 +1922,7 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
     fn clear_rect(&mut self, rect: &Rect<f32>, transform: Transform2D<f64>) {
         if self.is_viewport_cleared(rect, transform) {
             // The pending path draws would be cleared too.
-            self.pending_path_jobs.clear();
-            self.pending_path_draws.clear();
+            self.pending_paths.clear();
             self.scene.reset();
             self.source_frames.clear();
             self.unpin_uploads();
@@ -1612,24 +2078,7 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     ) {
-        self.ensure_drawing();
-        let Some(paint) = self.paint(style, composition_options.alpha) else {
-            return;
-        };
-        self.scene.set_paint(paint);
-        self.scene.set_transform(transform.cast().into());
-        let thread = self.gpu.thread.clone();
-        self.with_composition(composition_options.composition_operation, |self_| {
-            for text_run in &text_runs {
-                with_font(text_run, |font| {
-                    self_
-                        .scene
-                        .glyph_run(&mut thread.resources.borrow_mut(), font)
-                        .font_size(text_run.pt_size)
-                        .fill_glyphs(glyphs(text_run));
-                });
-            }
-        })
+        self.draw_text(text_runs, style, None, composition_options, transform);
     }
 
     fn fill_rect(
@@ -1709,25 +2158,13 @@ impl GenericDrawTarget for VelloGpuDrawTarget {
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     ) {
-        self.ensure_drawing();
-        let Some(paint) = self.paint(style, composition_options.alpha) else {
-            return;
-        };
-        self.scene.set_paint(paint);
-        self.scene.set_stroke(line_options.convert());
-        self.scene.set_transform(transform.cast().into());
-        let thread = self.gpu.thread.clone();
-        self.with_composition(composition_options.composition_operation, |self_| {
-            for text_run in &text_runs {
-                with_font(text_run, |font| {
-                    self_
-                        .scene
-                        .glyph_run(&mut thread.resources.borrow_mut(), font)
-                        .font_size(text_run.pt_size)
-                        .stroke_glyphs(glyphs(text_run));
-                });
-            }
-        })
+        self.draw_text(
+            text_runs,
+            style,
+            Some(line_options),
+            composition_options,
+            transform,
+        );
     }
 
     fn stroke_rect(

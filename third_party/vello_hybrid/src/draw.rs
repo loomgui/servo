@@ -6,7 +6,7 @@
 use crate::GpuStrip;
 use crate::paint::{COLOR_SOURCE_LAYER, COLOR_SOURCE_SHIFT, PaintResolver};
 use crate::rect::{RectPart, split_rect};
-use crate::scene::{RecordedDraw, RecordedPath};
+use crate::scene::{DirectBlend, RecordedDraw, RecordedPath};
 use crate::target::{DrawTarget, LayerTextureRegion};
 use crate::util::{Ranges, VecExt, pack_opacity, pack_u16_pair};
 use alloc::vec::Vec;
@@ -38,38 +38,39 @@ impl Draw {
         strips: &mut Vec<GpuStrip>,
         gpu_strip: GpuStrip,
         external_texture_id: Option<TextureId>,
-        additive: bool,
+        blend: DirectBlend,
     ) {
-        // Loom: runs split on the external texture binding and on additive blending. Without
-        // any run, every strip draws source-over with no external texture.
+        // Loom: runs split on the external texture binding and on the blend. Without any run,
+        // every strip draws source-over with no external texture.
         let position = self.strip_ranges.len();
+        let blends = blend != DirectBlend::SourceOver;
         match self.external_texture_runs.last_mut() {
             None => {
-                if external_texture_id.is_some() || additive {
-                    if additive && position > 0 {
+                if external_texture_id.is_some() || blends {
+                    if blends && position > 0 {
                         self.external_texture_runs.push(ExternalTextureRun {
                             strips_start: 0,
                             texture_id: None,
-                            additive: false,
+                            blend: DirectBlend::SourceOver,
                         });
                     }
                     self.external_texture_runs.push(ExternalTextureRun {
                         // A texture-only first run also covers earlier strips: binding a
                         // texture they do not sample is harmless.
-                        strips_start: if additive { position } else { 0 },
+                        strips_start: if blends { position } else { 0 },
                         texture_id: external_texture_id,
-                        additive,
+                        blend,
                     });
                 }
             }
             Some(run) => {
                 let texture_conflict = external_texture_id
                     .is_some_and(|id| run.texture_id.is_some_and(|current| current != id));
-                if run.additive != additive || texture_conflict {
+                if run.blend != blend || texture_conflict {
                     self.external_texture_runs.push(ExternalTextureRun {
                         strips_start: position,
                         texture_id: external_texture_id,
-                        additive,
+                        blend,
                     });
                 } else if run.texture_id.is_none() {
                     run.texture_id = external_texture_id;
@@ -125,7 +126,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         match draw {
             RecordedDraw::Path(path) => self.push_path(path, strip_storage, paint_resolver),
             RecordedDraw::Rect(rect) => {
-                self.push_rect(&rect.rect, &rect.paint, rect.additive, paint_resolver);
+                self.push_rect(&rect.rect, &rect.paint, rect.blend, paint_resolver);
             }
         }
     }
@@ -148,9 +149,10 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         let strips = &strip_storage.strips[path.strips.clone()];
 
         let paint = paint_resolver.pack(&path.paint);
-        let additive = path.additive;
-        // Loom: additive draws blend with what is below, so they are never opaque.
-        let opaque = paint.opaque && !additive;
+        let blend = path.blend;
+        // Loom: draws that are not source-over blend with what is below, so they are never
+        // opaque.
+        let opaque = paint.opaque && blend == DirectBlend::SourceOver;
         // Note: This will also advance the depth index for layer root draws even though
         // those _currently_ never use the depth buffer, but it's better to keep the
         // condition simple, and it's not incorrect to do so.
@@ -179,7 +181,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
 
                 builder
                     .draw
-                    .push(builder.strips, strip, paint.external_texture_id, additive);
+                    .push(builder.strips, strip, paint.external_texture_id, blend);
             },
             |builder, segment| {
                 let shifted = segment.shift(geometry_shift);
@@ -196,7 +198,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
                 if !opaque || !builder.push_opaque(strip) {
                     builder
                         .draw
-                        .push(builder.strips, strip, paint.external_texture_id, additive);
+                        .push(builder.strips, strip, paint.external_texture_id, blend);
                 }
             },
         );
@@ -206,7 +208,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         &mut self,
         rect: &Rect,
         paint: &Paint,
-        additive: bool,
+        blend: DirectBlend,
         paint_resolver: PaintResolver<'_>,
     ) {
         // Recordings might contain geometry that exceeds the actual layer
@@ -220,7 +222,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         }
 
         let paint = paint_resolver.pack(paint);
-        let opaque = paint.opaque && !additive;
+        let opaque = paint.opaque && blend == DirectBlend::SourceOver;
         let depth_index = self.state.depth_counter.next(opaque);
 
         let split = split_rect(&clipped_rect);
@@ -247,7 +249,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
 
             if !(opaque && part.frac == 0 && self.push_opaque(strip)) {
                 self.draw
-                    .push(self.strips, strip, paint.external_texture_id, additive);
+                    .push(self.strips, strip, paint.external_texture_id, blend);
             }
         }
     }
@@ -312,7 +314,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
                     depth_index,
                 ),
                 None,
-                false,
+                DirectBlend::SourceOver,
             );
         }
     }
@@ -331,7 +333,8 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         let shifted = segment.shift(self.state.target.geometry_shift());
         let strip = GpuStrip::from_fill_segment(shifted, col_idx, payload, paint, depth_index);
 
-        self.draw.push(self.strips, strip, None, false);
+        self.draw
+            .push(self.strips, strip, None, DirectBlend::SourceOver);
     }
 }
 
@@ -435,8 +438,8 @@ impl LayerTextureRegion {
 pub(crate) struct ExternalTextureRun {
     /// External texture bound for the run, if any strip in it samples one.
     pub(crate) texture_id: Option<TextureId>,
-    /// Loom: the run composites additively (`plus`) instead of source-over.
-    pub(crate) additive: bool,
+    /// Loom: how the run composites into its target.
+    pub(crate) blend: DirectBlend,
     /// Start index of the strip range for this run. The end is implicitly the start of the next
     /// run, or, for the last run, the total number of strips.
     pub(crate) strips_start: usize,

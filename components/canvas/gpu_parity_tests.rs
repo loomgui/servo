@@ -675,6 +675,167 @@ composite!(
     CompositionOrBlending::Blending(BlendingStyle::Luminosity)
 );
 
+/// The operations the GPU backend blends without a layer when one path, rectangle or image is
+/// drawn with them, and two that still need a layer.
+const DIRECT_AND_LAYER_MODES: [CompositionOrBlending; 8] = [
+    CompositionOrBlending::Composition(CompositionStyle::Lighter),
+    CompositionOrBlending::Composition(CompositionStyle::DestinationOut),
+    CompositionOrBlending::Composition(CompositionStyle::Xor),
+    CompositionOrBlending::Blending(BlendingStyle::Screen),
+    CompositionOrBlending::Composition(CompositionStyle::SourceAtop),
+    CompositionOrBlending::Composition(CompositionStyle::DestinationOver),
+    CompositionOrBlending::Blending(BlendingStyle::Multiply),
+    CompositionOrBlending::Blending(BlendingStyle::Overlay),
+];
+
+/// Overlapping translucent rectangles, a path and an image in every mode of
+/// `DIRECT_AND_LAYER_MODES`, over a partly transparent backdrop.
+fn mixed_blends<T: GenericDrawTarget>(t: &mut T) {
+    t.fill_rect(
+        &rect(20.0, 10.0, 200.0, 70.0),
+        color(30, 60, 90, 1.0),
+        normal(),
+        identity(),
+    );
+    t.fill_rect(
+        &rect(10.0, 90.0, 120.0, 60.0),
+        color(200, 160, 40, 0.5),
+        normal(),
+        identity(),
+    );
+    for (i, mode) in DIRECT_AND_LAYER_MODES.iter().enumerate() {
+        let i = i as f32;
+        t.fill_rect(
+            &rect(8.0 + i * 26.0, 20.0 + (i % 3.0) * 30.0, 60.0, 50.0),
+            color((40.0 + i * 25.0) as u8, 180, (230.0 - i * 20.0) as u8, 0.7),
+            with_op(*mode),
+            identity(),
+        );
+        t.fill(
+            &circle(30.0 + f64::from(i) * 26.0, 120.0, 18.0),
+            FillRule::Nonzero,
+            color(240, (60.0 + i * 20.0) as u8, 90, 0.8),
+            with_op(*mode),
+            identity(),
+        );
+        draw_image(
+            t,
+            test_image(16, 16),
+            frect(f64::from(i) * 28.0 + 4.0, 130.0, 24.0, 24.0),
+            Filter::Nearest,
+            with_op(*mode),
+            identity(),
+        );
+    }
+}
+
+// Each draw lands in the clip's layer, where blending it directly must give what a blend layer
+// there gives.
+parity!(direct_blends_in_a_clip, 240, 160, |t| {
+    t.push_clip(&circle(120.0, 80.0, 75.0), FillRule::Nonzero, identity());
+    mixed_blends(t);
+    t.pop_clip();
+});
+
+// Each draw casts a shadow, so it lands in the shadow's layer.
+parity!(direct_blends_with_shadows, 240, 160, |t| {
+    t.fill_rect(
+        &rect(0.0, 0.0, 240.0, 160.0),
+        color(236, 238, 240, 1.0),
+        normal(),
+        identity(),
+    );
+    for (i, mode) in DIRECT_AND_LAYER_MODES.iter().enumerate() {
+        let i = i as f32;
+        assert!(t.push_shadow(&shadow(3.0, 4.0, 4.0, 0, 0, 0, 0.6)));
+        t.fill_rect(
+            &rect(10.0 + i * 27.0, 30.0 + (i % 2.0) * 50.0, 40.0, 40.0),
+            color(220, (40.0 + i * 25.0) as u8, 60, 0.8),
+            with_op(*mode),
+            identity(),
+        );
+        t.pop_shadow();
+    }
+});
+
+/// Loom's `compositing` benchmark in small: overlapping rectangles cycling through blend modes in
+/// a clip on an opaque background.
+fn overlapping_blends<T: GenericDrawTarget>(t: &mut T) {
+    t.fill_rect(
+        &rect(0.0, 0.0, 320.0, 200.0),
+        color(0x24, 0x34, 0x47, 1.0),
+        normal(),
+        identity(),
+    );
+    t.push_clip(&circle(160.0, 100.0, 90.0), FillRule::Nonzero, identity());
+    for i in 0..24_u32 {
+        let fi = f64::from(i);
+        t.fill_rect(
+            &rect(
+                (160.0 + (fi * 0.5).cos() * 70.0 - 40.0) as f32,
+                (100.0 + (fi * 0.8).sin() * 55.0 - 30.0) as f32,
+                80.0,
+                60.0,
+            ),
+            color(
+                ((i * 47) % 256) as u8,
+                (255 - (i * 31) % 200) as u8,
+                120,
+                0.7,
+            ),
+            with_op(DIRECT_AND_LAYER_MODES[i as usize % 6]),
+            identity(),
+        );
+    }
+    t.pop_clip();
+}
+
+parity!(direct_and_layer_blends_overlapping, 320, 200, |t| {
+    overlapping_blends(t);
+});
+
+// Blending one draw straight into its target gives the pixels a blend layer around it gives.
+#[test]
+fn direct_blends_match_blend_layers() {
+    if gpu_canvas_unsupported_platform() {
+        return;
+    }
+    let size = Size2D::new(320, 200);
+    let render = |layers: bool| {
+        on_gpu_thread(move || {
+            crate::vello_gpu_backend::force_blend_layers(layers);
+            let mut gpu = VelloGpuDrawTarget::new(size);
+            overlapping_blends(&mut gpu);
+            mixed_blends(&mut gpu);
+            for (i, mode) in DIRECT_AND_LAYER_MODES.iter().enumerate() {
+                // Canvas-to-canvas draws too.
+                let mut source = VelloGpuDrawTarget::new(Size2D::new(32, 32));
+                canvas_source(&mut source);
+                gpu.draw_canvas(
+                    &mut source,
+                    urect(0, 0, 32, 32),
+                    frect(10.0 + i as f64 * 36.0, 160.0, 32.0, 32.0),
+                    Filter::Nearest,
+                    with_op(*mode),
+                    identity(),
+                );
+            }
+            crate::vello_gpu_backend::force_blend_layers(false);
+            gpu.snapshot().as_raw_bytes().to_vec()
+        })
+    };
+    let (direct, layers) = (render(false), render(true));
+    let result = compare_pixels(&layers, &direct);
+    assert!(
+        result.max_delta <= CHANNEL_TOLERANCE,
+        "direct blends differ from blend layers: {} of {} pixels by more than \
+         {CHANNEL_TOLERANCE}, max channel delta {}",
+        result.mismatched,
+        result.total,
+        result.max_delta
+    );
+}
+
 // ---- clips, clears, retained content -------------------------------------------------------
 
 parity!(clip_path, 120, 120, |t| {
