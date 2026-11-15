@@ -105,8 +105,11 @@ const UPLOAD_CACHE_MAX_IDLE: u64 = 600;
 const MIN_PARALLEL_PATHS: usize = 16;
 /// How many paths a thread takes from a batch at a time.
 const PATHS_PER_CLAIM: usize = 1;
-/// Glyphs of a text run prepared together, on one thread.
-const GLYPHS_PER_JOB: usize = 4;
+/// Glyphs of a text run prepared together, on one thread: a job takes a whole run of up to this
+/// many glyphs, and a longer run is split. Every job prepares its run and starts strip buffers
+/// of its own; at 4 glyphs a job, the `text` benchmark spent about 1 ms a frame more CPU time
+/// on that than at 16, for the same strips.
+const GLYPHS_PER_JOB: usize = 16;
 
 /// What generating the strips of a pending path draw needs. Shared with the worker threads.
 struct PathJob {
@@ -271,6 +274,111 @@ impl PendingPaths {
     }
 }
 
+/// The threads that generate the strips of pending draws, in the batches handed to them.
+///
+/// A worker with nothing to do sleeps at once, until a batch arrives. That is the difference
+/// with a rayon pool, whose idle workers look for work in 33 rounds, yielding the processor
+/// between them, before they sleep: batches arrive a few draws apart while the page draws, and
+/// every one woke every worker into those rounds again, which cost about as much CPU time as
+/// the strips. A sleeping worker costs nothing; waking it takes a few microseconds, while the
+/// canvas thread already works on the batch (see [`PendingPaths::record`]).
+struct StripWorkers {
+    shared: Arc<StripWorkersShared>,
+    threads: usize,
+}
+
+struct StripWorkersShared {
+    queue: Mutex<StripQueue>,
+    /// Signalled for every worker a new batch needs, and on shutdown.
+    wake: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct StripQueue {
+    /// Batches with jobs left to claim, oldest first.
+    batches: std::collections::VecDeque<Arc<StripBatch>>,
+    /// Workers waiting for a batch.
+    sleeping: usize,
+    /// The canvas thread is gone; workers exit.
+    shutdown: bool,
+}
+
+impl StripWorkers {
+    fn new(threads: usize) -> std::io::Result<Self> {
+        let workers = Self {
+            shared: Arc::new(StripWorkersShared {
+                queue: Mutex::new(StripQueue::default()),
+                wake: std::sync::Condvar::new(),
+            }),
+            threads,
+        };
+        for index in 0..threads {
+            let shared = workers.shared.clone();
+            // Dropping `workers` on an error stops the threads already started.
+            std::thread::Builder::new()
+                .name(format!("CanvasPaths#{index}"))
+                .spawn(move || shared.work())?;
+        }
+        Ok(workers)
+    }
+
+    /// Have the workers help with `batch`: as many as it has jobs for, up to all of them.
+    fn submit(&self, batch: Arc<StripBatch>) {
+        let wanted = batch.jobs.len().div_ceil(JOBS_PER_WORKER).min(self.threads);
+        let mut queue = lock(&self.shared.queue);
+        queue.batches.push_back(batch);
+        let wake = wanted.min(queue.sleeping);
+        drop(queue);
+        for _ in 0..wake {
+            self.shared.wake.notify_one();
+        }
+    }
+}
+
+impl Drop for StripWorkers {
+    fn drop(&mut self) {
+        lock(&self.shared.queue).shutdown = true;
+        self.shared.wake.notify_all();
+    }
+}
+
+impl StripWorkersShared {
+    /// A worker thread: work on the oldest batch with jobs left, or sleep until there is one.
+    fn work(&self) {
+        loop {
+            let batch = {
+                let mut queue = lock(&self.queue);
+                loop {
+                    while queue
+                        .batches
+                        .front()
+                        .is_some_and(|batch| batch.all_claimed())
+                    {
+                        queue.batches.pop_front();
+                    }
+                    if let Some(batch) = queue.batches.front() {
+                        break batch.clone();
+                    }
+                    if queue.shutdown {
+                        return;
+                    }
+                    queue.sleeping += 1;
+                    queue = self
+                        .wake
+                        .wait(queue)
+                        .unwrap_or_else(|error| error.into_inner());
+                    queue.sleeping -= 1;
+                }
+            };
+            // Jobs catch their own panics (see `StripBatch::run`).
+            batch.work();
+        }
+    }
+}
+
+/// Jobs of a batch per worker woken for it: a job takes around 10 µs, waking a worker a few.
+const JOBS_PER_WORKER: usize = 4;
+
 /// Paths whose strips any number of threads generate together. Each claims a few paths at a
 /// time until none are left, which keeps them balanced whatever the paths cost.
 ///
@@ -299,18 +407,30 @@ impl StripBatch {
         })
     }
 
-    /// Have every worker thread help.
-    fn start(self: &Arc<Self>, workers: &rayon::ThreadPool) {
-        for _ in 0..workers.current_num_threads() {
-            let batch = self.clone();
-            workers.spawn(move || batch.work());
-        }
+    /// Have the worker threads help.
+    fn start(self: &Arc<Self>, workers: &StripWorkers) {
+        #[cfg(test)]
+        bench_counters::BATCHES.fetch_add(1, Ordering::Relaxed);
+        workers.submit(self.clone());
+    }
+
+    /// Whether every job has been claimed by a thread.
+    fn all_claimed(&self) -> bool {
+        self.next.load(Ordering::Relaxed) >= self.jobs.len()
     }
 
     /// Run job `index` and keep its result, `None` if it panicked.
     fn run(&self, index: usize) {
+        #[cfg(test)]
+        let job_start = std::time::Instant::now();
         let strips =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.jobs[index].run()));
+        #[cfg(test)]
+        {
+            bench_counters::JOB_NANOS
+                .fetch_add(job_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            bench_counters::JOBS.fetch_add(1, Ordering::Relaxed);
+        }
         if strips.is_err() {
             warn_once(
                 &WARNED_JOB_PANIC,
@@ -371,6 +491,17 @@ impl StripBatch {
             .map(|strips| lock(strips).take().expect("every path was claimed"))
             .collect()
     }
+}
+
+/// What the benchmarks count of strip jobs (tests).
+#[cfg(test)]
+pub(crate) mod bench_counters {
+    use std::sync::atomic::AtomicU64;
+    /// Time spent running strip jobs, on all threads.
+    pub(crate) static JOB_NANOS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static JOBS: AtomicU64 = AtomicU64::new(0);
+    /// Batches handed to the worker threads.
+    pub(crate) static BATCHES: AtomicU64 = AtomicU64::new(0);
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -616,7 +747,7 @@ struct GpuThread {
     readback_buffer: Cell<Option<glow::NativeBuffer>>,
     /// Threads that generate path strips, started with the first batch that is worth it.
     /// `None` inside if they could not be started; paths are then prepared on this thread.
-    path_workers: std::cell::OnceCell<Option<rayon::ThreadPool>>,
+    path_workers: std::cell::OnceCell<Option<StripWorkers>>,
     /// A texture that only exists to be asked about. A context whose calls have stopped
     /// having any effect answers false to `glIsTexture`, without raising an error or a reset
     /// status (surfman creates contexts without reset notification).
@@ -825,17 +956,11 @@ impl GpuThread {
 
     /// The threads that generate path strips, started the first time they are asked for.
     /// `None` if they could not be started; paths are then prepared on this thread.
-    fn path_workers(&self) -> Option<&rayon::ThreadPool> {
+    fn path_workers(&self) -> Option<&StripWorkers> {
         self.path_workers
             .get_or_init(|| {
                 let threads = servo_config::pref!(thread_pool_canvas_workers).max(1) as usize;
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(threads)
-                    .thread_name(|index| format!("CanvasPaths#{index}"))
-                    // Jobs catch their own panics (see `StripBatch`); anything else that
-                    // panics on a pool thread must not abort the process either.
-                    .panic_handler(|_| warn!("GPU canvas: a path worker panicked"))
-                    .build()
+                StripWorkers::new(threads)
                     .inspect_err(|error| warn!("GPU canvas: no path workers: {error}"))
                     .ok()
             })
@@ -851,7 +976,6 @@ impl GpuThread {
         GPU_FAILED.with(|failed| failed.set(true));
         CONTEXT_LOSS_PENDING.with(|pending| pending.set(true));
     }
-
 
     /// The atlas image for `pixmap`, uploading it if this content is not cached, pinned once.
     fn pin_upload(&self, pixmap: &vello_cpu::Pixmap) -> Option<(UploadKey, ImageId)> {
@@ -1613,8 +1737,8 @@ impl VelloGpuDrawTarget {
                     break;
                 }
                 with_font(text_run, |font| {
-                    // A few glyphs per job, so that a long or costly run (strokes) spreads over
-                    // the threads too.
+                    // A long or costly run (strokes) is split, so that it spreads over the
+                    // threads too.
                     let all_glyphs: Vec<_> = glyphs(text_run).collect();
                     let mut jobs = all_glyphs.chunks(GLYPHS_PER_JOB).map(|chunk| {
                         self.scene.glyph_run_job(
@@ -2290,16 +2414,11 @@ mod strip_batch_tests {
         })
     }
 
-    /// A job that panics on a worker thread neither aborts the process (as an uncaught panic
-    /// on a rayon pool thread does) nor leaves `finish` waiting; the other jobs keep their
-    /// strips.
+    /// A job that panics on a worker thread neither takes the worker down nor leaves `finish`
+    /// waiting; the other jobs keep their strips.
     #[test]
     fn a_panicking_strip_job_is_dropped() {
-        let workers = rayon::ThreadPoolBuilder::new()
-            .num_threads(3)
-            .panic_handler(|_| panic!("a panic escaped a strip job"))
-            .build()
-            .unwrap();
+        let workers = StripWorkers::new(3).unwrap();
         let mut jobs: Vec<StripJob> = (0..40).map(|_| path_job()).collect();
         for index in [0, 17, 39] {
             jobs[index] = StripJob::Panic;
@@ -2320,5 +2439,15 @@ mod strip_batch_tests {
         let batch = StripBatch::new((0..8).map(|_| StripJob::Panic).collect());
         batch.start(&workers);
         assert!(batch.finish().iter().all(Option::is_none));
+        // A panic that escaped a job would have ended its worker thread. Every worker must
+        // be back asleep, waiting for the next batch.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while lock(&workers.shared.queue).sleeping != 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a strip worker did not survive the panicking jobs"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
