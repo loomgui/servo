@@ -355,6 +355,71 @@ fn glows<T: GenericDrawTarget>(t: &mut T, time: f64, count: u32, width: f64, hei
     }
 }
 
+/// CPU time of the whole process and of the calling thread so far.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn cpu_times() -> (Duration, Duration) {
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime(u32, u32);
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn GetCurrentThread() -> isize;
+        fn GetProcessTimes(
+            h: isize,
+            c: *mut FileTime,
+            e: *mut FileTime,
+            k: *mut FileTime,
+            u: *mut FileTime,
+        ) -> i32;
+        fn GetThreadTimes(
+            h: isize,
+            c: *mut FileTime,
+            e: *mut FileTime,
+            k: *mut FileTime,
+            u: *mut FileTime,
+        ) -> i32;
+    }
+    fn total(k: &FileTime, u: &FileTime) -> Duration {
+        let t = |f: &FileTime| (u64::from(f.1) << 32) | u64::from(f.0);
+        Duration::from_nanos((t(k) + t(u)) * 100)
+    }
+    let (mut c, mut e, mut k, mut u) = Default::default();
+    unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) };
+    let process = total(&k, &u);
+    unsafe { GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u) };
+    (process, total(&k, &u))
+}
+
+/// CPU time of the whole process and of the calling thread so far.
+#[cfg(not(windows))]
+#[allow(unsafe_code)]
+fn cpu_times() -> (Duration, Duration) {
+    #[repr(C)]
+    struct Timespec(i64, i64);
+    unsafe extern "C" {
+        fn clock_gettime(clock: u32, ts: *mut Timespec) -> i32;
+    }
+    #[cfg(target_os = "macos")]
+    const CLOCKS: (u32, u32) = (12, 16);
+    #[cfg(not(target_os = "macos"))]
+    const CLOCKS: (u32, u32) = (2, 3);
+    let read = |clock| {
+        let mut ts = Timespec(0, 0);
+        unsafe { clock_gettime(clock, &mut ts) };
+        Duration::new(ts.0 as u64, ts.1 as u32)
+    };
+    (read(CLOCKS.0), read(CLOCKS.1))
+}
+
+/// Pause between frames (`GPU_BENCH_IDLE_US`), as a page waits for its next animation frame.
+fn idle_between_frames() -> Option<Duration> {
+    std::env::var("GPU_BENCH_IDLE_US")
+        .ok()
+        .and_then(|us| us.parse().ok())
+        .map(Duration::from_micros)
+}
+
 struct Timing {
     per_frame: Duration,
 }
@@ -373,9 +438,21 @@ fn run<T: GenericDrawTarget>(
         after_frame(targets);
     }
     let frames = frames();
+    let idle = idle_between_frames();
+    use crate::vello_gpu_backend::bench_counters as counters;
+    for counter in [&counters::JOB_NANOS, &counters::JOBS, &counters::BATCHES] {
+        counter.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+    let (process_start, thread_start) = cpu_times();
     let start = Instant::now();
     let mut recording = Duration::ZERO;
+    let mut idled = Duration::ZERO;
     for frame in WARMUP_FRAMES..WARMUP_FRAMES + frames {
+        if let Some(idle) = idle {
+            let idle_start = Instant::now();
+            std::thread::sleep(idle);
+            idled += idle_start.elapsed();
+        }
         let frame_start = Instant::now();
         workload(targets, frame);
         recording += frame_start.elapsed();
@@ -383,6 +460,26 @@ fn run<T: GenericDrawTarget>(
             let _ = target.image_descriptor_and_serializable_data();
         }
         after_frame(targets);
+    }
+    let elapsed = start.elapsed() - idled;
+    // `GPU_BENCH_CPU=1`: CPU time per frame of the process and of the canvas thread.
+    if std::env::var_os("GPU_BENCH_CPU").is_some() {
+        let (process_end, thread_end) = cpu_times();
+        eprintln!(
+            "    CPU_ACCOUNT wall {:.3} ms, process cpu {:.3} ms, canvas thread cpu {:.3} ms per frame",
+            ms(elapsed / frames),
+            ms((process_end - process_start) / frames),
+            ms((thread_end - thread_start) / frames),
+        );
+        let load = |counter: &std::sync::atomic::AtomicU64| {
+            counter.load(std::sync::atomic::Ordering::Relaxed) / u64::from(frames)
+        };
+        eprintln!(
+            "    CPU_ACCOUNT strip jobs {:.3} ms in {} jobs, {} batches to the workers per frame",
+            load(&counters::JOB_NANOS) as f64 / 1e6,
+            load(&counters::JOBS),
+            load(&counters::BATCHES),
+        );
     }
     // `GPU_BENCH_SPLIT=1`: how much of a frame is the page's drawing calls, the rest being the
     // presentation (rasterization on the CPU backend, submission on the GPU backend).
@@ -394,7 +491,7 @@ fn run<T: GenericDrawTarget>(
         );
     }
     Timing {
-        per_frame: start.elapsed() / frames,
+        per_frame: elapsed / frames,
     }
 }
 

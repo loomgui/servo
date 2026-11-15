@@ -12,7 +12,9 @@
 
 use core::ops::RangeInclusive;
 
-use crate::{AtlasId, PathStripGenerator, PathStripSettings, PathStrips, Resources, Scene};
+use crate::{
+    AtlasId, PathStripGenerator, PathStripRange, PathStripSettings, PathStrips, Resources, Scene,
+};
 use alloc::vec::Vec;
 use glifo::GlyphPrepCache;
 use glifo::atlas::{PendingBitmapUpload, PendingClearRect};
@@ -371,8 +373,12 @@ pub struct GlyphRunStrips(GlyphRunResult);
 
 #[derive(Debug)]
 enum GlyphRunResult {
-    /// The transforms and strips of each glyph outline, in order.
-    Outlines(Vec<(Transforms, PathStrips)>),
+    /// The strips of every glyph outline, and the transforms and place in them of each, in
+    /// order.
+    Outlines {
+        strips: PathStrips,
+        outlines: Vec<(Transforms, PathStripRange)>,
+    },
     /// The run has glyphs that are not plain outlines (bitmaps, color layers); it is drawn
     /// into the scene as usual.
     Scene(GlyphRunJob),
@@ -385,6 +391,9 @@ pub struct GlyphRunCaches {
     prep: GlyphPrepCache,
     generator: PathStripGenerator,
     jobs: u32,
+    /// Strips and alpha values of the largest recent job: the room the next one starts with,
+    /// so that its buffers do not grow glyph by glyph.
+    capacity: (usize, usize),
 }
 
 /// Glyph run jobs a thread runs between two maintenances of its glyph caches.
@@ -398,12 +407,14 @@ impl GlyphRunJob {
             prep,
             generator,
             jobs,
+            capacity,
         } = caches;
         let mut collector = OutlineCollector {
             job: self,
             transforms: Transforms::new(),
             stroke: self.stroke.clone(),
             generator,
+            strips: PathStrips::appending_with_capacity(capacity.0, capacity.1),
             outlines: Vec::new(),
             other: false,
             paint: PaintType::Solid(BLACK),
@@ -428,13 +439,21 @@ impl GlyphRunJob {
             builder.fill_glyphs(self.glyphs.iter().copied());
         }
         *jobs += 1;
+        let (strips, alphas) = collector.strips.lens();
         if *jobs % JOBS_PER_CACHE_MAINTENANCE == 0 {
             prep.maintain();
+            // Let the room shrink back after a large run.
+            *capacity = (strips, alphas);
+        } else {
+            *capacity = (capacity.0.max(strips), capacity.1.max(alphas));
         }
         GlyphRunStrips(if collector.other {
             GlyphRunResult::Scene(self.clone())
         } else {
-            GlyphRunResult::Outlines(collector.outlines)
+            GlyphRunResult::Outlines {
+                strips: collector.strips,
+                outlines: collector.outlines,
+            }
         })
     }
 }
@@ -478,10 +497,10 @@ impl Scene {
     pub fn draw_glyph_run_strips(&mut self, resources: &mut Resources, strips: &GlyphRunStrips) {
         let saved = self.render_state().transforms.clone();
         match &strips.0 {
-            GlyphRunResult::Outlines(outlines) => {
-                for (transforms, strips) in outlines {
+            GlyphRunResult::Outlines { strips, outlines } => {
+                for (transforms, range) in outlines {
                     self.render_state_mut().transforms = transforms.clone();
-                    self.draw_path_strips(strips);
+                    self.draw_path_strip_range(strips, range);
                 }
             },
             GlyphRunResult::Scene(job) => {
@@ -558,7 +577,9 @@ struct OutlineCollector<'j> {
     transforms: Transforms,
     stroke: Option<Stroke>,
     generator: &'j mut PathStripGenerator,
-    outlines: Vec<(Transforms, PathStrips)>,
+    /// The strips of every outline so far, one after the other.
+    strips: PathStrips,
+    outlines: Vec<(Transforms, PathStripRange)>,
     other: bool,
     paint: PaintType,
 }
@@ -593,8 +614,10 @@ impl DrawSink for OutlineCollector<'_> {
             return;
         }
         let settings = self.settings();
-        let strips = self.generator.fill(path, self.job.fill_rule, &settings);
-        self.outlines.push((self.transforms.clone(), strips));
+        let range = self
+            .generator
+            .fill_into(path, self.job.fill_rule, &settings, &mut self.strips);
+        self.outlines.push((self.transforms.clone(), range));
     }
 
     fn fill_rect(&mut self, _rect: &Rect) {
@@ -650,8 +673,10 @@ impl glifo::GlyphRenderer for OutlineCollector<'_> {
             return;
         };
         let settings = self.settings();
-        let strips = self.generator.stroke(path, stroke, &settings);
-        self.outlines.push((self.transforms.clone(), strips));
+        let range = self
+            .generator
+            .stroke_into(path, stroke, &settings, &mut self.strips);
+        self.outlines.push((self.transforms.clone(), range));
     }
 
     fn set_paint_image(&mut self, _image: Image) {
