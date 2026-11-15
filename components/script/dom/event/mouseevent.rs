@@ -361,7 +361,10 @@ impl MouseEvent {
             self.uievent.Detail(),
             Point2D::new(self.ScreenX(), self.ScreenY()),
             Point2D::new(self.ClientX(), self.ClientY()),
-            Point2D::new(self.PageX(), self.PageY()),
+            // The page point recorded when the event was created. PageX() and PageY()
+            // fall back to scrollX/scrollY before dispatch, and each of those forces
+            // a synchronous layout query for every pointer event fired.
+            self.page_point.get(),
             self.modifiers.get(),
             button,
             self.buttons.get(),
@@ -420,7 +423,10 @@ impl MouseEvent {
             self.uievent.Detail(),
             Point2D::new(self.ScreenX(), self.ScreenY()),
             Point2D::new(self.ClientX(), self.ClientY()),
-            Point2D::new(self.PageX(), self.PageY()),
+            // The page point recorded when the event was created. PageX() and PageY()
+            // fall back to scrollX/scrollY before dispatch, and each of those forces
+            // a synchronous layout query for every pointer event fired.
+            self.page_point.get(),
             self.modifiers.get(),
             MouseButton::None,
             self.buttons.get(),
