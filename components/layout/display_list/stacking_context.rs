@@ -11,8 +11,9 @@ use embedder_traits::ViewportDetails;
 use euclid::{Point2D, Rect, SideOffsets2D, Size2D};
 use malloc_size_of_derive::MallocSizeOf;
 use paint_api::display_list::{
-    AxesScrollSensitivity, PaintDisplayListInfo, ReferenceFrameNodeInfo, ScrollType,
-    ScrollableNodeInfo, SpatialTreeNodeInfo, StickyNodeInfo, TouchAction,
+    AxesScrollSensitivity, PaintDisplayListInfo, ReferenceFrameBinding, ReferenceFrameBindingKind,
+    ReferenceFrameNodeInfo, ScrollType, ScrollableNodeInfo, SpatialTreeNodeInfo, StickyNodeInfo,
+    TouchAction,
 };
 use servo_base::id::ScrollTreeNodeId;
 use servo_base::print_tree::PrintTree;
@@ -20,10 +21,12 @@ use servo_config::opts::{DiagnosticsLogging, DiagnosticsLoggingOption};
 use servo_geometry::MaxRect;
 use style::Zero;
 use style::color::AbsoluteColor;
+use style::computed_values::background_attachment::SingleComputedValue as BackgroundAttachment;
 use style::computed_values::overflow_x::T as ComputedOverflow;
 use style::computed_values::position::T as ComputedPosition;
 use style::computed_values::text_decoration_style::T as TextDecorationStyle;
 use style::computed_values::text_decoration_thickness::T as TextDecorationThickness;
+use style::properties::ComputedValues;
 use style::values::computed::angle::Angle;
 use style::values::computed::{ClipRectOrAuto, Length, TextDecorationLine};
 use style::values::generics::box_::{OverflowClipMarginBox, Perspective};
@@ -48,6 +51,7 @@ use crate::geom::{
     AuOrAuto, LengthPercentageOrAuto, PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalSize,
     PhysicalVec,
 };
+use crate::move_bindings::{BoundFrameKind, MoveBatch, MoveBindings, PendingMove};
 use crate::style_ext::{ComputedValuesExt, TransformExt};
 
 #[derive(Clone)]
@@ -122,6 +126,12 @@ pub(crate) struct StackingContextTree {
     /// for things like `overflow`. More clips may be created later during WebRender
     /// display list construction, but they are never added here.
     pub clip_store: StackingContextTreeClipStore,
+
+    /// The reference frames of this tree that can move through a property binding.
+    /// They are only held here while the tree is built; the layout thread keeps them
+    /// with its other retained display list state afterwards.
+    #[ignore_malloc_size_of = "Only held while the tree is built"]
+    pub(crate) move_bindings: MoveBindings,
 }
 
 impl StackingContextTree {
@@ -133,13 +143,10 @@ impl StackingContextTree {
         pipeline_id: wr::PipelineId,
         first_reflow: bool,
         debug: &DiagnosticsLogging,
+        mut move_bindings: MoveBindings,
     ) -> Self {
-        let scrollable_overflow = fragment_tree.scrollable_overflow();
-        let scroll_area = scrollable_overflow.union(&fragment_tree.initial_containing_block);
-        let scroll_area = LayoutSize::from_untyped(Size2D::new(
-            scroll_area.size.width.to_f32_px(),
-            scroll_area.size.height.to_f32_px(),
-        ));
+        move_bindings.begin_stacking_context_tree();
+        let scroll_area = Self::scroll_area(fragment_tree);
 
         let viewport_size = viewport_details.layout_size();
         let paint_info = PaintDisplayListInfo::new(
@@ -188,6 +195,7 @@ impl StackingContextTree {
             root_stacking_context: StackingContext::root(root_scroll_node_id),
             paint_info,
             clip_store: Default::default(),
+            move_bindings,
         };
 
         let text_decorations = Default::default();
@@ -216,6 +224,18 @@ impl StackingContextTree {
         stacking_context_tree
     }
 
+    /// The size of the area the viewport can scroll over, which is the content size of
+    /// the root scroll node.
+    pub(crate) fn scroll_area(fragment_tree: &FragmentTree) -> LayoutSize {
+        let scrollable_overflow = fragment_tree.scrollable_overflow();
+        let scroll_area = scrollable_overflow.union(&fragment_tree.initial_containing_block);
+        LayoutSize::from_untyped(Size2D::new(
+            scroll_area.size.width.to_f32_px(),
+            scroll_area.size.height.to_f32_px(),
+        ))
+    }
+
+    #[expect(clippy::too_many_arguments)]
     fn push_reference_frame(
         &mut self,
         origin: LayoutPoint,
@@ -224,6 +244,7 @@ impl StackingContextTree {
         transform_style: wr::TransformStyle,
         transform: LayoutTransform,
         kind: wr::ReferenceFrameKind,
+        binding: Option<ReferenceFrameBinding>,
     ) -> ScrollTreeNodeId {
         self.paint_info.scroll_tree.add_scroll_tree_node(
             Some(parent_scroll_node_id),
@@ -233,8 +254,203 @@ impl StackingContextTree {
                 transform_style,
                 transform: transform.into(),
                 kind,
+                binding,
             }),
         )
+    }
+
+    /// The fragment being added would not follow the bound frames that enclose it, so
+    /// those frames must not move through their bindings.
+    fn taint_open_bound_frames(&mut self, only_origin_frames: bool) {
+        if !self.move_bindings.has_open_frames() {
+            return;
+        }
+        for node in self.move_bindings.taint_open_frames(only_origin_frames) {
+            self.paint_info
+                .scroll_tree
+                .update_reference_frame(node, |info| info.binding = None);
+        }
+    }
+
+    /// Whether content in the given spatial node is part of a 3d rendering context.
+    fn is_in_preserve_3d_context(&self, mut node_id: ScrollTreeNodeId) -> bool {
+        loop {
+            let node = self.paint_info.scroll_tree.get_node(node_id);
+            if let SpatialTreeNodeInfo::ReferenceFrame(info) = &node.info {
+                return info.transform_style == wr::TransformStyle::Preserve3D;
+            }
+            match node.parent {
+                Some(parent) => node_id = parent,
+                None => return false,
+            }
+        }
+    }
+
+    /// Apply the moves of one restyle to this tree, so that hit testing, queries and
+    /// the next full display list all see the boxes at their new places, and stage
+    /// the new value of each bound property.
+    ///
+    /// Returns false if this tree cannot take one of the moves. The tree may then be
+    /// partly changed and must be rebuilt.
+    pub(crate) fn apply_moves(
+        &mut self,
+        fragment_tree: &FragmentTree,
+        batch: &MoveBatch,
+        bindings: &mut MoveBindings,
+    ) -> bool {
+        // A box that moves can change how far its ancestors scroll. The scroll frames
+        // of this tree and of WebRender's scene hold the old extents, so only keep them
+        // if none changed.
+        if Self::scroll_area(fragment_tree) != self.paint_info.content_size {
+            return false;
+        }
+        for fragment in &batch.scroll_containers {
+            let Some(node_id) = fragment.generated_scroll_tree_node_id() else {
+                continue;
+            };
+            let SpatialTreeNodeInfo::Scroll(info) =
+                &self.paint_info.scroll_tree.get_node(node_id).info
+            else {
+                continue;
+            };
+            if info.content_rect != fragment.with_style().scrollable_overflow().to_webrender() {
+                return false;
+            }
+        }
+
+        for (index, pending) in &batch.moves {
+            let frame = bindings.frame(*index);
+            let (fragment, node, kind) = (frame.fragment.clone(), frame.node, frame.kind);
+            let new_kind = match (kind, pending) {
+                (
+                    BoundFrameKind::Origin {
+                        origin,
+                        query_origin,
+                    },
+                    PendingMove::Offset(offset),
+                ) => {
+                    let origin = origin + *offset;
+                    let query_origin = query_origin + *offset;
+                    if !self.move_origin_frame(&fragment, node, origin, query_origin, *offset) {
+                        return false;
+                    }
+                    BoundFrameKind::Origin {
+                        origin,
+                        query_origin,
+                    }
+                },
+                (BoundFrameKind::Transform { .. }, PendingMove::Transform(transform)) => {
+                    if !self
+                        .paint_info
+                        .scroll_tree
+                        .update_reference_frame(node, |info| info.transform = (*transform).into())
+                    {
+                        return false;
+                    }
+                    kind
+                },
+                _ => return false,
+            };
+            let value = match &self.paint_info.scroll_tree.get_node(node).info {
+                SpatialTreeNodeInfo::ReferenceFrame(info) => info.bound_transform(),
+                _ => None,
+            };
+            let Some(value) = value else {
+                return false;
+            };
+            bindings.stage(*index, new_kind, value);
+        }
+        true
+    }
+
+    /// Move the frame that was added around `fragment` to a new origin. The fragment
+    /// already has its new position.
+    fn move_origin_frame(
+        &mut self,
+        fragment: &Arc<BoxFragment>,
+        node: ScrollTreeNodeId,
+        origin: PhysicalPoint<Au>,
+        query_origin: PhysicalPoint<Au>,
+        offset: PhysicalVec<Au>,
+    ) -> bool {
+        if !self
+            .paint_info
+            .scroll_tree
+            .update_reference_frame(node, |info| {
+                info.origin = origin.to_webrender();
+                info.frame_origin_for_query = query_origin.to_webrender();
+            })
+        {
+            return false;
+        }
+
+        // The frame's coordinate system starts at the border box of the fragment, so
+        // the containing block the fragment is positioned in moves the other way.
+        // Everything else inside the frame is relative to the fragment and stays.
+        fn find<'a>(
+            stacking_context: &'a mut StackingContext,
+            fragment: &Arc<BoxFragment>,
+        ) -> Option<&'a mut StackingContext> {
+            if stacking_context
+                .fragment()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, fragment))
+            {
+                return Some(stacking_context);
+            }
+            stacking_context
+                .children
+                .iter_mut()
+                .find_map(|child| find(child, fragment))
+        }
+        let Some(stacking_context) = find(&mut self.root_stacking_context, fragment) else {
+            return false;
+        };
+        stacking_context.containing_block_origin -= offset;
+
+        // If the fragment scrolls its contents, its scrollable overflow is recorded
+        // relative to its containing block, like its own position.
+        if let Some(scroll_node_id) = fragment.generated_scroll_tree_node_id() &&
+            let SpatialTreeNodeInfo::Scroll(info) = &mut self
+                .paint_info
+                .scroll_tree
+                .get_node_mut(scroll_node_id)
+                .info
+        {
+            info.content_rect = fragment.with_style().scrollable_overflow().to_webrender();
+        }
+
+        // Descendants cache where their containing blocks are in the document.
+        fn translate_containing_blocks(fragments: &[Fragment], offset: PhysicalSize<Au>) {
+            for fragment in fragments {
+                match fragment {
+                    Fragment::LayoutRoot(layout_root) => {
+                        let box_fragment = Arc::clone(&*layout_root.inner_box_fragment());
+                        box_fragment
+                            .cumulative_containing_block_rect
+                            .translate(offset);
+                        translate_containing_blocks(&box_fragment.children, offset);
+                    },
+                    Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
+                        box_fragment
+                            .cumulative_containing_block_rect
+                            .translate(offset);
+                        translate_containing_blocks(&box_fragment.children, offset);
+                    },
+                    Fragment::Positioning(positioning_fragment) => {
+                        positioning_fragment
+                            .cumulative_containing_block_rect
+                            .translate(offset);
+                        translate_containing_blocks(&positioning_fragment.children, offset);
+                    },
+                    Fragment::AbsoluteOrFixedPositionedPlaceholder(_) |
+                    Fragment::Text(_) |
+                    Fragment::Image(_) |
+                    Fragment::IFrame(_) => {},
+                }
+            }
+        }
+        translate_containing_blocks(&fragment.children, offset.to_size());
+        true
     }
 
     fn define_scroll_frame(
@@ -545,7 +761,12 @@ impl Fragment {
                     text_decorations,
                 );
             },
-            Fragment::Text(_) | Fragment::Image(_) | Fragment::IFrame(_) => {},
+            Fragment::IFrame(_) => {
+                // WebRender places an iframe when it builds the scene, using the
+                // transforms around it at that time.
+                stacking_context_tree.taint_open_bound_frames(false);
+            },
+            Fragment::Text(_) | Fragment::Image(_) => {},
         }
     }
 }
@@ -591,6 +812,17 @@ impl BoxFragment {
         text_decorations: &Rc<Vec<FragmentTextDecoration>>,
     ) {
         self.clear_stacking_context_tree_traversal_data();
+        if stacking_context_tree.move_bindings.has_open_frames() {
+            // A fixed position box, or a fixed background, inside a box that is only
+            // translated stays where it is when that box moves.
+            let does_not_follow_ancestors = {
+                let style = self.style();
+                style.get_box().position == ComputedPosition::Fixed || has_fixed_background(&style)
+            };
+            if does_not_follow_ancestors {
+                stacking_context_tree.taint_open_bound_frames(true);
+            }
+        }
         self.build_stacking_context_tree_maybe_creating_reference_frame(
             fragment,
             stacking_context_tree,
@@ -610,21 +842,32 @@ impl BoxFragment {
         parent_stacking_context: &mut StackingContext,
         text_decorations: &Rc<Vec<FragmentTextDecoration>>,
     ) {
-        let reference_frame_data =
-            match self.reference_frame_data_if_necessary(&containing_block.rect) {
-                Some(reference_frame_data) => reference_frame_data,
-                None => {
-                    return self.build_stacking_context_tree_maybe_creating_stacking_context(
+        let reference_frame_data = match self
+            .reference_frame_data_if_necessary(&containing_block.rect)
+        {
+            Some(reference_frame_data) => reference_frame_data,
+            None => {
+                if self.should_have_bound_origin_frame(stacking_context_tree, containing_block) {
+                    return self.build_stacking_context_tree_in_bound_origin_frame(
                         fragment,
                         stacking_context_tree,
                         containing_block,
                         containing_block_info,
                         parent_stacking_context,
                         text_decorations,
-                        None, /* reference_frame_info */
                     );
-                },
-            };
+                }
+                return self.build_stacking_context_tree_maybe_creating_stacking_context(
+                    fragment,
+                    stacking_context_tree,
+                    containing_block,
+                    containing_block_info,
+                    parent_stacking_context,
+                    text_decorations,
+                    None, /* reference_frame_info */
+                );
+            },
+        };
 
         // <https://drafts.csswg.org/css-transforms/#transform-function-lists>
         // > If a transform function causes the current transformation matrix of an object
@@ -641,6 +884,12 @@ impl BoxFragment {
             )
             .origin
             .to_webrender();
+        let bound_kind =
+            self.bound_transform_frame_kind(stacking_context_tree, &reference_frame_data);
+        let binding = bound_kind.map(|_| ReferenceFrameBinding {
+            key: stacking_context_tree.move_bindings.next_key(),
+            kind: ReferenceFrameBindingKind::Transform,
+        });
         let new_spatial_id = stacking_context_tree.push_reference_frame(
             reference_frame_data.origin.to_webrender(),
             frame_origin_for_query,
@@ -648,7 +897,15 @@ impl BoxFragment {
             style.used_transform_style(self.base.flags).to_webrender(),
             reference_frame_data.transform,
             reference_frame_data.kind,
+            binding,
         );
+        if let Some(bound_kind) = bound_kind {
+            stacking_context_tree.move_bindings.enter_frame(
+                self.clone(),
+                new_spatial_id,
+                bound_kind,
+            );
+        }
 
         // WebRender reference frames establish a new coordinate system at their
         // origin (the border box of the fragment). We need to ensure that any
@@ -686,6 +943,138 @@ impl BoxFragment {
             text_decorations,
             Some(reference_frame_info),
         );
+        if bound_kind.is_some() {
+            stacking_context_tree.move_bindings.leave_frame();
+        }
+    }
+
+    /// The node and style conditions shared by both kinds of bound frame: the box
+    /// belongs to an element that was promoted, and the tree has room for the frame.
+    fn can_have_bound_frame(&self, stacking_context_tree: &StackingContextTree) -> bool {
+        let Some(tag) = self.base.tag else {
+            return false;
+        };
+        tag.pseudo_element_chain.is_empty() &&
+            stacking_context_tree.move_bindings.is_promoted(tag.node) &&
+            stacking_context_tree.move_bindings.can_add_frame() &&
+            !self.base.flags.intersects(
+                FragmentFlags::IS_ROOT_ELEMENT |
+                    FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT,
+            )
+    }
+
+    /// If the reference frame of this transformed box should have its transform bound
+    /// to a property, the kind of bound frame to register for it.
+    fn bound_transform_frame_kind(
+        &self,
+        stacking_context_tree: &StackingContextTree,
+        reference_frame_data: &ReferenceFrameData,
+    ) -> Option<BoundFrameKind> {
+        if !matches!(
+            reference_frame_data.kind,
+            wr::ReferenceFrameKind::Transform { .. }
+        ) || !self.can_have_bound_frame(stacking_context_tree)
+        {
+            return None;
+        }
+        Some(BoundFrameKind::Transform {
+            is_2d_scale_translation: is_2d_scale_translation(&reference_frame_data.transform),
+        })
+    }
+
+    /// Whether to add a reference frame around this box, which has none of its own, so
+    /// that a later change of its box offsets can move it through a property binding.
+    fn should_have_bound_origin_frame(
+        &self,
+        stacking_context_tree: &StackingContextTree,
+        containing_block: &ContainingBlock,
+    ) -> bool {
+        if !self.can_have_bound_frame(stacking_context_tree) {
+            return false;
+        }
+        {
+            let style = self.style();
+            if !style.get_box().position.is_absolutely_positioned() || has_fixed_background(&style)
+            {
+                return false;
+            }
+        }
+        // The frame is flat. Inside a 3d rendering context it would flatten the box.
+        !stacking_context_tree.is_in_preserve_3d_context(containing_block.scroll_node_id)
+    }
+
+    /// Build the stacking context tree for this absolutely positioned box inside a
+    /// reference frame that only translates it to its place. Unlike the frame of a
+    /// transformed box, this one leaves clips and containing blocks as they are: the
+    /// box is described exactly as it would be without the frame, in coordinates
+    /// relative to its own border box.
+    fn build_stacking_context_tree_in_bound_origin_frame(
+        self: &Arc<Self>,
+        fragment: Fragment,
+        stacking_context_tree: &mut StackingContextTree,
+        containing_block: &ContainingBlock,
+        containing_block_info: &ContainingBlockInfo,
+        parent_stacking_context: &mut StackingContext,
+        text_decorations: &Rc<Vec<FragmentTextDecoration>>,
+    ) {
+        let origin = self.border_rect().origin + containing_block.rect.origin.to_vector();
+        let query_origin = self
+            .cumulative_border_box_rect(
+                ContainingBlockCalculation::AlreadyDoneWithStackingContextTree,
+            )
+            .origin;
+        let binding = ReferenceFrameBinding {
+            key: stacking_context_tree.move_bindings.next_key(),
+            kind: ReferenceFrameBindingKind::Origin,
+        };
+        let frame_id = stacking_context_tree.push_reference_frame(
+            origin.to_webrender(),
+            query_origin.to_webrender(),
+            containing_block.scroll_node_id,
+            wr::TransformStyle::Flat,
+            LayoutTransform::identity(),
+            wr::ReferenceFrameKind::Transform {
+                is_2d_scale_translation: true,
+                should_snap: false,
+                paired_with_perspective: false,
+            },
+            Some(binding),
+        );
+        stacking_context_tree.move_bindings.enter_frame(
+            self.clone(),
+            frame_id,
+            BoundFrameKind::Origin {
+                origin,
+                query_origin,
+            },
+        );
+
+        let offset = origin.to_vector();
+        let adjusted_containing_block = ContainingBlock {
+            rect: containing_block.rect.translate(-offset),
+            scroll_node_id: frame_id,
+            // Without the frame, this box and its children take the scroll frame size
+            // from the containing block for non-absolute descendants at this place in
+            // the tree. Keep that.
+            scroll_frame_size: containing_block_info
+                .for_non_absolute_descendants
+                .scroll_frame_size,
+            accumulated_reference_frame_offset: containing_block.accumulated_reference_frame_offset +
+                offset,
+            ..containing_block.clone()
+        };
+        let new_containing_block_info =
+            containing_block_info.new_for_non_absolute_descendants(&adjusted_containing_block);
+        self.build_stacking_context_tree_maybe_creating_stacking_context(
+            fragment,
+            stacking_context_tree,
+            &adjusted_containing_block,
+            &new_containing_block_info,
+            parent_stacking_context,
+            text_decorations,
+            None, /* reference_frame_info */
+        );
+        stacking_context_tree.move_bindings.leave_frame();
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1247,6 +1636,10 @@ impl BoxFragment {
             offsets.left.non_auto().map(|v| v.to_f32_px()),
         );
 
+        // A sticky frame is placed relative to its scroll frame through the origins of
+        // the reference frames between them, not through their transforms.
+        stacking_context_tree.taint_open_bound_frames(true);
+
         let sticky_node_id = stacking_context_tree.define_sticky_frame(
             parent_scroll_node_id,
             frame_rect,
@@ -1310,55 +1703,91 @@ impl BoxFragment {
         &self,
         border_rect: &Rect<Au, CSSPixel>,
     ) -> Option<LayoutTransform> {
-        let style = self.style();
-        let list = &style.get_box().transform;
-        let length_rect = au_rect_to_length_rect(border_rect);
-        // https://drafts.csswg.org/css-transforms-2/#individual-transforms
-        let rotate = match style.clone_rotate() {
-            GenericRotate::Rotate(angle) => (0., 0., 1., angle),
-            GenericRotate::Rotate3D(x, y, z, angle) => {
-                // These are the raw, unormalized values from CSS, but euclid expects
-                // rotation input to be normalized, so we must do that first.
-                get_normalized_vector_and_angle(x, y, z, angle)
-            },
-            GenericRotate::None => (0., 0., 1., Angle::zero()),
-        };
-        let scale = match style.clone_scale() {
-            GenericScale::Scale(sx, sy, sz) => (sx, sy, sz),
-            GenericScale::None => (1., 1., 1.),
-        };
-        let translation = match style.clone_translate() {
-            GenericTranslate::Translate(x, y, z) => LayoutTransform::translation(
-                x.resolve(length_rect.size.width).px(),
-                y.resolve(length_rect.size.height).px(),
-                z.px(),
-            ),
-            GenericTranslate::None => LayoutTransform::identity(),
-        };
-
-        let angle = euclid::Angle::radians(rotate.3.radians());
-        let transform_base = list
-            .to_transform_3d_matrix(Some(&length_rect.to_untyped()))
-            .ok()?;
-        let transform = LayoutTransform::from_untyped(&transform_base.0)
-            .then_rotate(rotate.0, rotate.1, rotate.2, angle)
-            .then_scale(scale.0, scale.1, scale.2)
-            .then(&translation);
-
-        let transform_origin = &style.get_box().transform_origin;
-        let transform_origin_x = transform_origin
-            .horizontal
-            .to_used_value(border_rect.size.width)
-            .to_f32_px();
-        let transform_origin_y = transform_origin
-            .vertical
-            .to_used_value(border_rect.size.height)
-            .to_f32_px();
-        let transform_origin_z = transform_origin.depth.px();
-
-        Some(transform.change_basis(transform_origin_x, transform_origin_y, transform_origin_z))
+        transform_matrix_for_style(&self.style(), border_rect)
     }
+}
 
+/// Returns the 4D matrix for the transform properties of `style` on a box with the
+/// given border rectangle.
+pub(crate) fn transform_matrix_for_style(
+    style: &ComputedValues,
+    border_rect: &Rect<Au, CSSPixel>,
+) -> Option<LayoutTransform> {
+    let list = &style.get_box().transform;
+    let length_rect = au_rect_to_length_rect(border_rect);
+    // https://drafts.csswg.org/css-transforms-2/#individual-transforms
+    let rotate = match style.clone_rotate() {
+        GenericRotate::Rotate(angle) => (0., 0., 1., angle),
+        GenericRotate::Rotate3D(x, y, z, angle) => {
+            // These are the raw, unormalized values from CSS, but euclid expects
+            // rotation input to be normalized, so we must do that first.
+            get_normalized_vector_and_angle(x, y, z, angle)
+        },
+        GenericRotate::None => (0., 0., 1., Angle::zero()),
+    };
+    let scale = match style.clone_scale() {
+        GenericScale::Scale(sx, sy, sz) => (sx, sy, sz),
+        GenericScale::None => (1., 1., 1.),
+    };
+    let translation = match style.clone_translate() {
+        GenericTranslate::Translate(x, y, z) => LayoutTransform::translation(
+            x.resolve(length_rect.size.width).px(),
+            y.resolve(length_rect.size.height).px(),
+            z.px(),
+        ),
+        GenericTranslate::None => LayoutTransform::identity(),
+    };
+
+    let angle = euclid::Angle::radians(rotate.3.radians());
+    let transform_base = list
+        .to_transform_3d_matrix(Some(&length_rect.to_untyped()))
+        .ok()?;
+    let transform = LayoutTransform::from_untyped(&transform_base.0)
+        .then_rotate(rotate.0, rotate.1, rotate.2, angle)
+        .then_scale(scale.0, scale.1, scale.2)
+        .then(&translation);
+
+    let transform_origin = &style.get_box().transform_origin;
+    let transform_origin_x = transform_origin
+        .horizontal
+        .to_used_value(border_rect.size.width)
+        .to_f32_px();
+    let transform_origin_y = transform_origin
+        .vertical
+        .to_used_value(border_rect.size.height)
+        .to_f32_px();
+    let transform_origin_z = transform_origin.depth.px();
+
+    Some(transform.change_basis(transform_origin_x, transform_origin_y, transform_origin_z))
+}
+
+/// Whether WebRender treats this transform as a 2d scale and translation. This is the
+/// test WebRender applies to an unbound reference frame transform.
+pub(crate) fn is_2d_scale_translation(transform: &LayoutTransform) -> bool {
+    const NEARLY_ZERO: f32 = 1.0 / 4096.0;
+    (transform.m33 - 1.0).abs() < NEARLY_ZERO &&
+        (transform.m44 - 1.0).abs() < NEARLY_ZERO &&
+        transform.m12.abs() < NEARLY_ZERO &&
+        transform.m13.abs() < NEARLY_ZERO &&
+        transform.m14.abs() < NEARLY_ZERO &&
+        transform.m21.abs() < NEARLY_ZERO &&
+        transform.m23.abs() < NEARLY_ZERO &&
+        transform.m24.abs() < NEARLY_ZERO &&
+        transform.m31.abs() < NEARLY_ZERO &&
+        transform.m32.abs() < NEARLY_ZERO &&
+        transform.m34.abs() < NEARLY_ZERO &&
+        transform.m43.abs() < NEARLY_ZERO
+}
+
+fn has_fixed_background(style: &ComputedValues) -> bool {
+    style
+        .get_background()
+        .background_attachment
+        .0
+        .contains(&BackgroundAttachment::Fixed)
+}
+
+impl BoxFragment {
     /// Returns the 4D matrix representing this fragment's perspective.
     pub fn calculate_perspective_matrix(
         &self,

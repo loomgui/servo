@@ -2,14 +2,20 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::sync::Arc;
+
+use app_units::Au;
 use script::layout_dom::ServoLayoutNode;
+use style::properties::ComputedValues;
 
 use crate::context::LayoutContext;
 use crate::dom::{LayoutBox, NodeExt};
 use crate::flexbox::FlexLevelBox;
 use crate::flow::BlockLevelBox;
 use crate::flow::inline::InlineItem;
-use crate::fragment_tree::Fragment;
+use crate::fragment_tree::{BoxFragment, Fragment};
+use crate::geom::PhysicalVec;
+use crate::positioned::AbsolutelyPositionedBox;
 
 /// A data structure to track a layout root.
 ///
@@ -61,25 +67,22 @@ impl<'dom> TryFrom<ServoLayoutNode<'dom>> for LayoutRoot<'dom> {
 }
 
 impl<'dom> LayoutRoot<'dom> {
-    pub(crate) fn try_layout(&self, layout_context: &LayoutContext) -> bool {
-        let Some(inner_layout_data) = self.node.inner_layout_data_mut() else {
-            return false;
-        };
+    /// The absolutely positioned box of this layout root.
+    fn positioned_box(&self) -> Option<crate::cell::ArcRefCell<AbsolutelyPositionedBox>> {
+        let inner_layout_data = self.node.inner_layout_data()?;
         let layout_box = inner_layout_data.self_box.clone();
 
         let layout_box = layout_box.borrow();
-        let Some(layout_box) = &*layout_box else {
-            return false;
-        };
+        let layout_box = layout_box.as_ref()?;
 
-        let positioned_box = match layout_box {
+        Some(match layout_box {
             LayoutBox::BlockLevel(block_level) => {
                 let mut block_level = block_level.borrow_mut();
                 match &mut *block_level {
                     BlockLevelBox::OutOfFlowAbsolutelyPositionedBox(positioned_box) => {
                         positioned_box.clone()
                     },
-                    _ => return false,
+                    _ => return None,
                 }
             },
             LayoutBox::InlineLevel(InlineItem::OutOfFlowAbsolutelyPositionedBox(
@@ -92,10 +95,41 @@ impl<'dom> LayoutRoot<'dom> {
                     FlexLevelBox::OutOfFlowAbsolutelyPositionedBox(positioned_box) => {
                         positioned_box.clone()
                     },
-                    _ => return false,
+                    _ => return None,
                 }
             },
-            _ => return false,
+            _ => return None,
+        })
+    }
+
+    /// The style of this layout root changes to `new_style`, which differs from its
+    /// current style only in box offsets. If that only moves the box, return its
+    /// fragment and how far it moves; the fragment and its contents are otherwise
+    /// what a new layout would produce. Nothing is changed here.
+    pub(crate) fn offset_for_box_offsets_change(
+        &self,
+        new_style: &ComputedValues,
+    ) -> Option<(Arc<BoxFragment>, PhysicalVec<Au>)> {
+        let positioned_box = self.positioned_box()?;
+        let positioned_box = positioned_box.borrow();
+        let formatting_context = &positioned_box.context;
+        let fragments = formatting_context.base.fragments();
+        let Some(Fragment::LayoutRoot(layout_root_fragment)) = fragments.first() else {
+            return None;
+        };
+        let layout_inputs = formatting_context.layout_root_layout_inputs.borrow();
+        let offset = layout_inputs.as_ref()?.offset_for_box_offsets_change(
+            formatting_context,
+            formatting_context.style(),
+            new_style,
+        )?;
+        let box_fragment = Arc::clone(&*layout_root_fragment.inner_box_fragment());
+        Some((box_fragment, offset))
+    }
+
+    pub(crate) fn try_layout(&self, layout_context: &LayoutContext) -> bool {
+        let Some(positioned_box) = self.positioned_box() else {
+            return false;
         };
 
         let positioned_box = positioned_box.borrow();

@@ -1693,6 +1693,12 @@ impl LayoutThread {
 
         let mut box_tree = self.box_tree.borrow_mut();
         let mut layout_roots = Vec::new();
+        // A box moved in place is not laid out, so it is not reported as changed to
+        // the accessibility tree. Let moves take the ordinary path while that is on.
+        self.background_colors
+            .lock()
+            .moves
+            .begin_restyle(accessibility_damage.is_none());
         let damage = profile_time::profile_if_active(
             profile_time::ProfilerCategory::LayoutDamage,
             || self.profiler_metadata(),
@@ -1718,7 +1724,11 @@ impl LayoutThread {
             },
         );
 
-        if damage.contains(LayoutDamage::RebuildStackingContextTree) {
+        // Boxes that only moved are already in place in the fragment tree. If nothing
+        // else changed, the stacking context tree takes the same moves and the display
+        // list is kept; a property update moves the boxes on screen.
+        let moved_in_place = self.apply_moves_to_stacking_context_tree(damage);
+        if damage.contains(LayoutDamage::RebuildStackingContextTree) && !moved_in_place {
             self.background_colors.lock().invalidate();
             self.need_new_stacking_context_tree.set(true);
         }
@@ -1738,7 +1748,7 @@ impl LayoutThread {
         if !damage.contains(LayoutDamage::Relayout) {
             if damage.contains(LayoutDamage::RecalculateOverflow) {
                 assert!(self.need_new_display_list.get());
-                assert!(self.need_new_stacking_context_tree.get());
+                assert!(moved_in_place || self.need_new_stacking_context_tree.get());
                 self.fragment_tree
                     .borrow()
                     .as_ref()
@@ -1825,6 +1835,35 @@ impl LayoutThread {
         )
     }
 
+    /// Finish the moves that damage propagation applied to the fragment tree. If
+    /// those moves are the only change of this restyle, apply them to the stacking
+    /// context tree as well and stage the property updates that move the boxes on
+    /// screen. Returns whether that happened; if not, the stacking context tree has
+    /// to be rebuilt as for any other change of this kind.
+    fn apply_moves_to_stacking_context_tree(&self, damage: LayoutDamage) -> bool {
+        let mut cache = self.background_colors.lock();
+        let Some(batch) = cache.moves.finish_restyle() else {
+            return false;
+        };
+        if batch.other_damage ||
+            damage != LayoutDamage::RecalculateOverflow ||
+            !cache.retained_display_list_is_live() ||
+            self.need_new_stacking_context_tree.get() ||
+            self.need_containing_block_calculation.get()
+        {
+            return false;
+        }
+        let fragment_tree = self.fragment_tree.borrow();
+        let mut stacking_context_tree = self.stacking_context_tree.borrow_mut();
+        let (Some(fragment_tree), Some(stacking_context_tree)) =
+            (fragment_tree.as_ref(), stacking_context_tree.as_mut())
+        else {
+            return false;
+        };
+        fragment_tree.clear_scrollable_overflow();
+        stacking_context_tree.apply_moves(fragment_tree, &batch, &mut cache.moves)
+    }
+
     fn build_stacking_context_tree_for_reflow(&self, reflow_request: &ReflowRequest) -> bool {
         if !ReflowPhases::necessary(&reflow_request.reflow_goal)
             .contains(ReflowPhases::StackingContextTreeConstruction)
@@ -1844,7 +1883,13 @@ impl LayoutThread {
             return false;
         };
 
-        self.background_colors.lock().invalidate();
+        // The new tree registers the reference frames that can move through a
+        // property binding. The registry returns to the cache once the tree is built.
+        let move_bindings = {
+            let mut cache = self.background_colors.lock();
+            cache.invalidate();
+            std::mem::take(&mut cache.moves)
+        };
         let mut stacking_context_tree = self.stacking_context_tree.borrow_mut();
         let old_scroll_offsets = stacking_context_tree
             .as_ref()
@@ -1862,7 +1907,10 @@ impl LayoutThread {
             self.id.into(),
             !self.have_ever_generated_display_list.get(),
             &self.debug,
+            move_bindings,
         );
+        self.background_colors.lock().moves =
+            std::mem::take(&mut new_stacking_context_tree.move_bindings);
 
         // When a new StackingContextTree is built, it contains a freshly built
         // ScrollTree. We want to preserve any existing scroll offsets in that tree,
@@ -1923,12 +1971,19 @@ impl LayoutThread {
         // including canvas delays and the embedder's exact FrameBuilt tag gate.
         let eligible = self.retained_backgrounds_eligible(reflow_request, stacking_context_tree);
         // End the mutex borrow before waiting for the owner's validation ACK.
-        let updates = if eligible {
+        let mut updates = if eligible {
             self.background_colors.lock().take_updates()
         } else {
             None
         };
-        let phase = Self::submit_render_update(
+        // Bound reference frame transforms travel in the same batch as the colors.
+        let transforms = updates
+            .as_mut()
+            .map(|updates| updates.take_transforms())
+            .unwrap_or_default();
+        let has_transforms = !transforms.is_empty();
+        let has_colors = updates.as_ref().is_some_and(|updates| updates.has_colors());
+        let mut phase = Self::submit_render_update(
             updates,
             &self.background_colors,
             &self.need_new_display_list,
@@ -1939,12 +1994,13 @@ impl LayoutThread {
                     || self.profiler_metadata(),
                     &self.time_profiler_chan,
                     || {
-                        self.paint_api.update_background_colors(
+                        self.paint_api.update_retained_properties(
                             self.webview_id,
                             self.id,
                             reflow_request.epoch,
                             generation,
                             colors,
+                            transforms,
                         )
                     },
                 )
@@ -1961,6 +2017,13 @@ impl LayoutThread {
         );
         if phase == ReflowPhasesRun::UpdatedBackgroundColors {
             self.finish_background_color_commit(reflow_request, stacking_context_tree);
+            if has_transforms {
+                phase = if has_colors {
+                    phase | ReflowPhasesRun::UpdatedTransformBindings
+                } else {
+                    ReflowPhasesRun::UpdatedTransformBindings
+                };
+            }
         }
         phase
     }
@@ -2204,7 +2267,11 @@ impl LayoutThread {
         self.box_tree.borrow_mut().take();
         self.fragment_tree.borrow_mut().take();
         self.stacking_context_tree.borrow_mut().take();
-        self.background_colors.lock().begin_display_list();
+        {
+            let mut cache = self.background_colors.lock();
+            cache.begin_display_list();
+            cache.moves.begin_stacking_context_tree();
+        }
         self.need_new_display_list.set(false);
 
         // If the last display list was also empty a new one is not necessary.

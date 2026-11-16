@@ -540,6 +540,7 @@ impl Paint {
                 pipeline_id,
                 epoch,
                 colors,
+                transforms,
                 generation,
                 response,
             } => {
@@ -557,6 +558,7 @@ impl Paint {
                                 epoch,
                                 generation,
                                 colors,
+                                transforms,
                             )
                         },
                     )

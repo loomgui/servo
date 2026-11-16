@@ -7,16 +7,24 @@ use std::sync::Arc;
 use layout_api::{
     DangerousStyleElement, DangerousStyleNode, LayoutDamage, LayoutElement, LayoutNode,
 };
-use script::layout_dom::ServoLayoutNode;
+use script::layout_dom::{ServoLayoutElement, ServoLayoutNode};
 use style::context::{SharedStyleContext, StyleContext};
 use style::dom::{NodeInfo, TElement, TNode};
+use style::properties::{ComputedValues, LonghandId, PropertyDeclarationId};
 use style::selector_parser::RestyleDamage;
 use style::traversal::{DomTraversal, recalc_style_at};
+use style::values::generics::box_::Perspective;
+use webrender_api::units::LayoutTransform;
 
 use crate::BoxTree;
 use crate::context::LayoutContext;
+use crate::display_list::{is_2d_scale_translation, transform_matrix_for_style};
 use crate::dom::{DOMLayoutData, NodeExt};
+use crate::fragment_tree::BoxFragment;
+use crate::layout_box_base::LayoutBoxBase;
 use crate::layout_root::LayoutRoot;
+use crate::move_bindings::{BoundFrameKind, PendingMove};
+use crate::style_ext::ComputedValuesExt;
 
 pub struct RecalcStyle<'a> {
     context: &'a LayoutContext<'a>,
@@ -204,6 +212,12 @@ pub(crate) fn compute_damage_and_rebuild_box_tree_below_dirty_root<'dom>(
         return element_damage | damage_from_parent;
     }
 
+    // A new box that script positions through its `style` attribute is likely to be
+    // moved the same way.
+    if element_damage.contains(LayoutDamage::BoxDamage) {
+        promote_if_positioned_by_style_attribute(layout_context, element);
+    }
+
     let mut damage_set = ElementDamageSet {
         node,
         from_parent: damage_from_parent,
@@ -227,6 +241,59 @@ pub(crate) fn compute_damage_and_rebuild_box_tree_below_dirty_root<'dom>(
     // Apply the calculated damage to this element (perhaps triggering box tree layout),
     // and propagate resulting damage to ancestors.
     damage_set.apply_damage(layout_context, layout_roots)
+}
+
+/// Whether the element's own `style` attribute sets its box offsets or its transform.
+/// Such an element is placed by script, which usually goes on to move it: a tooltip or
+/// a dragged item that follows the pointer, a marker on a map. Giving its box a bound
+/// reference frame from the start lets the first move take the fast path. This is
+/// only a hint; it never decides whether a later change is a move.
+fn promote_if_positioned_by_style_attribute(
+    layout_context: &LayoutContext,
+    element: ServoLayoutElement<'_>,
+) {
+    #[expect(unsafe_code)]
+    let style_element = unsafe { element.dangerous_style_element() };
+    let Some(style_attribute) = style_element.style_attribute() else {
+        return;
+    };
+    let declarations = style_attribute.read_with(layout_context.style_context.guards.author);
+    let has = |longhand| declarations.contains(PropertyDeclarationId::Longhand(longhand));
+    let sets_box_offsets = (has(LonghandId::Left) || has(LonghandId::Right)) &&
+        (has(LonghandId::Top) || has(LonghandId::Bottom));
+    let sets_transform = has(LonghandId::Transform) || has(LonghandId::Translate);
+    if sets_box_offsets || sets_transform {
+        layout_context
+            .background_colors
+            .lock()
+            .moves
+            .promote(element.as_node().opaque());
+    }
+}
+
+/// If changing the style of the box of `base` to `new_style` only changes its
+/// transform, return its fragment and the new transform. The box keeps its reference
+/// frame and the frame keeps its kind, so its contents are unchanged.
+fn transform_for_transform_change(
+    base: &LayoutBoxBase,
+    new_style: &ComputedValues,
+) -> Option<(Arc<BoxFragment>, LayoutTransform)> {
+    if !base.style.same_except_transform(new_style) {
+        return None;
+    }
+    let fragments = base.fragments();
+    let [fragment] = fragments.as_slice() else {
+        return None;
+    };
+    let fragment = Arc::clone(&*fragment.retrieve_box_fragment()?);
+    if !new_style.has_effective_transform_or_perspective(fragment.base.flags) ||
+        new_style.get_box().perspective != Perspective::None
+    {
+        return None;
+    }
+    let transform = transform_matrix_for_style(new_style, &fragment.border_rect())?;
+    // The contents of a box with a non-invertible transform are not displayed.
+    transform.is_invertible().then_some((fragment, transform))
 }
 
 enum BoxDamageAction<'a> {
@@ -317,11 +384,112 @@ impl<'a> ElementDamageSet<'a> {
 
     /// Given the damage from this element, the parent, and children, determine what action to
     /// take for this element's boxes and return the damage that should be propagated to parents.
+    /// If the style change on this element only moves its box, and the display list
+    /// has a bound reference frame for that box, apply the move in place and return
+    /// the damage for the parent.
+    ///
+    /// The box is then where a new layout would put it, with the same fragments. If
+    /// anything else in this restyle needs a new stacking context tree or display
+    /// list, those are built from the moved fragment as usual. If nothing else does,
+    /// the move reaches the screen through the frame's property binding.
+    fn try_move_in_place(&self, layout_context: &LayoutContext<'_>) -> Option<LayoutDamage> {
+        // Only a change on this element alone can be a move of its box.
+        if !(self.from_parent | self.from_children).is_empty() {
+            return None;
+        }
+        let damage = self.on_element - LayoutDamage::RecomputeInlineContentSizes;
+        let changes_box_offsets = damage == LayoutDamage::Relayout;
+        if !changes_box_offsets && damage != LayoutDamage::RecalculateOverflow {
+            return None;
+        }
+        if !layout_context.background_colors.lock().moves.enabled() {
+            return None;
+        }
+
+        // A pseudo-element can take its style from this element, so it could change
+        // in ways the comparison of this element's styles does not show.
+        self.node.as_element()?;
+        let inner_layout_data = self.node.inner_layout_data()?;
+        if inner_layout_data.has_pseudo_boxes() {
+            return None;
+        }
+
+        let new_style = self.node.style(&layout_context.style_context);
+        let (fragment, pending) = if changes_box_offsets {
+            let layout_root = LayoutRoot::try_from(self.node).ok()?;
+            let mut only_box_offsets_changed = false;
+            self.node.with_layout_box_base(|base| {
+                only_box_offsets_changed = base.style.same_except_box_offsets(&new_style);
+            });
+            if !only_box_offsets_changed {
+                return None;
+            }
+            let (fragment, offset) = layout_root.offset_for_box_offsets_change(&new_style)?;
+            (fragment, PendingMove::Offset(offset))
+        } else {
+            let mut change = None;
+            self.node.with_layout_box_base(|base| {
+                change = transform_for_transform_change(base, &new_style);
+            });
+            let (fragment, transform) = change?;
+            (fragment, PendingMove::Transform(transform))
+        };
+
+        // This change is a move. Remember the node, so that its box has a bound frame
+        // in the next display list if it does not have one in this one.
+        let mut cache = layout_context.background_colors.lock();
+        cache.moves.promote(self.node.opaque());
+        if !cache.retained_display_list_is_live() {
+            return None;
+        }
+        let (index, frame) = cache.moves.frame_for(&fragment)?;
+        match (frame.kind, pending) {
+            (BoundFrameKind::Origin { .. }, PendingMove::Offset(offset)) => {
+                fragment.base.translate_rect(offset.to_size());
+            },
+            (
+                BoundFrameKind::Transform {
+                    is_2d_scale_translation: was_2d_scale_translation,
+                },
+                PendingMove::Transform(transform),
+            ) => {
+                // WebRender draws the contents of a 2d scale and translation in the
+                // coordinate system of their parent. Changing to or from one changes
+                // how the contents are drawn, which needs a new scene.
+                if is_2d_scale_translation(&transform) != was_2d_scale_translation {
+                    return None;
+                }
+            },
+            _ => return None,
+        }
+        cache.moves.record_move(index, pending);
+        drop(cache);
+
+        inner_layout_data.repair_style_after_move(&self.node, layout_context, &new_style);
+        // The scrollable overflow of a box is relative to its containing block, and
+        // includes its transform.
+        self.node.with_layout_box_base(|base| {
+            base.clear_scrollable_overflow_all_on_fragments();
+        });
+        Some(LayoutDamage::RecalculateOverflow)
+    }
+
     fn apply_damage(
         self,
         layout_context: &LayoutContext<'_>,
         layout_roots: &mut Vec<LayoutRoot<'a>>,
     ) -> LayoutDamage {
+        if !self.on_element.is_empty() {
+            if let Some(damage_for_parent) = self.try_move_in_place(layout_context) {
+                return damage_for_parent;
+            }
+            layout_context
+                .background_colors
+                .lock()
+                .moves
+                .note_other_damage();
+        }
+
         let only_layout_mode_damage =
             (self.from_parent | self.on_element | self.from_children).only_layout_modes();
 
@@ -444,6 +612,23 @@ impl<'a> ElementDamageSet<'a> {
                 self.node.with_layout_box_base_including_pseudos(|base| {
                     base.clear_scrollable_overflow_all_on_fragments();
                 });
+                // If a box below moved in place, its move may only keep the scroll
+                // frames of the display list if their extents are unchanged.
+                let mut cache = layout_context.background_colors.lock();
+                if cache.moves.has_moves() {
+                    self.node.with_layout_box_base_including_pseudos(|base| {
+                        for fragment in base.fragments().iter() {
+                            if let Some(box_fragment) = fragment.retrieve_box_fragment() &&
+                                box_fragment.generated_scroll_tree_node_id().is_some()
+                            {
+                                cache
+                                    .moves
+                                    .note_scroll_container(Arc::clone(&*box_fragment));
+                            }
+                        }
+                    });
+                }
+                drop(cache);
                 only_layout_mode_damage
             },
             BoxDamageAction::None => only_layout_mode_damage,
