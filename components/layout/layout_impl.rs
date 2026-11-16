@@ -1184,6 +1184,7 @@ impl LayoutThread {
         }
         reflow_phases_run |=
             self.build_display_list(&reflow_request, &image_resolver, &mut reflow_statistics);
+        layout_api::RepaintCounts::record(reflow_phases_run);
         if self.handle_update_scroll_node_request(&reflow_request) {
             reflow_phases_run.insert(ReflowPhasesRun::UpdatedScrollNodeOffset);
         }

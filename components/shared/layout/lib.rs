@@ -18,7 +18,7 @@ mod pseudo_element_chain;
 use std::any::Any;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::AtomicIsize;
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -694,6 +694,39 @@ impl ReflowPhasesRun {
                 | Self::UpdatedImageData
                 | Self::UpdatedBackgroundColors,
         )
+    }
+}
+
+/// How many reflows in this process sent each kind of repaint to the renderer.
+/// Embedders read it to check and report how often a repaint needed no new
+/// display list.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RepaintCounts {
+    /// Reflows that sent a complete display list.
+    pub display_lists: u64,
+    /// Reflows that sent only color updates for the retained display list.
+    pub retained_color_updates: u64,
+}
+
+static DISPLAY_LIST_REPAINTS: AtomicU64 = AtomicU64::new(0);
+static RETAINED_COLOR_REPAINTS: AtomicU64 = AtomicU64::new(0);
+
+impl RepaintCounts {
+    /// The counts since this process started.
+    pub fn current() -> Self {
+        Self {
+            display_lists: DISPLAY_LIST_REPAINTS.load(Ordering::Relaxed),
+            retained_color_updates: RETAINED_COLOR_REPAINTS.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Count the repaint, if any, of a reflow that ran these phases.
+    pub fn record(phases: ReflowPhasesRun) {
+        if phases.contains(ReflowPhasesRun::BuiltDisplayList) {
+            DISPLAY_LIST_REPAINTS.fetch_add(1, Ordering::Relaxed);
+        } else if phases.contains(ReflowPhasesRun::UpdatedBackgroundColors) {
+            RETAINED_COLOR_REPAINTS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
