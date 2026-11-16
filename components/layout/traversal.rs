@@ -226,6 +226,15 @@ pub(crate) fn compute_damage_and_rebuild_box_tree_below_dirty_root<'dom>(
         incoming_layout_root_count: layout_roots.len(),
     };
 
+    // A style change that only moves this element's box is applied right here, before
+    // its damage reaches the children. They are not laid out again, so their layout
+    // caches must stay as they are. From here on the element counts as undamaged;
+    // whatever its children need on their own is still handled below.
+    let moved_in_place = damage_set.try_move_in_place(layout_context);
+    if moved_in_place {
+        damage_set.on_element = LayoutDamage::empty();
+    }
+
     // Depending on the incoming damage, it can be isolated, meaning that some damage
     // doesn't get passed down to children.
     let damage_for_children = damage_set.isolate_incoming_damage();
@@ -240,7 +249,13 @@ pub(crate) fn compute_damage_and_rebuild_box_tree_below_dirty_root<'dom>(
 
     // Apply the calculated damage to this element (perhaps triggering box tree layout),
     // and propagate resulting damage to ancestors.
-    damage_set.apply_damage(layout_context, layout_roots)
+    let damage_for_parent = damage_set.apply_damage(layout_context, layout_roots);
+    if moved_in_place {
+        // A box that moved can change the scrollable overflow of every ancestor.
+        damage_for_parent | LayoutDamage::RecalculateOverflow
+    } else {
+        damage_for_parent
+    }
 }
 
 /// Whether the element's own `style` attribute sets its box offsets or its transform.
@@ -382,19 +397,21 @@ impl<'a> ElementDamageSet<'a> {
         }
     }
 
-    /// Given the damage from this element, the parent, and children, determine what action to
-    /// take for this element's boxes and return the damage that should be propagated to parents.
     /// If the style change on this element only moves its box, and the display list
     /// has a bound reference frame for that box, apply the move in place and return
-    /// the damage for the parent.
+    /// true. This runs before the element's damage is passed to its children.
     ///
     /// The box is then where a new layout would put it, with the same fragments. If
     /// anything else in this restyle needs a new stacking context tree or display
     /// list, those are built from the moved fragment as usual. If nothing else does,
     /// the move reaches the screen through the frame's property binding.
-    fn try_move_in_place(&self, layout_context: &LayoutContext<'_>) -> Option<LayoutDamage> {
-        // Only a change on this element alone can be a move of its box.
-        if !(self.from_parent | self.from_children).is_empty() {
+    fn try_move_in_place(&self, layout_context: &LayoutContext<'_>) -> bool {
+        self.move_in_place(layout_context).is_some()
+    }
+
+    fn move_in_place(&self, layout_context: &LayoutContext<'_>) -> Option<()> {
+        // A box whose ancestors are damaged may be laid out again with them.
+        if self.on_element.is_empty() || !self.from_parent.is_empty() {
             return None;
         }
         let damage = self.on_element - LayoutDamage::RecomputeInlineContentSizes;
@@ -471,18 +488,19 @@ impl<'a> ElementDamageSet<'a> {
         self.node.with_layout_box_base(|base| {
             base.clear_scrollable_overflow_all_on_fragments();
         });
-        Some(LayoutDamage::RecalculateOverflow)
+        Some(())
     }
 
+    /// Given the damage from this element, the parent, and children, determine what action to
+    /// take for this element's boxes and return the damage that should be propagated to parents.
     fn apply_damage(
         self,
         layout_context: &LayoutContext<'_>,
         layout_roots: &mut Vec<LayoutRoot<'a>>,
     ) -> LayoutDamage {
+        // A style change that was applied as a move left no damage on its element.
+        // Any other is one that a move through a property binding cannot carry.
         if !self.on_element.is_empty() {
-            if let Some(damage_for_parent) = self.try_move_in_place(layout_context) {
-                return damage_for_parent;
-            }
             layout_context
                 .background_colors
                 .lock()
