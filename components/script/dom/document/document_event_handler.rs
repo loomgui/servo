@@ -188,6 +188,9 @@ pub(crate) struct DocumentEventHandler {
     /// by the cursor.
     #[no_trace]
     current_cursor: Cell<Option<Cursor>>,
+    /// Whether a cursor refresh was left to the pending mouse move's hit test. See
+    /// [`Self::handle_refresh_cursor`].
+    cursor_refresh_deferred: Cell<bool>,
     /// <http://w3c.github.io/touch-events/#dfn-active-touch-point>
     active_touch_points: DomRefCell<Vec<Dom<Touch>>>,
     /// The active keyboard modifiers for the WebView. This is updated when receiving any input event.
@@ -228,6 +231,7 @@ impl DocumentEventHandler {
             most_recently_clicked_element: Default::default(),
             most_recent_mousemove_point: Default::default(),
             current_cursor: Default::default(),
+            cursor_refresh_deferred: Default::default(),
             active_touch_points: Default::default(),
             active_keyboard_modifiers: Default::default(),
             active_pointer_ids: Default::default(),
@@ -524,6 +528,7 @@ impl DocumentEventHandler {
 
         self.current_hover_target.set(None);
         self.most_recent_mousemove_point.set(None);
+        self.cursor_refresh_deferred.set(false);
     }
 
     fn handle_mouse_enter_leave_event(
@@ -617,10 +622,15 @@ impl DocumentEventHandler {
         // with the actual element under the pointer. Boundary events for hover
         // transitions are suppressed while pointer capture is active: per spec,
         // pointer events are retargeted to the capture element.
+        let cursor_refresh_deferred = self.cursor_refresh_deferred.replace(false);
         let Some(hit_test_result) = self
             .window
             .hit_test_from_input_event(hit_test_flags, input_event)
         else {
+            // This move cannot answer a cursor refresh that was left to it.
+            if cursor_refresh_deferred {
+                self.handle_refresh_cursor();
+            }
             return;
         };
 
@@ -633,15 +643,17 @@ impl DocumentEventHandler {
             }
         }
 
+        // Update the cursor when the mouse moves, if it has changed. This hit test ran on
+        // up-to-date layout at the newest mouse position, so it also answers a cursor
+        // refresh that was left to this move, even if the mouse did not move.
+        self.set_cursor(Some(hit_test_result.cursor));
+
         let old_mouse_move_point = self
             .most_recent_mousemove_point
             .replace(Some(hit_test_result.point_in_frame));
         if old_mouse_move_point == Some(hit_test_result.point_in_frame) {
             return;
         }
-
-        // Update the cursor when the mouse moves, if it has changed.
-        self.set_cursor(Some(hit_test_result.cursor));
 
         let Some(new_target) = hit_test_result
             .node
@@ -841,10 +853,21 @@ impl DocumentEventHandler {
         }
     }
 
+    /// The renderer produced a new frame, so the content under a mouse that did not move
+    /// may have changed (a scroll, an animation or a layout change), and with it the cursor.
     pub(crate) fn handle_refresh_cursor(&self) {
         let Some(most_recent_mousemove_point) = self.most_recent_mousemove_point.get() else {
             return;
         };
+
+        // A mouse move waiting for the next rendering update will flush layout, hit test
+        // the pointer's newest position and set the cursor from that result. Hit testing
+        // the older position now would only produce a cursor that the move replaces, so
+        // leave the refresh to the move's hit test instead of running a second one.
+        if self.mouse_move_event_index.borrow().is_some() {
+            self.cursor_refresh_deferred.set(true);
+            return;
+        }
 
         let Some(hit_test_result) = self
             .window
