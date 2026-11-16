@@ -58,6 +58,7 @@ use webrender_api::{
 };
 use wr::units::LayoutVector2D;
 
+use crate::background_color_cache::solid_border_color;
 use crate::context::{ImageResolver, ResolvedImage};
 use crate::display_list::background::BackgroundPainter;
 use crate::display_list::conversions::FilterToWebRender;
@@ -2315,18 +2316,48 @@ impl<'a> BuilderForBoxFragment<'a> {
 
         let current_color = style.get_inherited_text().clone_color();
         let style_color = BorderStyleColor::from_border(border, &current_color);
+        let common = builder.common_properties(state, self.border_rect, style);
+
+        // A solid border in one visible color is drawn white and tinted by a
+        // bound color. A later change of only that color then updates the
+        // binding instead of rebuilding the display list.
+        let bound_color = solid_border_color(style, &self.fragment.border)
+            .filter(|color| color.alpha > 0.0)
+            .map(|color| {
+                let color = rgba(color);
+                let key = builder
+                    .background_colors
+                    .bind_border(&self.fragment.box_fragment);
+                builder.paint_info.background_colors.push((key, color));
+                PropertyBinding::Binding(key, color)
+            });
+        let side = |style_color: BorderStyleColor| {
+            let mut side = self.build_border_side(style_color);
+            if bound_color.is_some() {
+                side.color = ColorF::WHITE;
+            }
+            side
+        };
         let details = wr::BorderDetails::Normal(wr::NormalBorder {
-            top: self.build_border_side(style_color.top),
-            right: self.build_border_side(style_color.right),
-            bottom: self.build_border_side(style_color.bottom),
-            left: self.build_border_side(style_color.left),
+            top: side(style_color.top),
+            right: side(style_color.right),
+            bottom: side(style_color.bottom),
+            left: side(style_color.left),
             radius: self.border_radius(),
             do_aa: true,
         });
-        let common = builder.common_properties(state, self.border_rect, style);
-        builder
-            .wr()
-            .push_border(&common, self.border_rect, border_widths, details)
+        match bound_color {
+            Some(tint) => builder.wr().push_border_with_tint(
+                &common,
+                self.border_rect,
+                border_widths,
+                details,
+                tint,
+            ),
+            None => builder
+                .wr()
+                .push_border(&common, self.border_rect, border_widths, details),
+        }
     }
 
     /// Add a display item for image borders if necessary.

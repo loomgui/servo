@@ -2,31 +2,40 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Retain the identities of background primitives, never rasterized pixels.
-//! The damage walk or a complete certified empty-leaf batch may add deltas.
+//! Retain the identities of background and border primitives, never
+//! rasterized pixels. The damage walk may add background and border color
+//! deltas; a complete certified empty-leaf batch may add background deltas.
 //! Any unrecognized repaint makes
 //! the whole batch ineligible until a complete display list replaces it.
 
 use std::sync::Arc;
 
+use app_units::Au;
 use layout_api::ReflowStatistics;
 use rustc_hash::FxHashMap;
 use servo_base::id::ColorBindingId;
+use style::color::AbsoluteColor;
+use style::computed_values::border_collapse::T as BorderCollapse;
 use style::data::BackgroundColorChangeWitness;
 use style::dom::OpaqueNode;
 use style::inline_background::BackgroundStyleReuse;
 use style::properties::ComputedValues;
+use style::values::computed::BorderStyle;
 use webrender_api::{ColorF, PropertyBindingKey, PropertyValue};
 
 use crate::display_list::rgba;
 use crate::fragment_tree::{BoxFragment, FragmentFlags, FragmentStatus};
+use crate::geom::PhysicalSides;
 use crate::layout_box_base::LayoutBoxBase;
+use crate::style_ext::BorderStyleColor;
 
 #[derive(Default)]
 pub(crate) struct BackgroundColorCache {
     // Holding the Arc ensures that an address cannot be recycled within this
     // display list's lifetime, even if a later reflow reconstructs a subtree.
     bindings: FxHashMap<usize, (Arc<BoxFragment>, PropertyBindingKey<ColorF>)>,
+    // Borders drawn in one bound color, keyed and kept alive like `bindings`.
+    border_bindings: FxHashMap<usize, (Arc<BoxFragment>, PropertyBindingKey<ColorF>)>,
     keys: Vec<PropertyBindingKey<ColorF>>,
     next_key: usize,
     generation: u64,
@@ -156,6 +165,7 @@ impl BackgroundColorCache {
             .expect("Background display-list generation exhausted");
         self.clear_reusable_styles();
         self.bindings.clear();
+        self.border_bindings.clear();
         self.next_key = 0;
         self.changed_fragments.clear();
         self.pending = Some(Vec::new());
@@ -319,6 +329,22 @@ impl BackgroundColorCache {
         key
     }
 
+    /// The key that tints this fragment's border. Only for a border that
+    /// [`solid_border_color`] accepts.
+    pub(crate) fn bind_border(
+        &mut self,
+        fragment: &Arc<BoxFragment>,
+    ) -> PropertyBindingKey<ColorF> {
+        // As in `bind`, every paint of this fragment shares one key.
+        if let Some((_, key)) = self.border_bindings.get(&(Arc::as_ptr(fragment) as usize)) {
+            return *key;
+        }
+        let key = self.next_key();
+        self.border_bindings
+            .insert(Arc::as_ptr(fragment) as usize, (fragment.clone(), key));
+        key
+    }
+
     pub(crate) fn record_style_change(
         &mut self,
         base: &LayoutBoxBase,
@@ -329,21 +355,38 @@ impl BackgroundColorCache {
             return;
         }
         let old = &base.style;
-        if !background_color_only(old, new, witness) {
+        if !colors_only(old, new, witness) {
             self.invalidate();
             return;
         }
-        if old.get_background().background_color == new.get_background().background_color {
+        let background_changed =
+            old.get_background().background_color != new.get_background().background_color;
+        let border_changed = border_colors_differ(old, new);
+        if !background_changed && !border_changed {
             return;
         }
-        let old_color = old.resolve_color(&old.get_background().background_color);
-        let new_color = new.resolve_color(&new.get_background().background_color);
-        if old_color.alpha != 1.0
-            || new_color.alpha != 1.0
-            || base.base_fragment_info.flags.intersects(
-                FragmentFlags::IS_ROOT_ELEMENT
-                    | FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT,
-            )
+        let mut background = None;
+        if background_changed {
+            let old_color = old.resolve_color(&old.get_background().background_color);
+            let new_color = new.resolve_color(&new.get_background().background_color);
+            if old_color.alpha != 1.0
+                || new_color.alpha != 1.0
+                || base.base_fragment_info.flags.intersects(
+                    FragmentFlags::IS_ROOT_ELEMENT
+                        | FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT,
+                )
+            {
+                self.invalidate();
+                return;
+            }
+            background = Some(rgba(new_color));
+        }
+        // In the collapsing border model, table layout resolves each grid
+        // edge's color and stores it on the table grid. Only relayout
+        // refreshes it, so never retain a border color there.
+        if border_changed
+            && (old.get_inherited_table().border_collapse == BorderCollapse::Collapse
+                || new.get_inherited_table().border_collapse == BorderCollapse::Collapse)
         {
             self.invalidate();
             return;
@@ -358,16 +401,30 @@ impl BackgroundColorCache {
                 self.invalidate();
                 return;
             };
-            let Some((bound_fragment, key)) = self.bindings.get(&(Arc::as_ptr(&fragment) as usize))
-            else {
-                self.invalidate();
-                return;
-            };
-            self.pending
-                .as_mut()
-                .unwrap()
-                .push(key.with(rgba(new_color)));
-            self.changed_fragments.push(bound_fragment.clone());
+            let identity = Arc::as_ptr(&fragment) as usize;
+            if let Some(color) = background {
+                let Some((_, key)) = self.bindings.get(&identity) else {
+                    self.invalidate();
+                    return;
+                };
+                self.pending.as_mut().unwrap().push(key.with(color));
+            }
+            if border_changed {
+                // The binding exists only if this fragment drew the old border
+                // in one bound color; the new one must be drawable the same
+                // way. A fragment without a binding may leave the border to
+                // another fragment (a table wrapper leaves it to its grid), so
+                // it is never skipped.
+                let (Some((_, key)), Some(color)) = (
+                    self.border_bindings.get(&identity),
+                    solid_border_color(new, &fragment.border),
+                ) else {
+                    self.invalidate();
+                    return;
+                };
+                self.pending.as_mut().unwrap().push(key.with(rgba(color)));
+            }
+            self.changed_fragments.push(Arc::clone(&fragment));
         }
     }
 
@@ -454,9 +511,10 @@ impl BackgroundColorCache {
     }
 }
 
+/// Whether the styles differ at most in background-color and border colors.
 /// A producer proof applies only to its exact final style pair. A stale or
 /// unrelated proof follows the ordinary comparison path in this same call.
-fn background_color_only(
+fn colors_only(
     old: &ComputedValues,
     new: &ComputedValues,
     witness: Option<&BackgroundColorChangeWitness>,
@@ -468,7 +526,44 @@ fn background_color_only(
     }
     #[cfg(test)]
     STRICT_BACKGROUND_COMPARISONS.with(|count| count.set(count.get() + 1));
-    old.same_except_background_color(new)
+    old.same_except_background_and_border_colors(new)
+}
+
+fn border_colors_differ(old: &ComputedValues, new: &ComputedValues) -> bool {
+    let (old, new) = (old.get_border(), new.get_border());
+    !std::ptr::eq(old, new)
+        && (old.border_top_color != new.border_top_color
+            || old.border_right_color != new.border_right_color
+            || old.border_bottom_color != new.border_bottom_color
+            || old.border_left_color != new.border_left_color)
+}
+
+/// The color of a border whose sides with a width are all solid and share one
+/// color. Such a border can be drawn white and tinted by a bound color, so a
+/// later change of that color needs no new display list. `widths` are the
+/// fragment's used border widths.
+pub(crate) fn solid_border_color(
+    style: &ComputedValues,
+    widths: &PhysicalSides<Au>,
+) -> Option<AbsoluteColor> {
+    let current_color = style.get_inherited_text().clone_color();
+    let sides = BorderStyleColor::from_border(style.get_border(), &current_color);
+    let mut color = None;
+    for (side, width) in [
+        (&sides.top, widths.top),
+        (&sides.right, widths.right),
+        (&sides.bottom, widths.bottom),
+        (&sides.left, widths.left),
+    ] {
+        if width == Au(0) {
+            continue;
+        }
+        if side.style != BorderStyle::Solid || color.is_some_and(|color| color != side.color) {
+            return None;
+        }
+        color = Some(side.color);
+    }
+    color
 }
 
 #[cfg(test)]
@@ -1059,6 +1154,232 @@ mod tests {
             .flags
             .insert(style::computed_value_flags::ComputedValueFlags::HAS_TEXT_DECORATION_LINES);
         assert!(!black.same_except_background_color(&changed));
+    }
+
+    const BORDER_KEY: usize = 1_000;
+
+    fn border_widths() -> PhysicalSides<Au> {
+        PhysicalSides::new_all_same(Au::from_px(2))
+    }
+
+    fn translucent_red() -> AbsoluteColor {
+        AbsoluteColor::srgb_legacy(255, 0, 0, 0.5)
+    }
+
+    /// A style with this background and a solid border in one color.
+    fn bordered(background: Color, border: Color) -> ServoArc<ComputedValues> {
+        let mut style = (*style(background)).clone();
+        let sides = style.mutate_border();
+        sides.border_top_style = BorderStyle::Solid;
+        sides.border_right_style = BorderStyle::Solid;
+        sides.border_bottom_style = BorderStyle::Solid;
+        sides.border_left_style = BorderStyle::Solid;
+        sides.border_top_color = border.clone();
+        sides.border_right_color = border.clone();
+        sides.border_bottom_color = border.clone();
+        sides.border_left_color = border;
+        ServoArc::new(style)
+    }
+
+    /// A box with 2px borders whose background is bound to key `id` and whose
+    /// border is bound to key `BORDER_KEY + id`.
+    fn bordered_box(
+        cache: &mut BackgroundColorCache,
+        id: usize,
+        style: ServoArc<ComputedValues>,
+    ) -> LayoutBoxBase {
+        let info = BaseFragmentInfo::new_for_testing(id);
+        let fragment = Arc::new(BoxFragment::new(
+            info,
+            style.clone(),
+            Vec::new(),
+            PhysicalRect::zero(),
+            Default::default(),
+            border_widths(),
+            Default::default(),
+            None,
+        ));
+        fragment.base.set_status(FragmentStatus::Clean);
+        let identity = Arc::as_ptr(&fragment) as usize;
+        cache.bindings.insert(
+            identity,
+            (fragment.clone(), PropertyBindingKey::new(id as u64)),
+        );
+        cache.border_bindings.insert(
+            identity,
+            (
+                fragment.clone(),
+                PropertyBindingKey::new((BORDER_KEY + id) as u64),
+            ),
+        );
+        let base = LayoutBoxBase::new(info, style);
+        base.set_fragment(Fragment::Box(fragment));
+        base
+    }
+
+    #[test]
+    fn border_color_change_updates_only_the_border_binding() {
+        let resting = bordered(Color::BLACK, Color::Absolute(translucent_red()));
+        let hovered = bordered(Color::BLACK, Color::WHITE);
+        let mut cache = BackgroundColorCache::default();
+        cache.begin_display_list();
+        let mut base = bordered_box(&mut cache, 1, resting.clone());
+        let mut statistics = ReflowStatistics::default();
+
+        change(&mut cache, &mut base, &hovered);
+        let values = collect_updates(&mut cache, &mut statistics).unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].key.id.uid as usize, BORDER_KEY + 1);
+        assert_eq!(values[0].value, ColorF::WHITE);
+
+        // A translucent color is retained as well.
+        change(&mut cache, &mut base, &resting);
+        let values = collect_updates(&mut cache, &mut statistics).unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].key.id.uid as usize, BORDER_KEY + 1);
+        assert_eq!(values[0].value, ColorF::new(1.0, 0.0, 0.0, 0.5));
+        assert_eq!(statistics.restyle_fragment_count, 2);
+    }
+
+    #[test]
+    fn background_and_border_change_together_and_count_the_fragment_once() {
+        let resting = bordered(Color::BLACK, Color::BLACK);
+        let hovered = bordered(Color::WHITE, Color::WHITE);
+        let mut cache = BackgroundColorCache::default();
+        cache.begin_display_list();
+        let mut base = bordered_box(&mut cache, 1, resting);
+        change(&mut cache, &mut base, &hovered);
+        let mut statistics = ReflowStatistics::default();
+        let values = collect_updates(&mut cache, &mut statistics).unwrap();
+        let mut keys: Vec<_> = values
+            .iter()
+            .map(|value| value.key.id.uid as usize)
+            .collect();
+        keys.sort();
+        assert_eq!(keys, [1, BORDER_KEY + 1]);
+        assert!(values.iter().all(|value| value.value == ColorF::WHITE));
+        assert_eq!(statistics.restyle_fragment_count, 1);
+    }
+
+    #[test]
+    fn border_color_change_without_a_retainable_border_forces_full_display_list() {
+        let resting = bordered(Color::BLACK, Color::BLACK);
+        let hovered = bordered(Color::BLACK, Color::WHITE);
+
+        // The old border was not drawn in one bound color.
+        let mut cache = BackgroundColorCache::default();
+        cache.begin_display_list();
+        let mut base = bordered_box(&mut cache, 1, resting.clone());
+        cache.border_bindings.clear();
+        change(&mut cache, &mut base, &hovered);
+        assert!(cache.pending.is_none());
+
+        // The new sides do not share one color.
+        cache.begin_display_list();
+        let mut base = bordered_box(&mut cache, 2, resting.clone());
+        let mut uneven = (*hovered).clone();
+        uneven.mutate_border().border_top_color = Color::BLACK;
+        change(&mut cache, &mut base, &ServoArc::new(uneven));
+        assert!(cache.pending.is_none());
+
+        // A border style changes along with the color.
+        cache.begin_display_list();
+        let mut base = bordered_box(&mut cache, 3, resting.clone());
+        let mut dashed = (*hovered).clone();
+        dashed.mutate_border().border_top_style = BorderStyle::Dashed;
+        change(&mut cache, &mut base, &ServoArc::new(dashed));
+        assert!(cache.pending.is_none());
+
+        // The collapsing border model keeps its colors on the table grid.
+        let collapsing = |style: &ServoArc<ComputedValues>| {
+            let mut style = (**style).clone();
+            style.mutate_inherited_table().border_collapse = BorderCollapse::Collapse;
+            ServoArc::new(style)
+        };
+        cache.begin_display_list();
+        let mut base = bordered_box(&mut cache, 4, collapsing(&resting));
+        change(&mut cache, &mut base, &collapsing(&hovered));
+        assert!(cache.pending.is_none());
+
+        // One unretainable border makes the whole batch ineligible.
+        cache.begin_display_list();
+        let mut first = bordered_box(&mut cache, 5, resting.clone());
+        let mut second = bordered_box(&mut cache, 6, collapsing(&resting));
+        change(&mut cache, &mut first, &hovered);
+        change(&mut cache, &mut second, &collapsing(&hovered));
+        assert!(cache.take_updates().is_none());
+        assert!(cache.pending.is_none());
+    }
+
+    #[test]
+    fn currentcolor_border_is_retained_only_while_color_is_unchanged() {
+        let resting = bordered(Color::BLACK, Color::currentcolor());
+
+        // `color` changed: the border resolves differently, and so may text.
+        let mut recolored = (*resting).clone();
+        recolored.mutate_inherited_text().color = AbsoluteColor::WHITE;
+        assert!(!resting.same_except_background_and_border_colors(&recolored));
+        let mut cache = BackgroundColorCache::default();
+        cache.begin_display_list();
+        let mut base = bordered_box(&mut cache, 1, resting.clone());
+        change(&mut cache, &mut base, &ServoArc::new(recolored));
+        assert!(cache.pending.is_none());
+
+        // Replacing `currentcolor` itself only changes the border color.
+        cache.begin_display_list();
+        let mut base = bordered_box(&mut cache, 2, resting);
+        change(&mut cache, &mut base, &bordered(Color::BLACK, Color::WHITE));
+        let values = collect_updates(&mut cache, &mut ReflowStatistics::default()).unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].key.id.uid as usize, BORDER_KEY + 2);
+        assert_eq!(values[0].value, ColorF::WHITE);
+    }
+
+    #[test]
+    fn solid_border_color_needs_one_color_on_every_side_with_a_width() {
+        let widths = border_widths();
+        let style = bordered(Color::BLACK, Color::Absolute(translucent_red()));
+        assert_eq!(solid_border_color(&style, &widths), Some(translucent_red()));
+        assert_eq!(
+            solid_border_color(&style, &PhysicalSides::new_all_same(Au(0))),
+            None
+        );
+
+        let mut uneven = (*style).clone();
+        uneven.mutate_border().border_left_color = Color::WHITE;
+        assert_eq!(solid_border_color(&uneven, &widths), None);
+        // A side without a width is not painted, so its color does not count.
+        let mut no_left = widths;
+        no_left.left = Au(0);
+        assert_eq!(
+            solid_border_color(&uneven, &no_left),
+            Some(translucent_red())
+        );
+
+        let mut dashed = (*style).clone();
+        dashed.mutate_border().border_top_style = BorderStyle::Dashed;
+        assert_eq!(solid_border_color(&dashed, &widths), None);
+
+        let mut current = (*bordered(Color::BLACK, Color::currentcolor())).clone();
+        current.mutate_inherited_text().color = AbsoluteColor::WHITE;
+        assert_eq!(
+            solid_border_color(&current, &widths),
+            Some(AbsoluteColor::WHITE)
+        );
+    }
+
+    #[test]
+    fn generated_comparator_ignores_only_the_colors_of_a_border() {
+        let resting = bordered(Color::BLACK, Color::BLACK);
+        let hovered = bordered(Color::WHITE, Color::WHITE);
+        assert!(resting.same_except_background_and_border_colors(&hovered));
+        assert!(!resting.same_except_background_color(&hovered));
+        let mut dashed = (*hovered).clone();
+        dashed.mutate_border().border_top_style = BorderStyle::Dashed;
+        assert!(!resting.same_except_background_and_border_colors(&dashed));
+        let mut faded = (*hovered).clone();
+        faded.mutate_effects().opacity = 0.5;
+        assert!(!resting.same_except_background_and_border_colors(&faded));
     }
 }
 
