@@ -95,13 +95,35 @@ pub(crate) struct MoveBatch {
     pub(crate) other_damage: bool,
 }
 
+/// Keys that one stacking context tree after another hands out in the same order.
+#[derive(Default)]
+struct KeyPool {
+    keys: Vec<PropertyBindingKey<LayoutTransform>>,
+    next: usize,
+}
+
+impl KeyPool {
+    fn next_key(&mut self) -> PropertyBindingKey<LayoutTransform> {
+        if self.next == self.keys.len() {
+            // Transform and color properties are separate in WebRender, so the ids only
+            // need to be unique among transform bindings.
+            self.keys
+                .push(PropertyBindingKey::new(ColorBindingId::new().into()));
+        }
+        let key = self.keys[self.next];
+        self.next += 1;
+        key
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct MoveBindings {
     /// Nodes whose boxes get a bound frame when the stacking context tree is built.
     promoted: FxHashSet<OpaqueNode>,
-    /// Binding keys, reused by every stacking context tree in order.
-    keys: Vec<PropertyBindingKey<LayoutTransform>>,
-    next_key: usize,
+    /// Binding keys, reused by every stacking context tree in order, one pool for
+    /// each kind of frame. See [`Self::next_key`] for why they are kept apart.
+    origin_keys: KeyPool,
+    transform_keys: KeyPool,
     /// The bound frames of the current stacking context tree.
     frames: Vec<BoundFrame>,
     by_fragment: FxHashMap<usize, usize>,
@@ -134,7 +156,8 @@ impl MoveBindings {
         self.frames.clear();
         self.by_fragment.clear();
         self.open.clear();
-        self.next_key = 0;
+        self.origin_keys.next = 0;
+        self.transform_keys.next = 0;
         self.moved.clear();
         self.staged.clear();
     }
@@ -143,16 +166,21 @@ impl MoveBindings {
         self.frames.len() < MAX_BOUND_FRAMES
     }
 
-    pub(crate) fn next_key(&mut self) -> PropertyBindingKey<LayoutTransform> {
-        if self.next_key == self.keys.len() {
-            // Transform and color properties are separate in WebRender, so the ids only
-            // need to be unique among transform bindings.
-            self.keys
-                .push(PropertyBindingKey::new(ColorBindingId::new().into()));
+    /// The binding key for the next frame of the given kind.
+    ///
+    /// A key never changes kind. The painter keeps the latest value of every key and
+    /// can hand it to WebRender while WebRender still draws the previous display
+    /// list, in which the same key may belong to another frame. WebRender requires the
+    /// transform of a frame that only translates to stay a translation, so a key of
+    /// such a frame must never have carried the matrix of a transformed box.
+    pub(crate) fn next_key(
+        &mut self,
+        kind: &BoundFrameKind,
+    ) -> PropertyBindingKey<LayoutTransform> {
+        match kind {
+            BoundFrameKind::Origin { .. } => self.origin_keys.next_key(),
+            BoundFrameKind::Transform { .. } => self.transform_keys.next_key(),
         }
-        let key = self.keys[self.next_key];
-        self.next_key += 1;
-        key
     }
 
     /// Register a frame and mark it as enclosing the fragments added until
@@ -345,15 +373,25 @@ mod tests {
     }
 
     #[test]
-    fn keys_are_reused_by_the_next_stacking_context_tree() {
+    fn keys_are_reused_by_the_next_stacking_context_tree_and_never_change_kind() {
+        let transform_kind = BoundFrameKind::Transform {
+            is_2d_scale_translation: false,
+        };
         let mut bindings = MoveBindings::default();
-        bindings.keys = vec![PropertyBindingKey::new(1), PropertyBindingKey::new(2)];
-        let first = bindings.next_key();
-        let second = bindings.next_key();
-        assert_ne!(first, second);
+        bindings.origin_keys.keys = vec![PropertyBindingKey::new(1), PropertyBindingKey::new(2)];
+        bindings.transform_keys.keys = vec![PropertyBindingKey::new(3)];
+        let first = bindings.next_key(&origin_kind());
+        let transform = bindings.next_key(&transform_kind);
+        let second = bindings.next_key(&origin_kind());
+        assert_eq!(first, PropertyBindingKey::new(1));
+        assert_eq!(second, PropertyBindingKey::new(2));
+        assert_eq!(transform, PropertyBindingKey::new(3));
+
+        // The next tree asks in another order and gets the same key for each kind.
         bindings.begin_stacking_context_tree();
-        assert_eq!(bindings.next_key(), first);
-        assert_eq!(bindings.next_key(), second);
+        assert_eq!(bindings.next_key(&transform_kind), transform);
+        assert_eq!(bindings.next_key(&origin_kind()), first);
+        assert_eq!(bindings.next_key(&origin_kind()), second);
     }
 
     #[test]

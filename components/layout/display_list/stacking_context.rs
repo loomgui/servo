@@ -886,8 +886,8 @@ impl BoxFragment {
             .to_webrender();
         let bound_kind =
             self.bound_transform_frame_kind(stacking_context_tree, &reference_frame_data);
-        let binding = bound_kind.map(|_| ReferenceFrameBinding {
-            key: stacking_context_tree.move_bindings.next_key(),
+        let binding = bound_kind.map(|bound_kind| ReferenceFrameBinding {
+            key: stacking_context_tree.move_bindings.next_key(&bound_kind),
             kind: ReferenceFrameBindingKind::Transform,
         });
         let new_spatial_id = stacking_context_tree.push_reference_frame(
@@ -1023,8 +1023,12 @@ impl BoxFragment {
                 ContainingBlockCalculation::AlreadyDoneWithStackingContextTree,
             )
             .origin;
+        let bound_kind = BoundFrameKind::Origin {
+            origin,
+            query_origin,
+        };
         let binding = ReferenceFrameBinding {
-            key: stacking_context_tree.move_bindings.next_key(),
+            key: stacking_context_tree.move_bindings.next_key(&bound_kind),
             kind: ReferenceFrameBindingKind::Origin,
         };
         let frame_id = stacking_context_tree.push_reference_frame(
@@ -1040,14 +1044,9 @@ impl BoxFragment {
             },
             Some(binding),
         );
-        stacking_context_tree.move_bindings.enter_frame(
-            self.clone(),
-            frame_id,
-            BoundFrameKind::Origin {
-                origin,
-                query_origin,
-            },
-        );
+        stacking_context_tree
+            .move_bindings
+            .enter_frame(self.clone(), frame_id, bound_kind);
 
         let offset = origin.to_vector();
         let adjusted_containing_block = ContainingBlock {
