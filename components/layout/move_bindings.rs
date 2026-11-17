@@ -21,8 +21,18 @@
 //! ordinary path: a new stacking context tree and a new display list.
 //!
 //! Only boxes that are likely to move get a bound frame, because each one adds a
-//! spatial node to the scene. A node is *promoted* when it is first seen to move, or
-//! when its own `style` attribute positions it (see [`MoveBindings::promote`]).
+//! spatial node to the scene and work to every display list. A node is *promoted*:
+//!
+//! - when a restyle only moved boxes and its box was one of them, or
+//! - when its box is created with a `style` attribute that positions it, which is how
+//!   script places a box it is about to move (a tooltip, a dragged item).
+//!
+//! The second is a guess, and a document can prove it wrong: the markers of a minimap
+//! are placed the same way, but move in every frame together with other changes, so
+//! their frames would never carry a move. When display list after display list is
+//! built with bound frames and no box moves through one, the frames are dropped and
+//! the guess is no longer made, until a restyle that only moves boxes shows that
+//! frames pay off again.
 
 use std::sync::Arc;
 
@@ -43,6 +53,10 @@ const MAX_BOUND_FRAMES: usize = 64;
 /// The most promoted nodes to remember. The set is cleared when it grows past this, so
 /// that nodes that have gone away do not accumulate.
 const MAX_PROMOTED_NODES: usize = 1024;
+
+/// How many display lists in a row may be built with bound frames that no box moves
+/// through. One more, and the frames are dropped.
+const MAX_UNUSED_DISPLAY_LISTS: u32 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum BoundFrameKind {
@@ -134,7 +148,15 @@ pub(crate) struct MoveBindings {
     moved: Vec<usize>,
     scroll_containers: Vec<Arc<BoxFragment>>,
     other_damage: bool,
+    /// Nodes whose style change in this restyle is a move, but whose box has no bound
+    /// frame to move through.
+    unbound_movers: Vec<OpaqueNode>,
     staged: Vec<usize>,
+    /// The display lists built with bound frames since a box last moved through one.
+    unused_display_lists: u32,
+    /// Whether bound frames went unused for too long. While this is set, a box gets
+    /// no frame just because script positions it.
+    suspended: bool,
 }
 
 impl MoveBindings {
@@ -149,6 +171,53 @@ impl MoveBindings {
 
     pub(crate) fn is_promoted(&self, node: OpaqueNode) -> bool {
         self.promoted.contains(&node)
+    }
+
+    /// The box of `node` was created with a `style` attribute that positions it.
+    /// Promote the node on the guess that script will move the box, unless such
+    /// frames have been going unused.
+    pub(crate) fn promote_positioned_by_script(&mut self, node: OpaqueNode) {
+        if !self.suspended {
+            self.promote(node);
+        }
+    }
+
+    /// The style change of `node` in this restyle is a move, but its box has no bound
+    /// frame, so it takes the ordinary path. If the restyle turns out to move boxes
+    /// and nothing else, the node is promoted when it finishes. Returns false for a
+    /// node that is promoted already: its box cannot have a frame, and its change
+    /// counts as any other damage.
+    pub(crate) fn note_unbound_move(&mut self, node: OpaqueNode) -> bool {
+        if self.promoted.contains(&node) {
+            return false;
+        }
+        self.unbound_movers.push(node);
+        true
+    }
+
+    /// A full display list is built from the current stacking context tree.
+    pub(crate) fn note_display_list(&mut self) {
+        if !self.frames.is_empty() {
+            self.unused_display_lists = self.unused_display_lists.saturating_add(1);
+        }
+    }
+
+    /// Boxes moved on screen through their frames, without a new display list.
+    pub(crate) fn note_binding_update(&mut self) {
+        self.unused_display_lists = 0;
+    }
+
+    /// Whether the bound frames of the current stacking context tree have gone unused
+    /// for so many display lists that the next one should be built without them. If
+    /// so, every node loses its promotion; the caller has a new tree built.
+    pub(crate) fn drop_unused_frames(&mut self) -> bool {
+        if self.frames.is_empty() || self.unused_display_lists < MAX_UNUSED_DISPLAY_LISTS {
+            return false;
+        }
+        self.promoted.clear();
+        self.suspended = true;
+        self.unused_display_lists = 0;
+        true
     }
 
     /// Forget the frames of the previous stacking context tree.
@@ -236,6 +305,7 @@ impl MoveBindings {
     pub(crate) fn begin_restyle(&mut self, enabled: bool) {
         self.enabled = enabled;
         self.other_damage = false;
+        self.unbound_movers.clear();
         self.scroll_containers.clear();
         for index in self.moved.drain(..) {
             self.frames[index].pending = None;
@@ -278,8 +348,23 @@ impl MoveBindings {
     /// Take the moves recorded since [`Self::begin_restyle`].
     pub(crate) fn finish_restyle(&mut self) -> Option<MoveBatch> {
         self.enabled = false;
-        let other_damage = std::mem::take(&mut self.other_damage);
+        let mut other_damage = std::mem::take(&mut self.other_damage);
         let scroll_containers = std::mem::take(&mut self.scroll_containers);
+        let unbound_movers = std::mem::take(&mut self.unbound_movers);
+        if !unbound_movers.is_empty() {
+            // A restyle that only moved boxes would have kept its display list had
+            // they all been bound. Bind them in the next one.
+            if !other_damage {
+                for node in unbound_movers {
+                    self.promote(node);
+                }
+                self.suspended = false;
+                self.unused_display_lists = 0;
+            }
+            // For the boxes that did move through a frame, a move without one is a
+            // change their bindings cannot carry.
+            other_damage = true;
+        }
         if self.moved.is_empty() {
             return None;
         }
@@ -476,6 +561,88 @@ mod tests {
         );
         bindings.clear_staged();
         assert!(bindings.take_staged().0.is_empty());
+    }
+
+    #[test]
+    fn a_restyle_that_only_moves_unbound_boxes_promotes_them() {
+        let mut bindings = MoveBindings::default();
+
+        // A move together with another change promotes nothing.
+        bindings.begin_restyle(true);
+        assert!(bindings.note_unbound_move(OpaqueNode(1)));
+        bindings.note_other_damage();
+        assert!(bindings.finish_restyle().is_none());
+        assert!(!bindings.is_promoted(OpaqueNode(1)));
+
+        // The same move on its own does.
+        bindings.begin_restyle(true);
+        assert!(bindings.note_unbound_move(OpaqueNode(1)));
+        assert!(bindings.finish_restyle().is_none());
+        assert!(bindings.is_promoted(OpaqueNode(1)));
+
+        // A promoted node whose box still has no frame is not a mover without one.
+        bindings.begin_restyle(true);
+        assert!(!bindings.note_unbound_move(OpaqueNode(1)));
+        assert!(bindings.finish_restyle().is_none());
+    }
+
+    #[test]
+    fn a_move_without_a_frame_keeps_bound_moves_off_their_bindings() {
+        let mut bindings = MoveBindings::default();
+        let moved = fragment();
+        bindings.enter_frame(moved.clone(), ScrollTreeNodeId { index: 2 }, origin_kind());
+        bindings.leave_frame();
+        let (index, _) = bindings.frame_for(&moved).unwrap();
+
+        bindings.begin_restyle(true);
+        bindings.record_move(index, PendingMove::Offset(PhysicalVec::new(Au(60), Au(0))));
+        assert!(bindings.note_unbound_move(OpaqueNode(7)));
+        let batch = bindings.finish_restyle().unwrap();
+        assert!(batch.other_damage);
+        // The restyle only moved boxes, so the one without a frame gets one.
+        assert!(bindings.is_promoted(OpaqueNode(7)));
+    }
+
+    #[test]
+    fn unused_frames_are_dropped_until_a_restyle_only_moves_boxes() {
+        let mut bindings = MoveBindings::default();
+        bindings.promote_positioned_by_script(OpaqueNode(1));
+        assert!(bindings.is_promoted(OpaqueNode(1)));
+
+        // Display lists without bound frames do not count.
+        for _ in 0..MAX_UNUSED_DISPLAY_LISTS * 2 {
+            bindings.note_display_list();
+        }
+        assert!(!bindings.drop_unused_frames());
+
+        bindings.enter_frame(fragment(), ScrollTreeNodeId { index: 2 }, origin_kind());
+        bindings.leave_frame();
+        for _ in 0..MAX_UNUSED_DISPLAY_LISTS - 1 {
+            bindings.note_display_list();
+        }
+        assert!(!bindings.drop_unused_frames());
+
+        // A move through a frame starts the count again.
+        bindings.note_binding_update();
+        for _ in 0..MAX_UNUSED_DISPLAY_LISTS - 1 {
+            bindings.note_display_list();
+        }
+        assert!(!bindings.drop_unused_frames());
+        bindings.note_display_list();
+        assert!(bindings.drop_unused_frames());
+        assert!(!bindings.is_promoted(OpaqueNode(1)));
+
+        // From here on a box that script positions gets no frame.
+        bindings.promote_positioned_by_script(OpaqueNode(2));
+        assert!(!bindings.is_promoted(OpaqueNode(2)));
+
+        // Until a restyle only moves boxes.
+        bindings.begin_restyle(true);
+        assert!(bindings.note_unbound_move(OpaqueNode(3)));
+        assert!(bindings.finish_restyle().is_none());
+        assert!(bindings.is_promoted(OpaqueNode(3)));
+        bindings.promote_positioned_by_script(OpaqueNode(2));
+        assert!(bindings.is_promoted(OpaqueNode(2)));
     }
 
     #[test]

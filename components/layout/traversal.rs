@@ -170,6 +170,7 @@ pub(crate) fn compute_damage_and_rebuild_box_tree_above_dirty_root<'dom>(
             // any existing layout roots, but they may isolate upward flowing fragment
             // tree damage.
             incoming_layout_root_count: layout_roots.len(),
+            is_unbound_move: false,
         };
 
         damage_for_parent = damage_set.apply_damage(layout_context, layout_roots);
@@ -224,16 +225,19 @@ pub(crate) fn compute_damage_and_rebuild_box_tree_below_dirty_root<'dom>(
         on_element: element_damage,
         from_children: LayoutDamage::empty(),
         incoming_layout_root_count: layout_roots.len(),
+        is_unbound_move: false,
     };
 
     // A style change that only moves this element's box is applied right here, before
     // its damage reaches the children. They are not laid out again, so their layout
     // caches must stay as they are. From here on the element counts as undamaged;
     // whatever its children need on their own is still handled below.
-    let moved_in_place = damage_set.try_move_in_place(layout_context);
+    let move_outcome = damage_set.try_move_in_place(layout_context);
+    let moved_in_place = move_outcome == MoveOutcome::Moved;
     if moved_in_place {
         damage_set.on_element = LayoutDamage::empty();
     }
+    damage_set.is_unbound_move = move_outcome == MoveOutcome::Unbound;
 
     // Depending on the incoming damage, it can be isolated, meaning that some damage
     // doesn't get passed down to children.
@@ -259,10 +263,11 @@ pub(crate) fn compute_damage_and_rebuild_box_tree_below_dirty_root<'dom>(
 }
 
 /// Whether the element's own `style` attribute sets its box offsets or its transform.
-/// Such an element is placed by script, which usually goes on to move it: a tooltip or
-/// a dragged item that follows the pointer, a marker on a map. Giving its box a bound
-/// reference frame from the start lets the first move take the fast path. This is
-/// only a hint; it never decides whether a later change is a move.
+/// Such an element is placed by script, which often goes on to move it: a tooltip or
+/// a dragged item that follows the pointer. Giving its box a bound reference frame
+/// from the start lets the first move take the fast path. This is only a guess, which
+/// is dropped while it does not pay off (see [`crate::move_bindings`]); it never
+/// decides whether a later change is a move.
 fn promote_if_positioned_by_style_attribute(
     layout_context: &LayoutContext,
     element: ServoLayoutElement<'_>,
@@ -282,7 +287,7 @@ fn promote_if_positioned_by_style_attribute(
             .background_colors
             .lock()
             .moves
-            .promote(element.as_node().opaque());
+            .promote_positioned_by_script(element.as_node().opaque());
     }
 }
 
@@ -311,6 +316,18 @@ fn transform_for_transform_change(
     transform.is_invertible().then_some((fragment, transform))
 }
 
+/// What became of an element's style change when it was checked for being a move.
+#[derive(PartialEq)]
+enum MoveOutcome {
+    /// The box moved in place, and the binding of its frame carries the move.
+    Moved,
+    /// The change is a move, but the box has no bound frame to move through. It takes
+    /// the ordinary path.
+    Unbound,
+    /// The change is not provably a move.
+    NotAMove,
+}
+
 enum BoxDamageAction<'a> {
     RebuildAncestor,
     TryRebuild,
@@ -333,6 +350,8 @@ pub(crate) struct ElementDamageSet<'a> {
     pub on_element: LayoutDamage,
     pub from_children: LayoutDamage,
     pub incoming_layout_root_count: usize,
+    /// Whether the damage on this element is a move of a box without a bound frame.
+    pub is_unbound_move: bool,
 }
 
 impl<'a> ElementDamageSet<'a> {
@@ -398,18 +417,22 @@ impl<'a> ElementDamageSet<'a> {
     }
 
     /// If the style change on this element only moves its box, and the display list
-    /// has a bound reference frame for that box, apply the move in place and return
-    /// true. This runs before the element's damage is passed to its children.
+    /// has a bound reference frame for that box, apply the move in place. This runs
+    /// before the element's damage is passed to its children.
     ///
     /// The box is then where a new layout would put it, with the same fragments. If
     /// anything else in this restyle needs a new stacking context tree or display
     /// list, those are built from the moved fragment as usual. If nothing else does,
     /// the move reaches the screen through the frame's property binding.
-    fn try_move_in_place(&self, layout_context: &LayoutContext<'_>) -> bool {
-        self.move_in_place(layout_context).is_some()
+    ///
+    /// A move of a box without a bound frame is only reported. Nothing is changed,
+    /// and the element's damage is handled like any other.
+    fn try_move_in_place(&self, layout_context: &LayoutContext<'_>) -> MoveOutcome {
+        self.move_in_place(layout_context)
+            .unwrap_or(MoveOutcome::NotAMove)
     }
 
-    fn move_in_place(&self, layout_context: &LayoutContext<'_>) -> Option<()> {
+    fn move_in_place(&self, layout_context: &LayoutContext<'_>) -> Option<MoveOutcome> {
         // A box whose ancestors are damaged may be laid out again with them.
         if self.on_element.is_empty() || !self.from_parent.is_empty() {
             return None;
@@ -452,14 +475,18 @@ impl<'a> ElementDamageSet<'a> {
             (fragment, PendingMove::Transform(transform))
         };
 
-        // This change is a move. Remember the node, so that its box has a bound frame
-        // in the next display list if it does not have one in this one.
+        // This change is a move. Without a bound frame it cannot be applied as one;
+        // the node is remembered, and gets a frame if this restyle only moves boxes.
         let mut cache = layout_context.background_colors.lock();
-        cache.moves.promote(self.node.opaque());
+        let Some((index, frame)) = cache.moves.frame_for(&fragment) else {
+            return cache
+                .moves
+                .note_unbound_move(self.node.opaque())
+                .then_some(MoveOutcome::Unbound);
+        };
         if !cache.retained_display_list_is_live() {
             return None;
         }
-        let (index, frame) = cache.moves.frame_for(&fragment)?;
         match (frame.kind, pending) {
             (BoundFrameKind::Origin { .. }, PendingMove::Offset(offset)) => {
                 fragment.base.translate_rect(offset.to_size());
@@ -488,7 +515,7 @@ impl<'a> ElementDamageSet<'a> {
         self.node.with_layout_box_base(|base| {
             base.clear_scrollable_overflow_all_on_fragments();
         });
-        Some(())
+        Some(MoveOutcome::Moved)
     }
 
     /// Given the damage from this element, the parent, and children, determine what action to
@@ -498,9 +525,10 @@ impl<'a> ElementDamageSet<'a> {
         layout_context: &LayoutContext<'_>,
         layout_roots: &mut Vec<LayoutRoot<'a>>,
     ) -> LayoutDamage {
-        // A style change that was applied as a move left no damage on its element.
-        // Any other is one that a move through a property binding cannot carry.
-        if !self.on_element.is_empty() {
+        // A style change that was applied as a move left no damage on its element,
+        // and a move of a box without a bound frame is counted on its own. Any other
+        // change is one that a move through a property binding cannot carry.
+        if !self.on_element.is_empty() && !self.is_unbound_move {
             layout_context
                 .background_colors
                 .lock()

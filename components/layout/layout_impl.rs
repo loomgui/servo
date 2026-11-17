@@ -1735,6 +1735,15 @@ impl LayoutThread {
         if damage.contains(LayoutDamage::Repaint) {
             self.need_new_display_list.set(true);
         }
+        // Every display list pays for its bound frames. If boxes stopped moving
+        // through them, build the next one from a stacking context tree without them.
+        if self.need_new_display_list.get() {
+            let mut cache = self.background_colors.lock();
+            if cache.moves.drop_unused_frames() {
+                cache.invalidate();
+                self.need_new_stacking_context_tree.set(true);
+            }
+        }
 
         let mut insert_accessibility_damage_if_necessary = |node: ServoLayoutNode<'dom>| {
             if let Some(map) = accessibility_damage.as_mut() {
@@ -1861,7 +1870,11 @@ impl LayoutThread {
             return false;
         };
         fragment_tree.clear_scrollable_overflow();
-        stacking_context_tree.apply_moves(fragment_tree, &batch, &mut cache.moves)
+        let moved = stacking_context_tree.apply_moves(fragment_tree, &batch, &mut cache.moves);
+        if moved {
+            cache.moves.note_binding_update();
+        }
+        moved
     }
 
     fn build_stacking_context_tree_for_reflow(&self, reflow_request: &ReflowRequest) -> bool {
@@ -2137,6 +2150,7 @@ impl LayoutThread {
 
         let mut background_colors = self.background_colors.lock();
         background_colors.begin_display_list();
+        background_colors.moves.note_display_list();
         let built_display_list = profile_time::profile_if_active(
             profile_time::ProfilerCategory::LayoutDisplayListBuild,
             || self.profiler_metadata(),
