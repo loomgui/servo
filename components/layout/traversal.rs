@@ -23,7 +23,7 @@ use crate::dom::{DOMLayoutData, NodeExt};
 use crate::fragment_tree::BoxFragment;
 use crate::layout_box_base::LayoutBoxBase;
 use crate::layout_root::LayoutRoot;
-use crate::move_bindings::{BoundFrameKind, PendingMove};
+use crate::move_bindings::{BoundFrameKind, PendingMove, is_whole_device_pixels};
 use crate::style_ext::ComputedValuesExt;
 
 pub struct RecalcStyle<'a> {
@@ -465,6 +465,21 @@ impl<'a> ElementDamageSet<'a> {
                 return None;
             }
             let (fragment, offset) = layout_root.offset_for_box_offsets_change(&new_style)?;
+            // A box moved by its offsets only goes through its frame by whole device
+            // pixels, on a display that is not scaled by a fraction. Any other such
+            // change is not a move: it takes the ordinary path, and does not earn the
+            // box a frame that could not carry it.
+            let device_pixel_ratio = layout_context
+                .style_context
+                .stylist
+                .device()
+                .device_pixel_ratio()
+                .get();
+            if !is_whole_device_pixels(offset.x, device_pixel_ratio) ||
+                !is_whole_device_pixels(offset.y, device_pixel_ratio)
+            {
+                return None;
+            }
             (fragment, PendingMove::Offset(offset))
         } else {
             let mut change = None;

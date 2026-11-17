@@ -51,7 +51,9 @@ use crate::geom::{
     AuOrAuto, LengthPercentageOrAuto, PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalSize,
     PhysicalVec,
 };
-use crate::move_bindings::{BoundFrameKind, MoveBatch, MoveBindings, PendingMove};
+use crate::move_bindings::{
+    BoundFrameKind, MoveBatch, MoveBindings, PendingMove, is_power_of_two, is_whole_device_pixels,
+};
 use crate::style_ext::{ComputedValuesExt, TransformExt};
 
 #[derive(Clone)]
@@ -392,12 +394,8 @@ impl StackingContextTree {
         if !is_2d_scale_translation(&to_root) {
             return false;
         }
-        let whole = |distance: Au, scale: f32| {
-            let scale = scale * device_pixel_ratio;
-            let on_screen = distance.to_f64_px() * f64::from(scale);
-            is_power_of_two(scale) && (on_screen - on_screen.round()).abs() < 1.0 / 1024.0
-        };
-        whole(offset.x, to_root.m11) && whole(offset.y, to_root.m22)
+        is_whole_device_pixels(offset.x, to_root.m11 * device_pixel_ratio) &&
+            is_whole_device_pixels(offset.y, to_root.m22 * device_pixel_ratio)
     }
 
     /// Move the contents of the frame that was added around `fragment` by `offset`.
@@ -1805,13 +1803,6 @@ pub(crate) fn transform_matrix_for_style(
     Some(transform.change_basis(transform_origin_x, transform_origin_y, transform_origin_z))
 }
 
-/// Whether `scale` is a positive power of two: 1, 2, 4, or a half, a quarter. Scaling
-/// by one and back is exact in floats.
-pub(crate) fn is_power_of_two(scale: f32) -> bool {
-    const MANTISSA: u32 = (1 << 23) - 1;
-    scale.is_normal() && scale > 0.0 && scale.to_bits() & MANTISSA == 0
-}
-
 /// Whether WebRender treats this transform as a 2d scale and translation. This is the
 /// test WebRender applies to an unbound reference frame transform.
 pub(crate) fn is_2d_scale_translation(transform: &LayoutTransform) -> bool {
@@ -1933,19 +1924,4 @@ pub(crate) fn au_rect_to_length_rect(rect: &Rect<Au, CSSPixel>) -> Rect<Length, 
         Point2D::new(rect.origin.x.into(), rect.origin.y.into()),
         Size2D::new(rect.size.width.into(), rect.size.height.into()),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_power_of_two;
-
-    #[test]
-    fn only_powers_of_two_scale_exactly() {
-        for scale in [1.0, 2.0, 4.0, 0.5, 0.25] {
-            assert!(is_power_of_two(scale), "{scale}");
-        }
-        for scale in [1.25, 1.5, 3.0, 0.75, 0.0, -1.0, f32::NAN, f32::INFINITY] {
-            assert!(!is_power_of_two(scale), "{scale}");
-        }
-    }
 }

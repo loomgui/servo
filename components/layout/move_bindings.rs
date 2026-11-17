@@ -59,6 +59,21 @@ const MAX_PROMOTED_NODES: usize = 1024;
 /// through. One more, and the frames are dropped.
 const MAX_UNUSED_DISPLAY_LISTS: u32 = 16;
 
+/// Whether `scale` is a positive power of two: 1, 2, 4, or a half, a quarter. Scaling
+/// by one and back is exact in floats.
+pub(crate) fn is_power_of_two(scale: f32) -> bool {
+    const MANTISSA: u32 = (1 << 23) - 1;
+    scale.is_normal() && scale > 0.0 && scale.to_bits() & MANTISSA == 0
+}
+
+/// Whether `distance`, at `scale` device pixels per CSS pixel, is a whole number of
+/// device pixels, at a scale that is a power of two. A box moved by its offsets only
+/// goes through its frame by such distances (see [`BoundFrameKind::Origin`]).
+pub(crate) fn is_whole_device_pixels(distance: Au, scale: f32) -> bool {
+    let on_screen = distance.to_f64_px() * f64::from(scale);
+    is_power_of_two(scale) && (on_screen - on_screen.round()).abs() < 1.0 / 1024.0
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum BoundFrameKind {
     /// A frame added around an absolutely positioned box, to translate it.
@@ -658,5 +673,26 @@ mod tests {
         bindings.promote(OpaqueNode(MAX_PROMOTED_NODES));
         assert!(!bindings.is_promoted(OpaqueNode(0)));
         assert!(bindings.is_promoted(OpaqueNode(MAX_PROMOTED_NODES)));
+    }
+
+    #[test]
+    fn only_powers_of_two_scale_exactly() {
+        for scale in [1.0, 2.0, 4.0, 0.5, 0.25] {
+            assert!(is_power_of_two(scale), "{scale}");
+        }
+        for scale in [1.25, 1.5, 3.0, 0.75, 0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(!is_power_of_two(scale), "{scale}");
+        }
+    }
+
+    #[test]
+    fn whole_device_pixels() {
+        assert!(is_whole_device_pixels(Au::from_px(3), 1.0));
+        assert!(is_whole_device_pixels(Au::from_f32_px(-1.5), 2.0));
+        assert!(!is_whole_device_pixels(Au::from_f32_px(2.5), 0.5));
+        assert!(!is_whole_device_pixels(Au::from_f32_px(0.4), 1.0));
+        assert!(!is_whole_device_pixels(Au::from_f32_px(1.5), 1.0));
+        // 4px is 5 device pixels at 125%, but that scale is not exact.
+        assert!(!is_whole_device_pixels(Au::from_px(4), 1.25));
     }
 }
