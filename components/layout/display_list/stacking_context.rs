@@ -297,6 +297,7 @@ impl StackingContextTree {
         fragment_tree: &FragmentTree,
         batch: &MoveBatch,
         bindings: &mut MoveBindings,
+        device_pixel_ratio: f32,
     ) -> bool {
         // A box that moves can change how far its ancestors scroll. The scroll frames
         // of this tree and of WebRender's scene hold the old extents, so only keep them
@@ -322,22 +323,14 @@ impl StackingContextTree {
             let frame = bindings.frame(*index);
             let (fragment, node, kind) = (frame.fragment.clone(), frame.node, frame.kind);
             let new_kind = match (kind, pending) {
-                (
-                    BoundFrameKind::Origin {
-                        origin,
-                        query_origin,
-                    },
-                    PendingMove::Offset(offset),
-                ) => {
-                    let origin = origin + *offset;
-                    let query_origin = query_origin + *offset;
-                    if !self.move_origin_frame(&fragment, node, origin, query_origin, *offset) {
+                (BoundFrameKind::Origin { offset: moved }, PendingMove::Offset(offset)) => {
+                    let moved = moved + *offset;
+                    if !self.moves_by_whole_device_pixels(node, moved, device_pixel_ratio) ||
+                        !self.move_origin_frame(&fragment, node, *offset)
+                    {
                         return false;
                     }
-                    BoundFrameKind::Origin {
-                        origin,
-                        query_origin,
-                    }
+                    BoundFrameKind::Origin { offset: moved }
                 },
                 (BoundFrameKind::Transform { .. }, PendingMove::Transform(transform)) => {
                     if !self
@@ -363,30 +356,73 @@ impl StackingContextTree {
         true
     }
 
-    /// Move the frame that was added around `fragment` to a new origin. The fragment
-    /// already has its new position.
+    /// Whether the frame `node`, having moved its contents by `offset` in all since its
+    /// display list was built, puts them on the pixels a new display list would.
+    ///
+    /// WebRender snaps text and the edges of boxes to device pixels. Two things must
+    /// hold for contents that a frame moves to be snapped the way a new display list
+    /// would snap them:
+    ///
+    /// - They move by a whole number of device pixels. Moved by a fraction of one,
+    ///   some of them would be snapped the other way.
+    /// - The scale from the frame to the screen is a power of two, which is the scale
+    ///   of every display that is not scaled by a fraction. At any other scale an edge
+    ///   can lie exactly halfway between two device pixels at a position that a float
+    ///   does not hold exactly (at 125%, `222.8px` is device pixel `278.5`). Which way
+    ///   it is snapped then depends on the rounding error of that one number, and the
+    ///   number is not the same when the frame adds the move as when the box is
+    ///   described at its new position.
+    ///
+    /// Above a rotation, skew or perspective nothing says how far the contents move on
+    /// screen, so neither holds.
+    fn moves_by_whole_device_pixels(
+        &self,
+        node: ScrollTreeNodeId,
+        offset: PhysicalVec<Au>,
+        device_pixel_ratio: f32,
+    ) -> bool {
+        let scroll_tree = &self.paint_info.scroll_tree;
+        let Some(parent) = scroll_tree.get_node(node).parent else {
+            return false;
+        };
+        let to_root = scroll_tree
+            .cumulative_node_to_root_transform(parent)
+            .to_transform()
+            .into_owned();
+        if !is_2d_scale_translation(&to_root) {
+            return false;
+        }
+        let whole = |distance: Au, scale: f32| {
+            let scale = scale * device_pixel_ratio;
+            let on_screen = distance.to_f64_px() * f64::from(scale);
+            is_power_of_two(scale) && (on_screen - on_screen.round()).abs() < 1.0 / 1024.0
+        };
+        whole(offset.x, to_root.m11) && whole(offset.y, to_root.m22)
+    }
+
+    /// Move the contents of the frame that was added around `fragment` by `offset`.
+    /// The fragment already has its new position.
     fn move_origin_frame(
         &mut self,
         fragment: &Arc<BoxFragment>,
         node: ScrollTreeNodeId,
-        origin: PhysicalPoint<Au>,
-        query_origin: PhysicalPoint<Au>,
         offset: PhysicalVec<Au>,
     ) -> bool {
+        let moved = LayoutVector2D::new(offset.x.to_f32_px(), offset.y.to_f32_px());
         if !self
             .paint_info
             .scroll_tree
             .update_reference_frame(node, |info| {
-                info.origin = origin.to_webrender();
-                info.frame_origin_for_query = query_origin.to_webrender();
+                info.origin += moved;
+                info.frame_origin_for_query += moved;
             })
         {
             return false;
         }
 
-        // The frame's coordinate system starts at the border box of the fragment, so
-        // the containing block the fragment is positioned in moves the other way.
-        // Everything else inside the frame is relative to the fragment and stays.
+        // What is inside the frame keeps the coordinates it was described in when the
+        // display list was built, and the fragment has moved. The containing block the
+        // fragment is positioned in moves the other way to make up for that.
         fn find<'a>(
             stacking_context: &'a mut StackingContext,
             fragment: &Arc<BoxFragment>,
@@ -999,15 +1035,26 @@ impl BoxFragment {
                 return false;
             }
         }
+        // A move through the frame is only exact on a display that is not scaled by a
+        // fraction (see `moves_by_whole_device_pixels`). On any other, leave the box as
+        // it is without the frame.
+        let device_pixel_ratio = stacking_context_tree
+            .paint_info
+            .viewport_details
+            .hidpi_scale_factor
+            .get();
+        if !is_power_of_two(device_pixel_ratio) {
+            return false;
+        }
         // The frame is flat. Inside a 3d rendering context it would flatten the box.
         !stacking_context_tree.is_in_preserve_3d_context(containing_block.scroll_node_id)
     }
 
     /// Build the stacking context tree for this absolutely positioned box inside a
-    /// reference frame that only translates it to its place. Unlike the frame of a
-    /// transformed box, this one leaves clips and containing blocks as they are: the
-    /// box is described exactly as it would be without the frame, in coordinates
-    /// relative to its own border box.
+    /// reference frame that is the identity for now, and translates the box once it
+    /// moves. The box and everything in it is described exactly as it would be
+    /// without the frame, in the coordinates of the frame's parent: the same clips,
+    /// the same containing blocks, the same positions. Only the spatial node differs.
     fn build_stacking_context_tree_in_bound_origin_frame(
         self: &Arc<Self>,
         fragment: Fragment,
@@ -1024,16 +1071,18 @@ impl BoxFragment {
             )
             .origin;
         let bound_kind = BoundFrameKind::Origin {
-            origin,
-            query_origin,
+            offset: PhysicalVec::zero(),
         };
         let binding = ReferenceFrameBinding {
             key: stacking_context_tree.move_bindings.next_key(&bound_kind),
             kind: ReferenceFrameBindingKind::Origin,
         };
+        // The frame's coordinates are those of its parent, which start here in the
+        // document.
+        let parent_origin_for_query = query_origin - origin.to_vector();
         let frame_id = stacking_context_tree.push_reference_frame(
-            origin.to_webrender(),
-            query_origin.to_webrender(),
+            LayoutPoint::zero(),
+            parent_origin_for_query.to_webrender(),
             containing_block.scroll_node_id,
             wr::TransformStyle::Flat,
             LayoutTransform::identity(),
@@ -1048,9 +1097,7 @@ impl BoxFragment {
             .move_bindings
             .enter_frame(self.clone(), frame_id, bound_kind);
 
-        let offset = origin.to_vector();
         let adjusted_containing_block = ContainingBlock {
-            rect: containing_block.rect.translate(-offset),
             scroll_node_id: frame_id,
             // Without the frame, this box and its children take the scroll frame size
             // from the containing block for non-absolute descendants at this place in
@@ -1058,8 +1105,6 @@ impl BoxFragment {
             scroll_frame_size: containing_block_info
                 .for_non_absolute_descendants
                 .scroll_frame_size,
-            accumulated_reference_frame_offset: containing_block.accumulated_reference_frame_offset +
-                offset,
             ..containing_block.clone()
         };
         let new_containing_block_info =
@@ -1760,6 +1805,13 @@ pub(crate) fn transform_matrix_for_style(
     Some(transform.change_basis(transform_origin_x, transform_origin_y, transform_origin_z))
 }
 
+/// Whether `scale` is a positive power of two: 1, 2, 4, or a half, a quarter. Scaling
+/// by one and back is exact in floats.
+pub(crate) fn is_power_of_two(scale: f32) -> bool {
+    const MANTISSA: u32 = (1 << 23) - 1;
+    scale.is_normal() && scale > 0.0 && scale.to_bits() & MANTISSA == 0
+}
+
 /// Whether WebRender treats this transform as a 2d scale and translation. This is the
 /// test WebRender applies to an unbound reference frame transform.
 pub(crate) fn is_2d_scale_translation(transform: &LayoutTransform) -> bool {
@@ -1881,4 +1933,19 @@ pub(crate) fn au_rect_to_length_rect(rect: &Rect<Au, CSSPixel>) -> Rect<Length, 
         Point2D::new(rect.origin.x.into(), rect.origin.y.into()),
         Size2D::new(rect.size.width.into(), rect.size.height.into()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_power_of_two;
+
+    #[test]
+    fn only_powers_of_two_scale_exactly() {
+        for scale in [1.0, 2.0, 4.0, 0.5, 0.25] {
+            assert!(is_power_of_two(scale), "{scale}");
+        }
+        for scale in [1.25, 1.5, 3.0, 0.75, 0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(!is_power_of_two(scale), "{scale}");
+        }
+    }
 }

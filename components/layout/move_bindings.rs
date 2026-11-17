@@ -12,8 +12,9 @@
 //! Two kinds of change count as a move:
 //!
 //! - **Box offsets** (`top`, `right`, `bottom`, `left`) of an absolutely positioned box
-//!   whose size does not depend on them. The box gets an extra reference frame that only
-//!   translates it ([`BoundFrameKind::Origin`]).
+//!   whose size does not depend on them. The box gets an extra reference frame
+//!   ([`BoundFrameKind::Origin`]) that is the identity until the box moves, and then
+//!   translates it by as far as it moved.
 //! - **Transform** (`transform`, `translate`, `rotate`, `scale`) of a box that already
 //!   has a reference frame ([`BoundFrameKind::Transform`]).
 //!
@@ -44,7 +45,7 @@ use webrender_api::units::LayoutTransform;
 use webrender_api::{PropertyBindingKey, PropertyValue};
 
 use crate::fragment_tree::BoxFragment;
-use crate::geom::{PhysicalPoint, PhysicalVec};
+use crate::geom::PhysicalVec;
 
 /// The most bound frames one stacking context tree may have. Boxes past this limit are
 /// drawn and moved the ordinary way.
@@ -61,12 +62,15 @@ const MAX_UNUSED_DISPLAY_LISTS: u32 = 16;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum BoundFrameKind {
     /// A frame added around an absolutely positioned box, to translate it.
+    ///
+    /// The frame is the identity when its display list is built: the box and its
+    /// contents are described in the coordinates of the frame's parent, exactly as
+    /// without the frame, so they are drawn exactly as without it. A move makes the
+    /// frame translate them, and only by whole device pixels: anything else could
+    /// snap text and edges to other pixels than a new display list would.
     Origin {
-        /// The origin of the box's border box in the parent spatial node.
-        origin: PhysicalPoint<Au>,
-        /// The same origin relative to the initial containing block, ignoring
-        /// transforms.
-        query_origin: PhysicalPoint<Au>,
+        /// How far the box has moved since the display list was built.
+        offset: PhysicalVec<Au>,
     },
     /// The frame of a box with a CSS transform.
     Transform {
@@ -452,8 +456,7 @@ mod tests {
 
     fn origin_kind() -> BoundFrameKind {
         BoundFrameKind::Origin {
-            origin: PhysicalPoint::zero(),
-            query_origin: PhysicalPoint::zero(),
+            offset: PhysicalVec::zero(),
         }
     }
 

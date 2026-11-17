@@ -1870,7 +1870,12 @@ impl LayoutThread {
             return false;
         };
         fragment_tree.clear_scrollable_overflow();
-        let moved = stacking_context_tree.apply_moves(fragment_tree, &batch, &mut cache.moves);
+        let moved = stacking_context_tree.apply_moves(
+            fragment_tree,
+            &batch,
+            &mut cache.moves,
+            self.device().device_pixel_ratio().get(),
+        );
         if moved {
             cache.moves.note_binding_update();
         }
