@@ -2,42 +2,35 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Move a box without building a new display list.
+//! Move a transformed box without building a new display list.
 //!
-//! A box that only changes position keeps its contents: the same fragments, in the same
-//! painting order, under the same clips. The stacking context tree gives such a box a
-//! reference frame whose transform is a WebRender property binding. A later move then
+//! A box whose transform changes keeps its contents: the same fragments, in the same
+//! painting order, under the same clips. Such a box has a reference frame, and the
+//! stacking context tree can bind the transform of that frame to a WebRender property.
+//! A later change of the transform (`transform`, `translate`, `rotate`, `scale`) then
 //! only changes that property, and WebRender builds a frame without a new scene.
 //!
-//! Two kinds of change count as a move:
+//! Every other change, and every case this module cannot prove to be such a move,
+//! takes the ordinary path: a new stacking context tree and a new display list. That
+//! includes a box moved by its box offsets (`top`, `left`). It has no reference frame,
+//! and one added for the purpose would not always draw it on the pixels it is on
+//! without the frame.
 //!
-//! - **Box offsets** (`top`, `right`, `bottom`, `left`) of an absolutely positioned box
-//!   whose size does not depend on them. The box gets an extra reference frame
-//!   ([`BoundFrameKind::Origin`]) that is the identity until the box moves, and then
-//!   translates it by as far as it moved.
-//! - **Transform** (`transform`, `translate`, `rotate`, `scale`) of a box that already
-//!   has a reference frame ([`BoundFrameKind::Transform`]).
-//!
-//! Every other change, and every case this module cannot prove to be a move, takes the
-//! ordinary path: a new stacking context tree and a new display list.
-//!
-//! Only boxes that are likely to move get a bound frame, because each one adds a
-//! spatial node to the scene and work to every display list. A node is *promoted*:
+//! Only boxes that are likely to move get a bound frame, because WebRender treats a
+//! bound transform as one that changes. A node is *promoted*:
 //!
 //! - when a restyle only moved boxes and its box was one of them, or
-//! - when its box is created with a `style` attribute that positions it, which is how
-//!   script places a box it is about to move (a tooltip, a dragged item).
+//! - when its box is created with a `style` attribute that sets its transform, which
+//!   is how script places a box it is about to move (a tooltip, a dragged item).
 //!
-//! The second is a guess, and a document can prove it wrong: the markers of a minimap
-//! are placed the same way, but move in every frame together with other changes, so
-//! their frames would never carry a move. When display list after display list is
-//! built with bound frames and no box moves through one, the frames are dropped and
-//! the guess is no longer made, until a restyle that only moves boxes shows that
-//! frames pay off again.
+//! The second is a guess, and a document can prove it wrong: a box placed that way may
+//! move in every frame together with other changes, so its frame would never carry a
+//! move. When display list after display list is built with bound frames and no box
+//! moves through one, the frames are dropped and the guess is no longer made, until a
+//! restyle that only moves boxes shows that frames pay off again.
 
 use std::sync::Arc;
 
-use app_units::Au;
 use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::id::{ColorBindingId, ScrollTreeNodeId};
 use style::dom::OpaqueNode;
@@ -45,7 +38,6 @@ use webrender_api::units::LayoutTransform;
 use webrender_api::{PropertyBindingKey, PropertyValue};
 
 use crate::fragment_tree::BoxFragment;
-use crate::geom::PhysicalVec;
 
 /// The most bound frames one stacking context tree may have. Boxes past this limit are
 /// drawn and moved the ordinary way.
@@ -59,69 +51,27 @@ const MAX_PROMOTED_NODES: usize = 1024;
 /// through. One more, and the frames are dropped.
 const MAX_UNUSED_DISPLAY_LISTS: u32 = 16;
 
-/// Whether `scale` is a positive power of two: 1, 2, 4, or a half, a quarter. Scaling
-/// by one and back is exact in floats.
-pub(crate) fn is_power_of_two(scale: f32) -> bool {
-    const MANTISSA: u32 = (1 << 23) - 1;
-    scale.is_normal() && scale > 0.0 && scale.to_bits() & MANTISSA == 0
-}
-
-/// Whether `distance`, at `scale` device pixels per CSS pixel, is a whole number of
-/// device pixels, at a scale that is a power of two. A box moved by its offsets only
-/// goes through its frame by such distances (see [`BoundFrameKind::Origin`]).
-pub(crate) fn is_whole_device_pixels(distance: Au, scale: f32) -> bool {
-    let on_screen = distance.to_f64_px() * f64::from(scale);
-    is_power_of_two(scale) && (on_screen - on_screen.round()).abs() < 1.0 / 1024.0
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum BoundFrameKind {
-    /// A frame added around an absolutely positioned box, to translate it.
-    ///
-    /// The frame is the identity when its display list is built: the box and its
-    /// contents are described in the coordinates of the frame's parent, exactly as
-    /// without the frame, so they are drawn exactly as without it. A move makes the
-    /// frame translate them, and only by whole device pixels: anything else could
-    /// snap text and edges to other pixels than a new display list would.
-    Origin {
-        /// How far the box has moved since the display list was built.
-        offset: PhysicalVec<Au>,
-    },
-    /// The frame of a box with a CSS transform.
-    Transform {
-        /// Whether the transform is a 2d scale and translation. WebRender draws such a
-        /// frame in its parent's coordinate system, so an update must not change this.
-        is_2d_scale_translation: bool,
-    },
-}
-
-/// A move recorded during damage propagation.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum PendingMove {
-    /// The box moved by this offset. Its fragment already has the new position.
-    Offset(PhysicalVec<Au>),
-    /// The box has this new transform.
-    Transform(LayoutTransform),
-}
-
 pub(crate) struct BoundFrame {
     /// The fragment the frame was made for. Holding it keeps its address from being
     /// reused while this frame is registered.
     pub(crate) fragment: Arc<BoxFragment>,
     pub(crate) node: ScrollTreeNodeId,
-    pub(crate) kind: BoundFrameKind,
+    /// Whether the transform is a 2d scale and translation. WebRender draws such a
+    /// frame in its parent's coordinate system, so an update must not change this.
+    pub(crate) is_2d_scale_translation: bool,
     /// Whether something inside the frame would not follow it. A tainted frame has no
     /// binding and never moves through one.
     tainted: bool,
-    pending: Option<PendingMove>,
+    /// The new transform of a move recorded during damage propagation.
+    pending: Option<LayoutTransform>,
     /// The value to send to the painter with the next property update.
     staged: Option<PropertyValue<LayoutTransform>>,
 }
 
 /// The moves of one restyle, taken once damage propagation is done.
 pub(crate) struct MoveBatch {
-    /// Indices into the registered frames, with the move for each.
-    pub(crate) moves: Vec<(usize, PendingMove)>,
+    /// Indices into the registered frames, with the new transform for each.
+    pub(crate) moves: Vec<(usize, LayoutTransform)>,
     /// Scroll containers whose scrollable overflow was invalidated by this restyle.
     pub(crate) scroll_containers: Vec<Arc<BoxFragment>>,
     /// Whether any element had damage that was not handled as a move.
@@ -153,10 +103,11 @@ impl KeyPool {
 pub(crate) struct MoveBindings {
     /// Nodes whose boxes get a bound frame when the stacking context tree is built.
     promoted: FxHashSet<OpaqueNode>,
-    /// Binding keys, reused by every stacking context tree in order, one pool for
-    /// each kind of frame. See [`Self::next_key`] for why they are kept apart.
-    origin_keys: KeyPool,
-    transform_keys: KeyPool,
+    /// Binding keys, reused by every stacking context tree in order. Frames whose
+    /// transform is a 2d scale and translation have a pool of their own. See
+    /// [`Self::next_key`] for why they are kept apart.
+    scale_translation_keys: KeyPool,
+    other_keys: KeyPool,
     /// The bound frames of the current stacking context tree.
     frames: Vec<BoundFrame>,
     by_fragment: FxHashMap<usize, usize>,
@@ -244,8 +195,8 @@ impl MoveBindings {
         self.frames.clear();
         self.by_fragment.clear();
         self.open.clear();
-        self.origin_keys.next = 0;
-        self.transform_keys.next = 0;
+        self.scale_translation_keys.next = 0;
+        self.other_keys.next = 0;
         self.moved.clear();
         self.staged.clear();
     }
@@ -254,20 +205,22 @@ impl MoveBindings {
         self.frames.len() < MAX_BOUND_FRAMES
     }
 
-    /// The binding key for the next frame of the given kind.
+    /// The binding key for the next frame, whose transform is or is not a 2d scale and
+    /// translation.
     ///
     /// A key never changes kind. The painter keeps the latest value of every key and
     /// can hand it to WebRender while WebRender still draws the previous display
     /// list, in which the same key may belong to another frame. WebRender requires the
-    /// transform of a frame that only translates to stay a translation, so a key of
-    /// such a frame must never have carried the matrix of a transformed box.
+    /// transform of a frame that is a 2d scale and translation to stay one, so a key
+    /// of such a frame must never have carried any other matrix.
     pub(crate) fn next_key(
         &mut self,
-        kind: &BoundFrameKind,
+        is_2d_scale_translation: bool,
     ) -> PropertyBindingKey<LayoutTransform> {
-        match kind {
-            BoundFrameKind::Origin { .. } => self.origin_keys.next_key(),
-            BoundFrameKind::Transform { .. } => self.transform_keys.next_key(),
+        if is_2d_scale_translation {
+            self.scale_translation_keys.next_key()
+        } else {
+            self.other_keys.next_key()
         }
     }
 
@@ -277,7 +230,7 @@ impl MoveBindings {
         &mut self,
         fragment: Arc<BoxFragment>,
         node: ScrollTreeNodeId,
-        kind: BoundFrameKind,
+        is_2d_scale_translation: bool,
     ) {
         let index = self.frames.len();
         self.by_fragment
@@ -285,7 +238,7 @@ impl MoveBindings {
         self.frames.push(BoundFrame {
             fragment,
             node,
-            kind,
+            is_2d_scale_translation,
             tainted: false,
             pending: None,
             staged: None,
@@ -303,14 +256,11 @@ impl MoveBindings {
 
     /// Taint the frames that enclose the current fragment, because it would not follow
     /// them. Returns the spatial nodes that must lose their binding.
-    pub(crate) fn taint_open_frames(&mut self, only_origin_frames: bool) -> Vec<ScrollTreeNodeId> {
+    pub(crate) fn taint_open_frames(&mut self) -> Vec<ScrollTreeNodeId> {
         let mut nodes = Vec::new();
         for index in &self.open {
             let frame = &mut self.frames[*index];
             if frame.tainted {
-                continue;
-            }
-            if only_origin_frames && !matches!(frame.kind, BoundFrameKind::Origin { .. }) {
                 continue;
             }
             frame.tainted = true;
@@ -342,12 +292,12 @@ impl MoveBindings {
         (!frame.tainted && Arc::ptr_eq(&frame.fragment, fragment)).then_some((index, frame))
     }
 
-    pub(crate) fn record_move(&mut self, index: usize, pending: PendingMove) {
+    pub(crate) fn record_move(&mut self, index: usize, transform: LayoutTransform) {
         let frame = &mut self.frames[index];
         if frame.pending.is_none() {
             self.moved.push(index);
         }
-        frame.pending = Some(pending);
+        frame.pending = Some(transform);
     }
 
     /// An element had damage that is not a move.
@@ -402,16 +352,10 @@ impl MoveBindings {
         &self.frames[index]
     }
 
-    /// The stacking context tree now has `frame` at its new place; `value` is what its
-    /// bound property must become.
-    pub(crate) fn stage(
-        &mut self,
-        index: usize,
-        kind: BoundFrameKind,
-        value: PropertyValue<LayoutTransform>,
-    ) {
+    /// The stacking context tree now has the frame at its new place; `value` is what
+    /// its bound property must become.
+    pub(crate) fn stage(&mut self, index: usize, value: PropertyValue<LayoutTransform>) {
         let frame = &mut self.frames[index];
-        frame.kind = kind;
         if frame.staged.is_none() {
             self.staged.push(index);
         }
@@ -456,6 +400,10 @@ mod tests {
     use crate::fragment_tree::BaseFragmentInfo;
     use crate::geom::PhysicalRect;
 
+    fn new_transform() -> LayoutTransform {
+        LayoutTransform::translation(60.0, 0.0, 0.0)
+    }
+
     fn fragment() -> Arc<BoxFragment> {
         Arc::new(BoxFragment::new(
             BaseFragmentInfo::new_for_testing(1),
@@ -469,32 +417,24 @@ mod tests {
         ))
     }
 
-    fn origin_kind() -> BoundFrameKind {
-        BoundFrameKind::Origin {
-            offset: PhysicalVec::zero(),
-        }
-    }
-
     #[test]
     fn keys_are_reused_by_the_next_stacking_context_tree_and_never_change_kind() {
-        let transform_kind = BoundFrameKind::Transform {
-            is_2d_scale_translation: false,
-        };
         let mut bindings = MoveBindings::default();
-        bindings.origin_keys.keys = vec![PropertyBindingKey::new(1), PropertyBindingKey::new(2)];
-        bindings.transform_keys.keys = vec![PropertyBindingKey::new(3)];
-        let first = bindings.next_key(&origin_kind());
-        let transform = bindings.next_key(&transform_kind);
-        let second = bindings.next_key(&origin_kind());
+        bindings.scale_translation_keys.keys =
+            vec![PropertyBindingKey::new(1), PropertyBindingKey::new(2)];
+        bindings.other_keys.keys = vec![PropertyBindingKey::new(3)];
+        let first = bindings.next_key(true);
+        let rotated = bindings.next_key(false);
+        let second = bindings.next_key(true);
         assert_eq!(first, PropertyBindingKey::new(1));
         assert_eq!(second, PropertyBindingKey::new(2));
-        assert_eq!(transform, PropertyBindingKey::new(3));
+        assert_eq!(rotated, PropertyBindingKey::new(3));
 
         // The next tree asks in another order and gets the same key for each kind.
         bindings.begin_stacking_context_tree();
-        assert_eq!(bindings.next_key(&transform_kind), transform);
-        assert_eq!(bindings.next_key(&origin_kind()), first);
-        assert_eq!(bindings.next_key(&origin_kind()), second);
+        assert_eq!(bindings.next_key(false), rotated);
+        assert_eq!(bindings.next_key(true), first);
+        assert_eq!(bindings.next_key(true), second);
     }
 
     #[test]
@@ -502,23 +442,18 @@ mod tests {
         let mut bindings = MoveBindings::default();
         let outer = fragment();
         let inner = fragment();
-        bindings.enter_frame(outer.clone(), ScrollTreeNodeId { index: 2 }, origin_kind());
-        bindings.enter_frame(
-            inner.clone(),
-            ScrollTreeNodeId { index: 3 },
-            BoundFrameKind::Transform {
-                is_2d_scale_translation: true,
-            },
-        );
-        // Something that only escapes origin frames leaves the transform frame alone.
+        bindings.enter_frame(outer.clone(), ScrollTreeNodeId { index: 2 }, true);
+        bindings.leave_frame();
+        bindings.enter_frame(inner.clone(), ScrollTreeNodeId { index: 3 }, true);
+        // Only the frames that enclose the current fragment are tainted.
         assert_eq!(
-            bindings.taint_open_frames(true),
-            vec![ScrollTreeNodeId { index: 2 }]
+            bindings.taint_open_frames(),
+            vec![ScrollTreeNodeId { index: 3 }]
         );
+        assert!(bindings.taint_open_frames().is_empty());
         bindings.leave_frame();
-        bindings.leave_frame();
-        assert!(bindings.frame_for(&outer).is_none());
-        assert!(bindings.frame_for(&inner).is_some());
+        assert!(bindings.frame_for(&outer).is_some());
+        assert!(bindings.frame_for(&inner).is_none());
         // A fragment that was never registered has no frame.
         assert!(bindings.frame_for(&fragment()).is_none());
     }
@@ -527,7 +462,7 @@ mod tests {
     fn a_restyle_reports_its_moves_once_and_forgets_abandoned_ones() {
         let mut bindings = MoveBindings::default();
         let moved = fragment();
-        bindings.enter_frame(moved.clone(), ScrollTreeNodeId { index: 2 }, origin_kind());
+        bindings.enter_frame(moved.clone(), ScrollTreeNodeId { index: 2 }, true);
         bindings.leave_frame();
         let (index, _) = bindings.frame_for(&moved).unwrap();
 
@@ -535,7 +470,7 @@ mod tests {
         assert!(bindings.finish_restyle().is_none());
 
         bindings.begin_restyle(true);
-        bindings.record_move(index, PendingMove::Offset(PhysicalVec::new(Au(60), Au(0))));
+        bindings.record_move(index, new_transform());
         bindings.note_other_damage();
         let batch = bindings.finish_restyle().unwrap();
         assert_eq!(batch.moves.len(), 1);
@@ -544,7 +479,7 @@ mod tests {
 
         // A move whose restyle never finished is not reported by the next one.
         bindings.begin_restyle(true);
-        bindings.record_move(index, PendingMove::Offset(PhysicalVec::new(Au(60), Au(0))));
+        bindings.record_move(index, new_transform());
         bindings.begin_restyle(true);
         assert!(bindings.finish_restyle().is_none());
     }
@@ -553,30 +488,18 @@ mod tests {
     fn staging_keeps_only_the_latest_value_for_a_frame() {
         let mut bindings = MoveBindings::default();
         let moved = fragment();
-        bindings.enter_frame(moved.clone(), ScrollTreeNodeId { index: 2 }, origin_kind());
+        bindings.enter_frame(moved.clone(), ScrollTreeNodeId { index: 2 }, true);
         bindings.leave_frame();
         let key = PropertyBindingKey::new(9);
-        bindings.stage(
-            0,
-            origin_kind(),
-            key.with(LayoutTransform::translation(1.0, 0.0, 0.0)),
-        );
-        bindings.stage(
-            0,
-            origin_kind(),
-            key.with(LayoutTransform::translation(2.0, 0.0, 0.0)),
-        );
+        bindings.stage(0, key.with(LayoutTransform::translation(1.0, 0.0, 0.0)));
+        bindings.stage(0, key.with(LayoutTransform::translation(2.0, 0.0, 0.0)));
         let (values, fragments) = bindings.take_staged();
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].value, LayoutTransform::translation(2.0, 0.0, 0.0));
         assert!(Arc::ptr_eq(&fragments[0], &moved));
         assert!(!bindings.has_staged());
 
-        bindings.stage(
-            0,
-            origin_kind(),
-            key.with(LayoutTransform::translation(3.0, 0.0, 0.0)),
-        );
+        bindings.stage(0, key.with(LayoutTransform::translation(3.0, 0.0, 0.0)));
         bindings.clear_staged();
         assert!(bindings.take_staged().0.is_empty());
     }
@@ -608,12 +531,12 @@ mod tests {
     fn a_move_without_a_frame_keeps_bound_moves_off_their_bindings() {
         let mut bindings = MoveBindings::default();
         let moved = fragment();
-        bindings.enter_frame(moved.clone(), ScrollTreeNodeId { index: 2 }, origin_kind());
+        bindings.enter_frame(moved.clone(), ScrollTreeNodeId { index: 2 }, true);
         bindings.leave_frame();
         let (index, _) = bindings.frame_for(&moved).unwrap();
 
         bindings.begin_restyle(true);
-        bindings.record_move(index, PendingMove::Offset(PhysicalVec::new(Au(60), Au(0))));
+        bindings.record_move(index, new_transform());
         assert!(bindings.note_unbound_move(OpaqueNode(7)));
         let batch = bindings.finish_restyle().unwrap();
         assert!(batch.other_damage);
@@ -633,7 +556,7 @@ mod tests {
         }
         assert!(!bindings.drop_unused_frames());
 
-        bindings.enter_frame(fragment(), ScrollTreeNodeId { index: 2 }, origin_kind());
+        bindings.enter_frame(fragment(), ScrollTreeNodeId { index: 2 }, true);
         bindings.leave_frame();
         for _ in 0..MAX_UNUSED_DISPLAY_LISTS - 1 {
             bindings.note_display_list();
@@ -673,26 +596,5 @@ mod tests {
         bindings.promote(OpaqueNode(MAX_PROMOTED_NODES));
         assert!(!bindings.is_promoted(OpaqueNode(0)));
         assert!(bindings.is_promoted(OpaqueNode(MAX_PROMOTED_NODES)));
-    }
-
-    #[test]
-    fn only_powers_of_two_scale_exactly() {
-        for scale in [1.0, 2.0, 4.0, 0.5, 0.25] {
-            assert!(is_power_of_two(scale), "{scale}");
-        }
-        for scale in [1.25, 1.5, 3.0, 0.75, 0.0, -1.0, f32::NAN, f32::INFINITY] {
-            assert!(!is_power_of_two(scale), "{scale}");
-        }
-    }
-
-    #[test]
-    fn whole_device_pixels() {
-        assert!(is_whole_device_pixels(Au::from_px(3), 1.0));
-        assert!(is_whole_device_pixels(Au::from_f32_px(-1.5), 2.0));
-        assert!(!is_whole_device_pixels(Au::from_f32_px(2.5), 0.5));
-        assert!(!is_whole_device_pixels(Au::from_f32_px(0.4), 1.0));
-        assert!(!is_whole_device_pixels(Au::from_f32_px(1.5), 1.0));
-        // 4px is 5 device pixels at 125%, but that scale is not exact.
-        assert!(!is_whole_device_pixels(Au::from_px(4), 1.25));
     }
 }

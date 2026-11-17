@@ -423,12 +423,11 @@ impl DisplayListBuilder<'_> {
                 SpatialTreeNodeInfo::ReferenceFrame(info) => {
                     // A frame that can move without a new display list has its
                     // transform bound to a property.
-                    let (origin, transform) = info.webrender_origin_and_transform();
                     let spatial_id = self.wr().push_reference_frame(
-                        origin,
+                        info.origin,
                         *parent_spatial_node_id,
                         info.transform_style,
-                        transform,
+                        info.webrender_transform(),
                         info.kind,
                     );
                     self.wr().pop_reference_frame();

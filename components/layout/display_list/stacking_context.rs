@@ -11,9 +11,8 @@ use embedder_traits::ViewportDetails;
 use euclid::{Point2D, Rect, SideOffsets2D, Size2D};
 use malloc_size_of_derive::MallocSizeOf;
 use paint_api::display_list::{
-    AxesScrollSensitivity, PaintDisplayListInfo, ReferenceFrameBinding, ReferenceFrameBindingKind,
-    ReferenceFrameNodeInfo, ScrollType, ScrollableNodeInfo, SpatialTreeNodeInfo, StickyNodeInfo,
-    TouchAction,
+    AxesScrollSensitivity, PaintDisplayListInfo, ReferenceFrameNodeInfo, ScrollType,
+    ScrollableNodeInfo, SpatialTreeNodeInfo, StickyNodeInfo, TouchAction,
 };
 use servo_base::id::ScrollTreeNodeId;
 use servo_base::print_tree::PrintTree;
@@ -21,7 +20,6 @@ use servo_config::opts::{DiagnosticsLogging, DiagnosticsLoggingOption};
 use servo_geometry::MaxRect;
 use style::Zero;
 use style::color::AbsoluteColor;
-use style::computed_values::background_attachment::SingleComputedValue as BackgroundAttachment;
 use style::computed_values::overflow_x::T as ComputedOverflow;
 use style::computed_values::position::T as ComputedPosition;
 use style::computed_values::text_decoration_style::T as TextDecorationStyle;
@@ -51,9 +49,7 @@ use crate::geom::{
     AuOrAuto, LengthPercentageOrAuto, PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalSize,
     PhysicalVec,
 };
-use crate::move_bindings::{
-    BoundFrameKind, MoveBatch, MoveBindings, PendingMove, is_power_of_two, is_whole_device_pixels,
-};
+use crate::move_bindings::{MoveBatch, MoveBindings};
 use crate::style_ext::{ComputedValuesExt, TransformExt};
 
 #[derive(Clone)]
@@ -246,7 +242,7 @@ impl StackingContextTree {
         transform_style: wr::TransformStyle,
         transform: LayoutTransform,
         kind: wr::ReferenceFrameKind,
-        binding: Option<ReferenceFrameBinding>,
+        binding: Option<wr::PropertyBindingKey<LayoutTransform>>,
     ) -> ScrollTreeNodeId {
         self.paint_info.scroll_tree.add_scroll_tree_node(
             Some(parent_scroll_node_id),
@@ -263,28 +259,14 @@ impl StackingContextTree {
 
     /// The fragment being added would not follow the bound frames that enclose it, so
     /// those frames must not move through their bindings.
-    fn taint_open_bound_frames(&mut self, only_origin_frames: bool) {
+    fn taint_open_bound_frames(&mut self) {
         if !self.move_bindings.has_open_frames() {
             return;
         }
-        for node in self.move_bindings.taint_open_frames(only_origin_frames) {
+        for node in self.move_bindings.taint_open_frames() {
             self.paint_info
                 .scroll_tree
                 .update_reference_frame(node, |info| info.binding = None);
-        }
-    }
-
-    /// Whether content in the given spatial node is part of a 3d rendering context.
-    fn is_in_preserve_3d_context(&self, mut node_id: ScrollTreeNodeId) -> bool {
-        loop {
-            let node = self.paint_info.scroll_tree.get_node(node_id);
-            if let SpatialTreeNodeInfo::ReferenceFrame(info) = &node.info {
-                return info.transform_style == wr::TransformStyle::Preserve3D;
-            }
-            match node.parent {
-                Some(parent) => node_id = parent,
-                None => return false,
-            }
         }
     }
 
@@ -299,7 +281,6 @@ impl StackingContextTree {
         fragment_tree: &FragmentTree,
         batch: &MoveBatch,
         bindings: &mut MoveBindings,
-        device_pixel_ratio: f32,
     ) -> bool {
         // A box that moves can change how far its ancestors scroll. The scroll frames
         // of this tree and of WebRender's scene hold the old extents, so only keep them
@@ -321,31 +302,15 @@ impl StackingContextTree {
             }
         }
 
-        for (index, pending) in &batch.moves {
-            let frame = bindings.frame(*index);
-            let (fragment, node, kind) = (frame.fragment.clone(), frame.node, frame.kind);
-            let new_kind = match (kind, pending) {
-                (BoundFrameKind::Origin { offset: moved }, PendingMove::Offset(offset)) => {
-                    let moved = moved + *offset;
-                    if !self.moves_by_whole_device_pixels(node, moved, device_pixel_ratio) ||
-                        !self.move_origin_frame(&fragment, node, *offset)
-                    {
-                        return false;
-                    }
-                    BoundFrameKind::Origin { offset: moved }
-                },
-                (BoundFrameKind::Transform { .. }, PendingMove::Transform(transform)) => {
-                    if !self
-                        .paint_info
-                        .scroll_tree
-                        .update_reference_frame(node, |info| info.transform = (*transform).into())
-                    {
-                        return false;
-                    }
-                    kind
-                },
-                _ => return false,
-            };
+        for (index, transform) in &batch.moves {
+            let node = bindings.frame(*index).node;
+            if !self
+                .paint_info
+                .scroll_tree
+                .update_reference_frame(node, |info| info.transform = (*transform).into())
+            {
+                return false;
+            }
             let value = match &self.paint_info.scroll_tree.get_node(node).info {
                 SpatialTreeNodeInfo::ReferenceFrame(info) => info.bound_transform(),
                 _ => None,
@@ -353,137 +318,8 @@ impl StackingContextTree {
             let Some(value) = value else {
                 return false;
             };
-            bindings.stage(*index, new_kind, value);
+            bindings.stage(*index, value);
         }
-        true
-    }
-
-    /// Whether the frame `node`, having moved its contents by `offset` in all since its
-    /// display list was built, puts them on the pixels a new display list would.
-    ///
-    /// WebRender snaps text and the edges of boxes to device pixels. Two things must
-    /// hold for contents that a frame moves to be snapped the way a new display list
-    /// would snap them:
-    ///
-    /// - They move by a whole number of device pixels. Moved by a fraction of one,
-    ///   some of them would be snapped the other way.
-    /// - The scale from the frame to the screen is a power of two, which is the scale
-    ///   of every display that is not scaled by a fraction. At any other scale an edge
-    ///   can lie exactly halfway between two device pixels at a position that a float
-    ///   does not hold exactly (at 125%, `222.8px` is device pixel `278.5`). Which way
-    ///   it is snapped then depends on the rounding error of that one number, and the
-    ///   number is not the same when the frame adds the move as when the box is
-    ///   described at its new position.
-    ///
-    /// Above a rotation, skew or perspective nothing says how far the contents move on
-    /// screen, so neither holds.
-    fn moves_by_whole_device_pixels(
-        &self,
-        node: ScrollTreeNodeId,
-        offset: PhysicalVec<Au>,
-        device_pixel_ratio: f32,
-    ) -> bool {
-        let scroll_tree = &self.paint_info.scroll_tree;
-        let Some(parent) = scroll_tree.get_node(node).parent else {
-            return false;
-        };
-        let to_root = scroll_tree
-            .cumulative_node_to_root_transform(parent)
-            .to_transform()
-            .into_owned();
-        if !is_2d_scale_translation(&to_root) {
-            return false;
-        }
-        is_whole_device_pixels(offset.x, to_root.m11 * device_pixel_ratio) &&
-            is_whole_device_pixels(offset.y, to_root.m22 * device_pixel_ratio)
-    }
-
-    /// Move the contents of the frame that was added around `fragment` by `offset`.
-    /// The fragment already has its new position.
-    fn move_origin_frame(
-        &mut self,
-        fragment: &Arc<BoxFragment>,
-        node: ScrollTreeNodeId,
-        offset: PhysicalVec<Au>,
-    ) -> bool {
-        let moved = LayoutVector2D::new(offset.x.to_f32_px(), offset.y.to_f32_px());
-        if !self
-            .paint_info
-            .scroll_tree
-            .update_reference_frame(node, |info| {
-                info.origin += moved;
-                info.frame_origin_for_query += moved;
-            })
-        {
-            return false;
-        }
-
-        // What is inside the frame keeps the coordinates it was described in when the
-        // display list was built, and the fragment has moved. The containing block the
-        // fragment is positioned in moves the other way to make up for that.
-        fn find<'a>(
-            stacking_context: &'a mut StackingContext,
-            fragment: &Arc<BoxFragment>,
-        ) -> Option<&'a mut StackingContext> {
-            if stacking_context
-                .fragment()
-                .is_some_and(|candidate| Arc::ptr_eq(candidate, fragment))
-            {
-                return Some(stacking_context);
-            }
-            stacking_context
-                .children
-                .iter_mut()
-                .find_map(|child| find(child, fragment))
-        }
-        let Some(stacking_context) = find(&mut self.root_stacking_context, fragment) else {
-            return false;
-        };
-        stacking_context.containing_block_origin -= offset;
-
-        // If the fragment scrolls its contents, its scrollable overflow is recorded
-        // relative to its containing block, like its own position.
-        if let Some(scroll_node_id) = fragment.generated_scroll_tree_node_id() &&
-            let SpatialTreeNodeInfo::Scroll(info) = &mut self
-                .paint_info
-                .scroll_tree
-                .get_node_mut(scroll_node_id)
-                .info
-        {
-            info.content_rect = fragment.with_style().scrollable_overflow().to_webrender();
-        }
-
-        // Descendants cache where their containing blocks are in the document.
-        fn translate_containing_blocks(fragments: &[Fragment], offset: PhysicalSize<Au>) {
-            for fragment in fragments {
-                match fragment {
-                    Fragment::LayoutRoot(layout_root) => {
-                        let box_fragment = Arc::clone(&*layout_root.inner_box_fragment());
-                        box_fragment
-                            .cumulative_containing_block_rect
-                            .translate(offset);
-                        translate_containing_blocks(&box_fragment.children, offset);
-                    },
-                    Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
-                        box_fragment
-                            .cumulative_containing_block_rect
-                            .translate(offset);
-                        translate_containing_blocks(&box_fragment.children, offset);
-                    },
-                    Fragment::Positioning(positioning_fragment) => {
-                        positioning_fragment
-                            .cumulative_containing_block_rect
-                            .translate(offset);
-                        translate_containing_blocks(&positioning_fragment.children, offset);
-                    },
-                    Fragment::AbsoluteOrFixedPositionedPlaceholder(_) |
-                    Fragment::Text(_) |
-                    Fragment::Image(_) |
-                    Fragment::IFrame(_) => {},
-                }
-            }
-        }
-        translate_containing_blocks(&fragment.children, offset.to_size());
         true
     }
 
@@ -798,7 +634,7 @@ impl Fragment {
             Fragment::IFrame(_) => {
                 // WebRender places an iframe when it builds the scene, using the
                 // transforms around it at that time.
-                stacking_context_tree.taint_open_bound_frames(false);
+                stacking_context_tree.taint_open_bound_frames();
             },
             Fragment::Text(_) | Fragment::Image(_) => {},
         }
@@ -846,17 +682,6 @@ impl BoxFragment {
         text_decorations: &Rc<Vec<FragmentTextDecoration>>,
     ) {
         self.clear_stacking_context_tree_traversal_data();
-        if stacking_context_tree.move_bindings.has_open_frames() {
-            // A fixed position box, or a fixed background, inside a box that is only
-            // translated stays where it is when that box moves.
-            let does_not_follow_ancestors = {
-                let style = self.style();
-                style.get_box().position == ComputedPosition::Fixed || has_fixed_background(&style)
-            };
-            if does_not_follow_ancestors {
-                stacking_context_tree.taint_open_bound_frames(true);
-            }
-        }
         self.build_stacking_context_tree_maybe_creating_reference_frame(
             fragment,
             stacking_context_tree,
@@ -876,32 +701,21 @@ impl BoxFragment {
         parent_stacking_context: &mut StackingContext,
         text_decorations: &Rc<Vec<FragmentTextDecoration>>,
     ) {
-        let reference_frame_data = match self
-            .reference_frame_data_if_necessary(&containing_block.rect)
-        {
-            Some(reference_frame_data) => reference_frame_data,
-            None => {
-                if self.should_have_bound_origin_frame(stacking_context_tree, containing_block) {
-                    return self.build_stacking_context_tree_in_bound_origin_frame(
+        let reference_frame_data =
+            match self.reference_frame_data_if_necessary(&containing_block.rect) {
+                Some(reference_frame_data) => reference_frame_data,
+                None => {
+                    return self.build_stacking_context_tree_maybe_creating_stacking_context(
                         fragment,
                         stacking_context_tree,
                         containing_block,
                         containing_block_info,
                         parent_stacking_context,
                         text_decorations,
+                        None, /* reference_frame_info */
                     );
-                }
-                return self.build_stacking_context_tree_maybe_creating_stacking_context(
-                    fragment,
-                    stacking_context_tree,
-                    containing_block,
-                    containing_block_info,
-                    parent_stacking_context,
-                    text_decorations,
-                    None, /* reference_frame_info */
-                );
-            },
-        };
+                },
+            };
 
         // <https://drafts.csswg.org/css-transforms/#transform-function-lists>
         // > If a transform function causes the current transformation matrix of an object
@@ -918,11 +732,13 @@ impl BoxFragment {
             )
             .origin
             .to_webrender();
-        let bound_kind =
-            self.bound_transform_frame_kind(stacking_context_tree, &reference_frame_data);
-        let binding = bound_kind.map(|bound_kind| ReferenceFrameBinding {
-            key: stacking_context_tree.move_bindings.next_key(&bound_kind),
-            kind: ReferenceFrameBindingKind::Transform,
+        // A box that is likely to move has the transform of its frame bound to a
+        // property, so that a later change of the transform needs no new display list.
+        let bound_frame = self.bound_frame_kind(stacking_context_tree, &reference_frame_data);
+        let binding = bound_frame.map(|is_2d_scale_translation| {
+            stacking_context_tree
+                .move_bindings
+                .next_key(is_2d_scale_translation)
         });
         let new_spatial_id = stacking_context_tree.push_reference_frame(
             reference_frame_data.origin.to_webrender(),
@@ -933,11 +749,11 @@ impl BoxFragment {
             reference_frame_data.kind,
             binding,
         );
-        if let Some(bound_kind) = bound_kind {
+        if let Some(is_2d_scale_translation) = bound_frame {
             stacking_context_tree.move_bindings.enter_frame(
                 self.clone(),
                 new_spatial_id,
-                bound_kind,
+                is_2d_scale_translation,
             );
         }
 
@@ -977,146 +793,35 @@ impl BoxFragment {
             text_decorations,
             Some(reference_frame_info),
         );
-        if bound_kind.is_some() {
+        if bound_frame.is_some() {
             stacking_context_tree.move_bindings.leave_frame();
         }
     }
 
-    /// The node and style conditions shared by both kinds of bound frame: the box
-    /// belongs to an element that was promoted, and the tree has room for the frame.
-    fn can_have_bound_frame(&self, stacking_context_tree: &StackingContextTree) -> bool {
-        let Some(tag) = self.base.tag else {
-            return false;
-        };
-        tag.pseudo_element_chain.is_empty() &&
+    /// Whether the reference frame of this transformed box should have its transform
+    /// bound to a property, and if so, whether the transform is a 2d scale and
+    /// translation. The box must belong to an element that was promoted, and the tree
+    /// must have room for the frame.
+    fn bound_frame_kind(
+        &self,
+        stacking_context_tree: &StackingContextTree,
+        reference_frame_data: &ReferenceFrameData,
+    ) -> Option<bool> {
+        if !matches!(
+            reference_frame_data.kind,
+            wr::ReferenceFrameKind::Transform { .. }
+        ) {
+            return None;
+        }
+        let tag = self.base.tag?;
+        let can_be_bound = tag.pseudo_element_chain.is_empty() &&
             stacking_context_tree.move_bindings.is_promoted(tag.node) &&
             stacking_context_tree.move_bindings.can_add_frame() &&
             !self.base.flags.intersects(
                 FragmentFlags::IS_ROOT_ELEMENT |
                     FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT,
-            )
-    }
-
-    /// If the reference frame of this transformed box should have its transform bound
-    /// to a property, the kind of bound frame to register for it.
-    fn bound_transform_frame_kind(
-        &self,
-        stacking_context_tree: &StackingContextTree,
-        reference_frame_data: &ReferenceFrameData,
-    ) -> Option<BoundFrameKind> {
-        if !matches!(
-            reference_frame_data.kind,
-            wr::ReferenceFrameKind::Transform { .. }
-        ) || !self.can_have_bound_frame(stacking_context_tree)
-        {
-            return None;
-        }
-        Some(BoundFrameKind::Transform {
-            is_2d_scale_translation: is_2d_scale_translation(&reference_frame_data.transform),
-        })
-    }
-
-    /// Whether to add a reference frame around this box, which has none of its own, so
-    /// that a later change of its box offsets can move it through a property binding.
-    fn should_have_bound_origin_frame(
-        &self,
-        stacking_context_tree: &StackingContextTree,
-        containing_block: &ContainingBlock,
-    ) -> bool {
-        if !self.can_have_bound_frame(stacking_context_tree) {
-            return false;
-        }
-        {
-            let style = self.style();
-            if !style.get_box().position.is_absolutely_positioned() || has_fixed_background(&style)
-            {
-                return false;
-            }
-        }
-        // A move through the frame is only exact on a display that is not scaled by a
-        // fraction (see `moves_by_whole_device_pixels`). On any other, leave the box as
-        // it is without the frame.
-        let device_pixel_ratio = stacking_context_tree
-            .paint_info
-            .viewport_details
-            .hidpi_scale_factor
-            .get();
-        if !is_power_of_two(device_pixel_ratio) {
-            return false;
-        }
-        // The frame is flat. Inside a 3d rendering context it would flatten the box.
-        !stacking_context_tree.is_in_preserve_3d_context(containing_block.scroll_node_id)
-    }
-
-    /// Build the stacking context tree for this absolutely positioned box inside a
-    /// reference frame that is the identity for now, and translates the box once it
-    /// moves. The box and everything in it is described exactly as it would be
-    /// without the frame, in the coordinates of the frame's parent: the same clips,
-    /// the same containing blocks, the same positions. Only the spatial node differs.
-    fn build_stacking_context_tree_in_bound_origin_frame(
-        self: &Arc<Self>,
-        fragment: Fragment,
-        stacking_context_tree: &mut StackingContextTree,
-        containing_block: &ContainingBlock,
-        containing_block_info: &ContainingBlockInfo,
-        parent_stacking_context: &mut StackingContext,
-        text_decorations: &Rc<Vec<FragmentTextDecoration>>,
-    ) {
-        let origin = self.border_rect().origin + containing_block.rect.origin.to_vector();
-        let query_origin = self
-            .cumulative_border_box_rect(
-                ContainingBlockCalculation::AlreadyDoneWithStackingContextTree,
-            )
-            .origin;
-        let bound_kind = BoundFrameKind::Origin {
-            offset: PhysicalVec::zero(),
-        };
-        let binding = ReferenceFrameBinding {
-            key: stacking_context_tree.move_bindings.next_key(&bound_kind),
-            kind: ReferenceFrameBindingKind::Origin,
-        };
-        // The frame's coordinates are those of its parent, which start here in the
-        // document.
-        let parent_origin_for_query = query_origin - origin.to_vector();
-        let frame_id = stacking_context_tree.push_reference_frame(
-            LayoutPoint::zero(),
-            parent_origin_for_query.to_webrender(),
-            containing_block.scroll_node_id,
-            wr::TransformStyle::Flat,
-            LayoutTransform::identity(),
-            wr::ReferenceFrameKind::Transform {
-                is_2d_scale_translation: true,
-                should_snap: false,
-                paired_with_perspective: false,
-            },
-            Some(binding),
-        );
-        stacking_context_tree
-            .move_bindings
-            .enter_frame(self.clone(), frame_id, bound_kind);
-
-        let adjusted_containing_block = ContainingBlock {
-            scroll_node_id: frame_id,
-            // Without the frame, this box and its children take the scroll frame size
-            // from the containing block for non-absolute descendants at this place in
-            // the tree. Keep that.
-            scroll_frame_size: containing_block_info
-                .for_non_absolute_descendants
-                .scroll_frame_size,
-            ..containing_block.clone()
-        };
-        let new_containing_block_info =
-            containing_block_info.new_for_non_absolute_descendants(&adjusted_containing_block);
-        self.build_stacking_context_tree_maybe_creating_stacking_context(
-            fragment,
-            stacking_context_tree,
-            &adjusted_containing_block,
-            &new_containing_block_info,
-            parent_stacking_context,
-            text_decorations,
-            None, /* reference_frame_info */
-        );
-        stacking_context_tree.move_bindings.leave_frame();
+            );
+        can_be_bound.then(|| is_2d_scale_translation(&reference_frame_data.transform))
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1678,10 +1383,6 @@ impl BoxFragment {
             offsets.left.non_auto().map(|v| v.to_f32_px()),
         );
 
-        // A sticky frame is placed relative to its scroll frame through the origins of
-        // the reference frames between them, not through their transforms.
-        stacking_context_tree.taint_open_bound_frames(true);
-
         let sticky_node_id = stacking_context_tree.define_sticky_frame(
             parent_scroll_node_id,
             frame_rect,
@@ -1819,14 +1520,6 @@ pub(crate) fn is_2d_scale_translation(transform: &LayoutTransform) -> bool {
         transform.m32.abs() < NEARLY_ZERO &&
         transform.m34.abs() < NEARLY_ZERO &&
         transform.m43.abs() < NEARLY_ZERO
-}
-
-fn has_fixed_background(style: &ComputedValues) -> bool {
-    style
-        .get_background()
-        .background_attachment
-        .0
-        .contains(&BackgroundAttachment::Fixed)
 }
 
 impl BoxFragment {

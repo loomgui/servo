@@ -23,7 +23,6 @@ use crate::dom::{DOMLayoutData, NodeExt};
 use crate::fragment_tree::BoxFragment;
 use crate::layout_box_base::LayoutBoxBase;
 use crate::layout_root::LayoutRoot;
-use crate::move_bindings::{BoundFrameKind, PendingMove, is_whole_device_pixels};
 use crate::style_ext::ComputedValuesExt;
 
 pub struct RecalcStyle<'a> {
@@ -262,12 +261,12 @@ pub(crate) fn compute_damage_and_rebuild_box_tree_below_dirty_root<'dom>(
     }
 }
 
-/// Whether the element's own `style` attribute sets its box offsets or its transform.
-/// Such an element is placed by script, which often goes on to move it: a tooltip or
-/// a dragged item that follows the pointer. Giving its box a bound reference frame
-/// from the start lets the first move take the fast path. This is only a guess, which
-/// is dropped while it does not pay off (see [`crate::move_bindings`]); it never
-/// decides whether a later change is a move.
+/// Promote the element if its own `style` attribute sets its transform. Such an
+/// element is placed by script, which often goes on to move it: a tooltip or a dragged
+/// item that follows the pointer. Binding the transform of its reference frame from
+/// the start lets the first move take the fast path. This is only a guess, which is
+/// dropped while it does not pay off (see [`crate::move_bindings`]); it never decides
+/// whether a later change is a move.
 fn promote_if_positioned_by_style_attribute(
     layout_context: &LayoutContext,
     element: ServoLayoutElement<'_>,
@@ -279,10 +278,7 @@ fn promote_if_positioned_by_style_attribute(
     };
     let declarations = style_attribute.read_with(layout_context.style_context.guards.author);
     let has = |longhand| declarations.contains(PropertyDeclarationId::Longhand(longhand));
-    let sets_box_offsets = (has(LonghandId::Left) || has(LonghandId::Right)) &&
-        (has(LonghandId::Top) || has(LonghandId::Bottom));
-    let sets_transform = has(LonghandId::Transform) || has(LonghandId::Translate);
-    if sets_box_offsets || sets_transform {
+    if has(LonghandId::Transform) || has(LonghandId::Translate) {
         layout_context
             .background_colors
             .lock()
@@ -416,14 +412,14 @@ impl<'a> ElementDamageSet<'a> {
         }
     }
 
-    /// If the style change on this element only moves its box, and the display list
-    /// has a bound reference frame for that box, apply the move in place. This runs
-    /// before the element's damage is passed to its children.
+    /// If the style change on this element only changes the transform of its box, and
+    /// the display list has a bound reference frame for that box, record the move.
+    /// This runs before the element's damage is passed to its children.
     ///
-    /// The box is then where a new layout would put it, with the same fragments. If
-    /// anything else in this restyle needs a new stacking context tree or display
-    /// list, those are built from the moved fragment as usual. If nothing else does,
-    /// the move reaches the screen through the frame's property binding.
+    /// The box keeps its fragments, which do not depend on its transform. If anything
+    /// else in this restyle needs a new stacking context tree or display list, those
+    /// are built as usual. If nothing else does, the move reaches the screen through
+    /// the frame's property binding.
     ///
     /// A move of a box without a bound frame is only reported. Nothing is changed,
     /// and the element's damage is handled like any other.
@@ -437,9 +433,9 @@ impl<'a> ElementDamageSet<'a> {
         if self.on_element.is_empty() || !self.from_parent.is_empty() {
             return None;
         }
+        // A change of transform alone only needs the scrollable overflow again.
         let damage = self.on_element - LayoutDamage::RecomputeInlineContentSizes;
-        let changes_box_offsets = damage == LayoutDamage::Relayout;
-        if !changes_box_offsets && damage != LayoutDamage::RecalculateOverflow {
+        if damage != LayoutDamage::RecalculateOverflow {
             return None;
         }
         if !layout_context.background_colors.lock().moves.enabled() {
@@ -455,40 +451,11 @@ impl<'a> ElementDamageSet<'a> {
         }
 
         let new_style = self.node.style(&layout_context.style_context);
-        let (fragment, pending) = if changes_box_offsets {
-            let layout_root = LayoutRoot::try_from(self.node).ok()?;
-            let mut only_box_offsets_changed = false;
-            self.node.with_layout_box_base(|base| {
-                only_box_offsets_changed = base.style.same_except_box_offsets(&new_style);
-            });
-            if !only_box_offsets_changed {
-                return None;
-            }
-            let (fragment, offset) = layout_root.offset_for_box_offsets_change(&new_style)?;
-            // A box moved by its offsets only goes through its frame by whole device
-            // pixels, on a display that is not scaled by a fraction. Any other such
-            // change is not a move: it takes the ordinary path, and does not earn the
-            // box a frame that could not carry it.
-            let device_pixel_ratio = layout_context
-                .style_context
-                .stylist
-                .device()
-                .device_pixel_ratio()
-                .get();
-            if !is_whole_device_pixels(offset.x, device_pixel_ratio) ||
-                !is_whole_device_pixels(offset.y, device_pixel_ratio)
-            {
-                return None;
-            }
-            (fragment, PendingMove::Offset(offset))
-        } else {
-            let mut change = None;
-            self.node.with_layout_box_base(|base| {
-                change = transform_for_transform_change(base, &new_style);
-            });
-            let (fragment, transform) = change?;
-            (fragment, PendingMove::Transform(transform))
-        };
+        let mut change = None;
+        self.node.with_layout_box_base(|base| {
+            change = transform_for_transform_change(base, &new_style);
+        });
+        let (fragment, transform) = change?;
 
         // This change is a move. Without a bound frame it cannot be applied as one;
         // the node is remembered, and gets a frame if this restyle only moves boxes.
@@ -502,26 +469,13 @@ impl<'a> ElementDamageSet<'a> {
         if !cache.retained_display_list_is_live() {
             return None;
         }
-        match (frame.kind, pending) {
-            (BoundFrameKind::Origin { .. }, PendingMove::Offset(offset)) => {
-                fragment.base.translate_rect(offset.to_size());
-            },
-            (
-                BoundFrameKind::Transform {
-                    is_2d_scale_translation: was_2d_scale_translation,
-                },
-                PendingMove::Transform(transform),
-            ) => {
-                // WebRender draws the contents of a 2d scale and translation in the
-                // coordinate system of their parent. Changing to or from one changes
-                // how the contents are drawn, which needs a new scene.
-                if is_2d_scale_translation(&transform) != was_2d_scale_translation {
-                    return None;
-                }
-            },
-            _ => return None,
+        // WebRender draws the contents of a 2d scale and translation in the
+        // coordinate system of their parent. Changing to or from one changes how the
+        // contents are drawn, which needs a new scene.
+        if is_2d_scale_translation(&transform) != frame.is_2d_scale_translation {
+            return None;
         }
-        cache.moves.record_move(index, pending);
+        cache.moves.record_move(index, transform);
         drop(cache);
 
         inner_layout_data.repair_style_after_move(&self.node, layout_context, &new_style);

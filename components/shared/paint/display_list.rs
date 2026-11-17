@@ -213,24 +213,6 @@ impl StickyNodeInfo {
     }
 }
 
-/// Which part of a reference frame is bound to a WebRender transform property.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum ReferenceFrameBindingKind {
-    /// The frame only places its contents at [`ReferenceFrameNodeInfo::origin`]. The
-    /// bound value is the translation to that origin.
-    Origin,
-    /// The bound value is [`ReferenceFrameNodeInfo::transform`]. The origin is fixed.
-    Transform,
-}
-
-/// A WebRender property binding for a reference frame. A frame with a binding can move
-/// through a property update, without a new display list.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-pub struct ReferenceFrameBinding {
-    pub key: PropertyBindingKey<LayoutTransform>,
-    pub kind: ReferenceFrameBindingKind,
-}
-
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct ReferenceFrameNodeInfo {
     pub origin: LayoutPoint,
@@ -239,10 +221,10 @@ pub struct ReferenceFrameNodeInfo {
     pub transform_style: TransformStyle,
     pub transform: FastLayoutTransform,
     pub kind: ReferenceFrameKind,
-    /// The property this frame's transform is bound to, if it can move without a new
-    /// display list.
+    /// The WebRender property that [`Self::transform`] is bound to, if this frame can
+    /// take a new transform through a property update, without a new display list.
     #[ignore_malloc_size_of = "A WebRender key without heap data"]
-    pub binding: Option<ReferenceFrameBinding>,
+    pub binding: Option<PropertyBindingKey<LayoutTransform>>,
 }
 
 impl ReferenceFrameNodeInfo {
@@ -250,32 +232,15 @@ impl ReferenceFrameNodeInfo {
     /// list and later property updates both take the value from here, so a frame moved
     /// by an update is described to WebRender exactly as a new display list would.
     pub fn bound_transform(&self) -> Option<PropertyValue<LayoutTransform>> {
-        let binding = self.binding?;
-        let value = match binding.kind {
-            ReferenceFrameBindingKind::Origin => {
-                LayoutTransform::translation(self.origin.x, self.origin.y, 0.0)
-            },
-            ReferenceFrameBindingKind::Transform => *self.transform.to_transform(),
-        };
-        Some(binding.key.with(value))
+        Some(self.binding?.with(*self.transform.to_transform()))
     }
 
-    /// The origin and transform that describe this frame to WebRender.
-    pub fn webrender_origin_and_transform(
-        &self,
-    ) -> (LayoutPoint, PropertyBinding<LayoutTransform>) {
-        match (self.binding, self.bound_transform()) {
-            (Some(binding), Some(bound)) => {
-                let origin = match binding.kind {
-                    ReferenceFrameBindingKind::Origin => LayoutPoint::zero(),
-                    ReferenceFrameBindingKind::Transform => self.origin,
-                };
-                (origin, PropertyBinding::Binding(bound.key, bound.value))
-            },
-            _ => (
-                self.origin,
-                PropertyBinding::Value(*self.transform.to_transform()),
-            ),
+    /// The transform that describes this frame to WebRender: bound to a property if
+    /// the frame has one, a plain value otherwise.
+    pub fn webrender_transform(&self) -> PropertyBinding<LayoutTransform> {
+        match self.bound_transform() {
+            Some(bound) => PropertyBinding::Binding(bound.key, bound.value),
+            None => PropertyBinding::Value(*self.transform.to_transform()),
         }
     }
 }
