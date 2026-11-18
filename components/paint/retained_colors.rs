@@ -6,6 +6,7 @@ use rustc_hash::FxHashMap;
 use servo_base::Epoch;
 use servo_base::id::{PipelineId, WebViewId};
 use webrender::Transaction;
+use webrender_api::units::LayoutTransform;
 use webrender_api::{
     ColorF, DynamicProperties, PropertyBindingId, PropertyBindingKey, PropertyValue,
 };
@@ -14,6 +15,9 @@ struct PipelineColors {
     generation: u64,
     epoch: Epoch,
     colors: FxHashMap<PropertyBindingId, PropertyValue<ColorF>>,
+    /// The latest value of every reference frame transform this pipeline's display
+    /// list bound to a property.
+    transforms: FxHashMap<PropertyBindingId, PropertyValue<LayoutTransform>>,
     caret_binding: Option<(PropertyBindingKey<ColorF>, ColorF)>,
     // WR overrides survive ordinary full DLs even when a caret is temporarily
     // absent. Only an actual animated-property reset removes inactive samples.
@@ -51,10 +55,61 @@ impl RetainedColors {
                     .into_iter()
                     .map(|color| (color.key.id, color))
                     .collect(),
+                transforms: FxHashMap::default(),
                 caret_binding,
                 caret_sample,
             },
         );
+    }
+
+    /// Record the transforms bound by the display list that [`Self::install`] just
+    /// registered for this pipeline, with the values that list was built with.
+    pub(crate) fn install_transforms(
+        &mut self,
+        webview: WebViewId,
+        pipeline: PipelineId,
+        transforms: impl IntoIterator<Item = PropertyValue<LayoutTransform>>,
+    ) {
+        if let Some(retained) = self.pipelines.get_mut(&(webview, pipeline)) {
+            retained.transforms = transforms
+                .into_iter()
+                .map(|transform| (transform.key.id, transform))
+                .collect();
+        }
+    }
+
+    /// Like [`Self::update`], for a batch that may also move bound reference frames.
+    /// Nothing is changed unless every color and transform belongs to the current
+    /// display list.
+    pub(crate) fn update_with_transforms(
+        &mut self,
+        webview: WebViewId,
+        pipeline: PipelineId,
+        generation: u64,
+        epoch: Epoch,
+        colors: &[PropertyValue<ColorF>],
+        transforms: &[PropertyValue<LayoutTransform>],
+    ) -> bool {
+        let Some(retained) = self.pipelines.get(&(webview, pipeline)) else {
+            return false;
+        };
+        if transforms
+            .iter()
+            .any(|transform| !retained.transforms.contains_key(&transform.key.id))
+        {
+            return false;
+        }
+        if !self.update(webview, pipeline, generation, epoch, colors) {
+            return false;
+        }
+        let retained = self
+            .pipelines
+            .get_mut(&(webview, pipeline))
+            .expect("The pipeline was just updated");
+        for transform in transforms {
+            retained.transforms.insert(transform.key.id, *transform);
+        }
+        true
     }
 
     pub(crate) fn update(
@@ -125,12 +180,21 @@ impl RetainedColors {
             .collect()
     }
 
+    pub(crate) fn all_transforms(&self) -> Vec<PropertyValue<LayoutTransform>> {
+        self.pipelines
+            .values()
+            .flat_map(|pipeline| pipeline.transforms.values().copied())
+            .collect()
+    }
+
     /// All production color resets use this order and this latest-value store.
-    /// The pinned WR append API otherwise retains every historical value.
+    /// The pinned WR append API otherwise retains every historical value. Bound
+    /// transforms are reinstalled with the colors, so a reset never returns a moved
+    /// reference frame to the value of the display list that created it.
     pub(crate) fn reset_transaction(&self, transaction: &mut Transaction) {
         transaction.reset_dynamic_properties();
         transaction.append_dynamic_properties(DynamicProperties {
-            transforms: Vec::new(),
+            transforms: self.all_transforms(),
             floats: Vec::new(),
             colors: self.all(),
         });

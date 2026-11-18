@@ -28,6 +28,7 @@ mod taffy;
 mod construct_modern;
 mod layout_root;
 mod lists;
+mod move_bindings;
 mod positioned;
 mod query;
 mod quotes;

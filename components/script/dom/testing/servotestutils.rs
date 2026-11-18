@@ -78,6 +78,12 @@ impl AutomaticRenderingObservation {
         }
         if self
             .phases
+            .contains(ReflowPhasesRun::UpdatedTransformBindings)
+        {
+            phases.push(DOMString::from_static("UpdatedTransformBindings"))
+        }
+        if self
+            .phases
             .contains(ReflowPhasesRun::UpdatedScrollNodeOffset)
         {
             phases.push(DOMString::from_static("UpdatedScrollNodeOffset"))

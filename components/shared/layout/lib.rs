@@ -674,6 +674,9 @@ bitflags! {
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     pub struct ReflowPhasesRun: u8 {
         const RanLayout = 1 << 0;
+        /// Boxes that only moved were moved through the property bindings of their
+        /// reference frames, without a new display list.
+        const UpdatedTransformBindings = 1 << 1;
         const BuiltStackingContextTree = 1 << 2;
         const BuiltDisplayList = 1 << 3;
         const UpdatedScrollNodeOffset = 1 << 4;
@@ -692,7 +695,8 @@ impl ReflowPhasesRun {
             Self::BuiltDisplayList
                 | Self::UpdatedScrollNodeOffset
                 | Self::UpdatedImageData
-                | Self::UpdatedBackgroundColors,
+                | Self::UpdatedBackgroundColors
+                | Self::UpdatedTransformBindings,
         )
     }
 }

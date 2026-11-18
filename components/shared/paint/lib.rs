@@ -38,7 +38,7 @@ use servo_base::generic_channel::{
     self, GenericCallback, GenericReceiver, GenericSender, GenericSharedMemory, SendError,
 };
 pub use webrender_api::ExternalImageSource;
-use webrender_api::units::{DevicePixel, LayoutVector2D, TexelRect};
+use webrender_api::units::{DevicePixel, LayoutTransform, LayoutVector2D, TexelRect};
 use webrender_api::{
     BuiltDisplayList, BuiltDisplayListDescriptor, ColorF, ExternalImage, ExternalImageData,
     ExternalImageHandler, ExternalImageId, ExternalScrollId, FontInstanceFlags, FontInstanceKey,
@@ -167,12 +167,14 @@ pub enum PaintMessage {
         /// A [`GenericReceiver`] used to send the serialized  version of `DisplayListPayload.
         display_list_data_receiver: GenericReceiver<SerializableDisplayListPayload>,
     },
-    /// Change retained background primitives without replacing their scene.
+    /// Change retained background primitives and bound reference frame transforms
+    /// without replacing their scene.
     UpdateBackgroundColors {
         webview_id: WebViewId,
         pipeline_id: PipelineId,
         epoch: Epoch,
         colors: Vec<PropertyValue<ColorF>>,
+        transforms: Vec<PropertyValue<LayoutTransform>>,
         generation: u64,
         response: GenericSender<bool>,
     },
@@ -380,6 +382,28 @@ impl CrossProcessPaintApi {
         generation: u64,
         colors: Vec<PropertyValue<ColorF>>,
     ) -> bool {
+        self.update_retained_properties(
+            webview_id,
+            pipeline_id,
+            epoch,
+            generation,
+            colors,
+            Vec::new(),
+        )
+    }
+
+    /// Like [`Self::update_background_colors`], and also moves reference frames whose
+    /// transforms the current display list bound to properties. The batch is accepted
+    /// or rejected as a whole.
+    pub fn update_retained_properties(
+        &self,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        epoch: Epoch,
+        generation: u64,
+        colors: Vec<PropertyValue<ColorF>>,
+        transforms: Vec<PropertyValue<LayoutTransform>>,
+    ) -> bool {
         let Some((response, receiver)) = generic_channel::channel() else {
             return false;
         };
@@ -390,6 +414,7 @@ impl CrossProcessPaintApi {
                 pipeline_id,
                 epoch,
                 colors,
+                transforms,
                 generation,
                 response,
             })

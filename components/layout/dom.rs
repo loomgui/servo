@@ -133,6 +133,32 @@ impl InnerDOMLayoutData {
         }
     }
 
+    /// Whether this node generated boxes for pseudo-elements.
+    pub(crate) fn has_pseudo_boxes(&self) -> bool {
+        !self.pseudo_boxes.is_empty()
+    }
+
+    /// Repair the style of this node's box after a style change that was applied as a
+    /// move of its box. Unlike [`Self::repair_style`], this does not report the
+    /// change as one that needs a new display list. The caller has checked that the
+    /// node has no pseudo-element boxes.
+    pub(crate) fn repair_style_after_move(
+        &self,
+        node: &ServoLayoutNode,
+        context: &LayoutContext,
+        new_style: &ServoArc<ComputedValues>,
+    ) {
+        // A witness of a background color change belongs to one exact pair of styles.
+        if let Some(element) = node.as_element() {
+            element
+                .element_data_mut()
+                .take_background_color_change_witness();
+        }
+        if let Some(layout_object) = &*self.self_box.borrow() {
+            layout_object.repair_style(&context.style_context, node, new_style);
+        }
+    }
+
     fn with_layout_box_base(&self, callback: impl FnOnce(&LayoutBoxBase)) {
         if let Some(data) = self.self_box.borrow().as_ref() {
             data.with_base(callback);

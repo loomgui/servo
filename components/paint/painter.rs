@@ -1424,14 +1424,23 @@ impl Painter {
         epoch: Epoch,
         generation: u64,
         colors: Vec<PropertyValue<ColorF>>,
+        transforms: Vec<PropertyValue<LayoutTransform>>,
     ) -> bool {
-        if !self
-            .retained_colors
-            .update(webview_id, pipeline_id, generation, epoch, &colors)
-        {
-            warn!("Received background colors from an obsolete display list");
+        if !self.retained_colors.update_with_transforms(
+            webview_id,
+            pipeline_id,
+            generation,
+            epoch,
+            &colors,
+            &transforms,
+        ) {
+            warn!("Received retained properties from an obsolete display list");
             return false;
         }
+        // Tells a move through bound reference frames apart from a color update in a
+        // trace.
+        let _span = (!transforms.is_empty())
+            .then(|| profile_traits::trace_span!("update_transform_bindings").entered());
         self.update_epoch(webview_id, pipeline_id, epoch);
         if let Some(renderer) = self.webview_renderers.get_mut(&webview_id) {
             // A retained update represents the same content activity as the
@@ -1489,6 +1498,9 @@ impl Painter {
         let pipeline_id = display_list_info.pipeline_id;
         let details = webview_renderer.ensure_pipeline_details(pipeline_id.into());
 
+        // The values this display list bound reference frame transforms to. Later
+        // updates may only move these frames.
+        let bound_transforms: Vec<_> = display_list_info.scroll_tree.bound_transforms().collect();
         details.install_new_scroll_tree(display_list_info.scroll_tree);
         details.viewport_scale = Some(display_list_info.viewport_details.hidpi_scale_factor);
 
@@ -1544,6 +1556,8 @@ impl Painter {
             colors,
             display_list_info.caret_property_binding,
         );
+        self.retained_colors
+            .install_transforms(webview_id, pipeline_id.into(), bound_transforms);
         self.reset_dynamic_colors(&mut transaction);
         transaction.set_display_list(epoch, (pipeline_id, built_display_list));
 

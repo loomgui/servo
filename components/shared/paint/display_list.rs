@@ -19,10 +19,13 @@ use servo_base::id::{LCPCandidateID, ScrollTreeNodeId};
 use servo_base::print_tree::PrintTree;
 use servo_geometry::FastLayoutTransform;
 use style::values::specified::Overflow;
-use webrender_api::units::{LayoutPixel, LayoutPoint, LayoutRect, LayoutSize, LayoutVector2D};
+use webrender_api::units::{
+    LayoutPixel, LayoutPoint, LayoutRect, LayoutSize, LayoutTransform, LayoutVector2D,
+};
 use webrender_api::{
-    ColorF, ExternalScrollId, PipelineId, PropertyBindingKey, ReferenceFrameKind, ScrollLocation,
-    SnapshotImageKey, SpatialId, StickyOffsetBounds, TransformStyle,
+    ColorF, ExternalScrollId, PipelineId, PropertyBinding, PropertyBindingKey, PropertyValue,
+    ReferenceFrameKind, ScrollLocation, SnapshotImageKey, SpatialId, StickyOffsetBounds,
+    TransformStyle,
 };
 
 /// A scroll type, describing whether what kind of action originated this scroll request.
@@ -218,6 +221,28 @@ pub struct ReferenceFrameNodeInfo {
     pub transform_style: TransformStyle,
     pub transform: FastLayoutTransform,
     pub kind: ReferenceFrameKind,
+    /// The WebRender property that [`Self::transform`] is bound to, if this frame can
+    /// take a new transform through a property update, without a new display list.
+    #[ignore_malloc_size_of = "A WebRender key without heap data"]
+    pub binding: Option<PropertyBindingKey<LayoutTransform>>,
+}
+
+impl ReferenceFrameNodeInfo {
+    /// The current value of this frame's bound property, if it has one. The display
+    /// list and later property updates both take the value from here, so a frame moved
+    /// by an update is described to WebRender exactly as a new display list would.
+    pub fn bound_transform(&self) -> Option<PropertyValue<LayoutTransform>> {
+        Some(self.binding?.with(*self.transform.to_transform()))
+    }
+
+    /// The transform that describes this frame to WebRender: bound to a property if
+    /// the frame has one, a plain value otherwise.
+    pub fn webrender_transform(&self) -> PropertyBinding<LayoutTransform> {
+        match self.bound_transform() {
+            Some(bound) => PropertyBinding::Binding(bound.key, bound.value),
+            None => PropertyBinding::Value(*self.transform.to_transform()),
+        }
+    }
 }
 
 /// Data stored for nodes in the [ScrollTree] that actually scroll,
@@ -524,6 +549,31 @@ impl ScrollTree {
     /// Get an immutable reference to the node with the given index.
     pub fn get_node(&self, id: ScrollTreeNodeId) -> &ScrollTreeNode {
         &self.nodes[id.index]
+    }
+
+    /// Change the reference frame with the given id in place and drop the cached
+    /// transforms that depend on it. Returns false if the node is not a reference frame.
+    pub fn update_reference_frame(
+        &mut self,
+        id: ScrollTreeNodeId,
+        update: impl FnOnce(&mut ReferenceFrameNodeInfo),
+    ) -> bool {
+        let SpatialTreeNodeInfo::ReferenceFrame(info) = &mut self.get_node_mut(id).info else {
+            return false;
+        };
+        update(info);
+        self.get_node(id)
+            .invalidate_cached_transforms(self, true /* ancestors_invalid */);
+        true
+    }
+
+    /// The transform properties bound by reference frames in this tree, with their
+    /// current values.
+    pub fn bound_transforms(&self) -> impl Iterator<Item = PropertyValue<LayoutTransform>> + '_ {
+        self.nodes.iter().filter_map(|node| match &node.info {
+            SpatialTreeNodeInfo::ReferenceFrame(info) => info.bound_transform(),
+            _ => None,
+        })
     }
 
     /// Get the WebRender [`SpatialId`] for the given [`ScrollNodeId`]. This will
@@ -1043,6 +1093,7 @@ impl PaintDisplayListInfo {
                 transform_style: TransformStyle::Flat,
                 transform: FastLayoutTransform::identity(),
                 kind: ReferenceFrameKind::default(),
+                binding: None,
             }),
         );
         let root_scroll_node_id = scroll_tree.add_scroll_tree_node(

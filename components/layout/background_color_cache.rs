@@ -16,11 +16,13 @@ use style::data::BackgroundColorChangeWitness;
 use style::dom::OpaqueNode;
 use style::inline_background::BackgroundStyleReuse;
 use style::properties::ComputedValues;
+use webrender_api::units::LayoutTransform;
 use webrender_api::{ColorF, PropertyBindingKey, PropertyValue};
 
 use crate::display_list::rgba;
 use crate::fragment_tree::{BoxFragment, FragmentFlags, FragmentStatus};
 use crate::layout_box_base::LayoutBoxBase;
+use crate::move_bindings::MoveBindings;
 
 #[derive(Default)]
 pub(crate) struct BackgroundColorCache {
@@ -33,6 +35,9 @@ pub(crate) struct BackgroundColorCache {
     pending: Option<Vec<PropertyValue<ColorF>>>,
     changed_fragments: Vec<Arc<BoxFragment>>,
     reusable_styles: BackgroundStyleReuseStore,
+    /// Reference frames that can move through a property update. Their values travel
+    /// in the same batch as the colors and are valid for the same display list.
+    pub(crate) moves: MoveBindings,
 }
 
 /// Non-authoritative, bounded by this display list's retained bindings. A slot
@@ -140,6 +145,13 @@ impl BackgroundColorCache {
         self.pending = None;
         self.changed_fragments.clear();
         self.clear_reusable_styles();
+        self.moves.clear_staged();
+    }
+
+    /// Whether the painter's display list still matches layout, except for the
+    /// property updates staged here. Only then can a box move through a binding.
+    pub(crate) fn retained_display_list_is_live(&self) -> bool {
+        self.pending.is_some()
     }
 
     /// Selection highlights use static display-list colors, including inherited
@@ -159,6 +171,8 @@ impl BackgroundColorCache {
         self.next_key = 0;
         self.changed_fragments.clear();
         self.pending = Some(Vec::new());
+        // A full display list carries the current place of every bound frame.
+        self.moves.clear_staged();
     }
 
     pub(crate) fn clear_reusable_styles(&mut self) {
@@ -280,6 +294,7 @@ impl BackgroundColorCache {
         Some(BackgroundColorUpdates {
             generation: self.generation,
             colors,
+            transforms: Vec::new(),
             changed_fragments,
         })
     }
@@ -372,7 +387,11 @@ impl BackgroundColorCache {
     }
 
     pub(crate) fn can_prepare_certified_updates(&self) -> bool {
-        self.pending.as_ref().is_some_and(Vec::is_empty) && self.changed_fragments.is_empty()
+        // A staged move has to reach the painter through `take_updates`. A certified
+        // batch would mark the display list clean without sending it.
+        self.pending.as_ref().is_some_and(Vec::is_empty)
+            && self.changed_fragments.is_empty()
+            && !self.moves.has_staged()
     }
 
     /// Prepare an owned batch without consuming cache or fragment authority.
@@ -436,6 +455,7 @@ impl BackgroundColorCache {
         Some(BackgroundColorUpdates {
             generation: self.generation,
             colors,
+            transforms: Vec::new(),
             changed_fragments,
         })
     }
@@ -443,13 +463,18 @@ impl BackgroundColorCache {
     /// Taking a batch does not commit fragment status or accounting.
     pub(crate) fn take_updates(&mut self) -> Option<BackgroundColorUpdates> {
         let updates = self.pending.as_mut()?;
-        if updates.is_empty() {
+        if updates.is_empty() && !self.moves.has_staged() {
             return None;
         }
+        let colors = std::mem::take(updates);
+        let mut changed_fragments = std::mem::take(&mut self.changed_fragments);
+        let (transforms, moved_fragments) = self.moves.take_staged();
+        changed_fragments.extend(moved_fragments);
         Some(BackgroundColorUpdates {
             generation: self.generation,
-            colors: std::mem::take(updates),
-            changed_fragments: std::mem::take(&mut self.changed_fragments),
+            colors,
+            transforms,
+            changed_fragments,
         })
     }
 }
@@ -480,10 +505,23 @@ std::thread_local! {
 pub(crate) struct BackgroundColorUpdates {
     generation: u64,
     colors: Vec<PropertyValue<ColorF>>,
+    /// New values for bound reference frame transforms. They are sent with the colors
+    /// and their fragments are in `changed_fragments`.
+    transforms: Vec<PropertyValue<LayoutTransform>>,
     changed_fragments: Vec<Arc<BoxFragment>>,
 }
 
 impl BackgroundColorUpdates {
+    /// Take the transform values of this batch. The caller must pass them to the
+    /// painter in the same message as the colors that `submit` hands it.
+    pub(crate) fn take_transforms(&mut self) -> Vec<PropertyValue<LayoutTransform>> {
+        std::mem::take(&mut self.transforms)
+    }
+
+    pub(crate) fn has_colors(&self) -> bool {
+        !self.colors.is_empty()
+    }
+
     pub(crate) fn submit(
         self,
         statistics: &mut ReflowStatistics,
@@ -1272,6 +1310,7 @@ mod reuse_tests {
 
     fn batch(fragment: &Arc<BoxFragment>) -> BackgroundColorUpdates {
         BackgroundColorUpdates {
+            transforms: Vec::new(),
             generation: 7,
             colors: vec![PropertyBindingKey::new(1).with(ColorF::WHITE)],
             changed_fragments: vec![fragment.clone()],
@@ -1395,6 +1434,7 @@ mod rejected_batch_tests {
             let batch = || BackgroundColorUpdates {
                 generation: 1,
                 colors: vec![PropertyBindingKey::new(1).with(ColorF::WHITE)],
+                transforms: Vec::new(),
                 changed_fragments: vec![fragment.clone()],
             };
             let mut statistics = ReflowStatistics::default();
